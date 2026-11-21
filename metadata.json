@@ -1,0 +1,6 @@
+{
+  "name": "LicitAudit — Auditoria Autônoma de Contratos Públicos",
+  "description": "Plataforma brasileira de auditoria autônoma de contratos públicos com resolução IBGE, integração PNCP, pipeline documental com trilha probatória, motor de risco OCDS Cardinal e regras brasileiras.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
