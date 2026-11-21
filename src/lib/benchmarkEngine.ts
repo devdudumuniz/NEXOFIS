@@ -3,10 +3,10 @@ import type { BenchmarkPeer, HorizontalBenchmarkResult } from '../types/audit';
 export const HORIZONTAL_BENCHMARK_RULE_ID = 'BENCH_HORIZONTAL_SUPPLIER_V1';
 
 /**
- * Cumulative IPCA-like price deflator multipliers bringing past years to 2026 BRL baseline
- * so nominal 2021-2025 contracts are never compared raw against 2026 prices.
+ * Versioned reference IPCA cumulative factors (IBGE IPCA annual series, base 2026-01).
+ * Years outside this table are NOT silently adjusted — comparison is explicitly flagged as nominal.
  */
-const INFLATION_TO_2026_FACTOR: Record<number, number> = {
+const IPCA_SERIES_TO_2026: Record<number, number> = {
   2021: 1.312,
   2022: 1.198,
   2023: 1.132,
@@ -15,9 +15,15 @@ const INFLATION_TO_2026_FACTOR: Record<number, number> = {
   2026: 1.0,
 };
 
-export function adjustPriceTo2026(nominalPrice: number, contractYear: number): number {
-  const factor = INFLATION_TO_2026_FACTOR[contractYear] ?? 1.0;
-  return Number((nominalPrice * factor).toFixed(2));
+export function adjustPriceTo2026(
+  nominalPrice: number,
+  contractYear: number
+): { value: number; adjusted: boolean } {
+  const factor = IPCA_SERIES_TO_2026[contractYear];
+  if (factor === undefined) {
+    return { value: Number(nominalPrice.toFixed(2)), adjusted: false };
+  }
+  return { value: Number((nominalPrice * factor).toFixed(2)), adjusted: true };
 }
 
 export function computeMedian(values: number[]): number {
@@ -37,12 +43,32 @@ export function computeMAD(values: number[], medianValue?: number): number {
   return computeMedian(absDevs);
 }
 
+function normalizeUnit(u: string): string {
+  return u
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s+/g, '')
+    .trim();
+}
+
+function peerIdentityKey(p: BenchmarkPeer): string {
+  return [
+    p.municipalityName.trim().toLowerCase(),
+    p.uf.trim().toUpperCase(),
+    p.contractNumber.trim().toLowerCase(),
+    String(p.contractYear),
+  ].join('|');
+}
+
 /**
  * Evaluates a subject contract item against comparable peer contracts using Median & MAD.
- * Enforces sample-size policy:
- *  - n < 4  -> NOT_VERIFIABLE (refuses statistical inference; descriptive only)
- *  - 4 <= n < 8 -> low-evidence observation (level C)
- *  - n >= 8 -> robust statistical comparison (level B)
+ * Enforces strict methodological safeguards:
+ *  - Mode 'same_supplier' excludes peers from different suppliers; 'market' declares multi-supplier scope.
+ *  - Deduplicates repeated contract records so duplicates count as a single independent observation.
+ *  - Excludes incompatible units unless a documented positive conversionFactor is supplied.
+ *  - Rejects invalid (NaN, <= 0) prices and explicitly handles MAD = 0 without inflating z-scores.
+ *  - Refuses statistical inference when n < 4 (NOT_VERIFIABLE).
  */
 export function evaluateHorizontalBenchmark(params: {
   serviceClass: string;
@@ -52,32 +78,107 @@ export function evaluateHorizontalBenchmark(params: {
   inflationIndexLabel: string;
   peers: BenchmarkPeer[];
   maxScopeDistance?: number;
+  mode?: 'same_supplier' | 'market';
+  subjectContractKey?: string;
 }): HorizontalBenchmarkResult {
   const maxScope = params.maxScopeDistance ?? 0.2;
-  const subjectAdjusted = adjustPriceTo2026(params.subjectNominalPrice, params.subjectYear);
+  const mode = params.mode ?? 'market';
+  const normalizedSubjectUnit = normalizeUnit(params.unitLabel);
+
+  // Reject invalid subject prices immediately
+  if (!Number.isFinite(params.subjectNominalPrice) || params.subjectNominalPrice <= 0) {
+    return {
+      ruleId: HORIZONTAL_BENCHMARK_RULE_ID,
+      mode,
+      state: 'NOT_VERIFIABLE',
+      evidenceLevel: 'C',
+      confidence: 0,
+      serviceClass: params.serviceClass,
+      unitLabel: params.unitLabel,
+      subjectNominalPrice: params.subjectNominalPrice,
+      subjectAdjustedPrice: 0,
+      inflationIndexApplied: 'Não aplicado (preço inválido)',
+      inflationApplied: false,
+      peerCount: 0,
+      excludedPeerCount: params.peers.length,
+      deduplicatedPeerCount: 0,
+      peerMedian: null,
+      mad: null,
+      madZero: false,
+      robustZ: null,
+      peerRatio: null,
+      statement: 'Preço unitário do contrato analisado ausente, negativo ou inválido (NaN). Benchmark recusado.',
+      notAConclusion: 'Sem preço válido do item analisado não é possível calcular referência comparativa.',
+      controls: {
+        inflation: 'não aplicado',
+        scope: `distância ≤ ${(maxScope * 100).toFixed(0)}%`,
+        sla: 'filtrado',
+        licensing: 'filtrado',
+        supplierMode: mode === 'same_supplier' ? 'mesmo fornecedor obrigatório' : 'mercado (fornecedores variados)',
+      },
+      peers: params.peers.map((p) => ({ ...p, included: false, exclusionReason: 'Preço do contrato-objeto inválido.' })),
+    };
+  }
+
+  const subjectAdj = adjustPriceTo2026(params.subjectNominalPrice, params.subjectYear);
+  let allInflationResolved = subjectAdj.adjusted;
+  const seenKeys = new Set<string>();
+  let duplicateExclusions = 0;
 
   const normalizedPeers: BenchmarkPeer[] = params.peers.map((p) => {
-    const adjusted = adjustPriceTo2026(p.nominalUnitPrice, p.contractYear);
+    const key = peerIdentityKey(p);
     let included = p.included;
     let exclusionReason = p.exclusionReason;
+    let comparableNominal = p.nominalUnitPrice;
 
-    if (p.serviceClass !== params.serviceClass) {
+    if (!Number.isFinite(p.nominalUnitPrice) || p.nominalUnitPrice <= 0) {
+      included = false;
+      exclusionReason = 'Valor unitário ausente, negativo ou inválido (NaN).';
+    } else if (params.subjectContractKey && key === params.subjectContractKey) {
+      included = false;
+      exclusionReason = 'Próprio contrato excluído da amostra de referência.';
+    } else if (seenKeys.has(key)) {
+      included = false;
+      duplicateExclusions += 1;
+      exclusionReason = `Registro duplicado (${p.municipalityName}/${p.uf} · ${p.contractNumber}) excluído para preservar observações independentes.`;
+    } else if (mode === 'same_supplier' && !p.sameSupplier) {
+      included = false;
+      exclusionReason = 'Fornecedor divergente excluído no modo mesmo fornecedor.';
+    } else if (p.serviceClass !== params.serviceClass) {
       included = false;
       exclusionReason = `Classe de serviço divergente (${p.serviceClass} ≠ ${params.serviceClass}).`;
-    } else if (p.scopeDistance > maxScope) {
+    } else if (normalizeUnit(p.unitLabel) !== normalizedSubjectUnit) {
+      if (typeof p.conversionFactor === 'number' && Number.isFinite(p.conversionFactor) && p.conversionFactor > 0) {
+        comparableNominal = p.nominalUnitPrice * p.conversionFactor;
+      } else {
+        included = false;
+        exclusionReason = `Unidade incompatível (${p.unitLabel} ≠ ${params.unitLabel}) sem fator de conversão documentado.`;
+      }
+    }
+
+    if (included && p.scopeDistance > maxScope) {
       included = false;
       exclusionReason = `Distância de escopo ${(p.scopeDistance * 100).toFixed(0)}% excede o limite de ${(maxScope * 100).toFixed(0)}%.`;
-    } else if (!p.slaComparable) {
+    } else if (included && !p.slaComparable) {
       included = false;
       exclusionReason = 'SLA ou regime de atendimento não comparável.';
-    } else if (!p.licensingComparable) {
+    } else if (included && !p.licensingComparable) {
       included = false;
       exclusionReason = 'Modelo de licenciamento/implantação incompatível.';
     }
 
+    if (included) {
+      seenKeys.add(key);
+    }
+
+    const adj = adjustPriceTo2026(comparableNominal, p.contractYear);
+    if (included && !adj.adjusted) {
+      allInflationResolved = false;
+    }
+
     return {
       ...p,
-      inflationAdjustedPrice: adjusted,
+      inflationAdjustedPrice: included && Number.isFinite(adj.value) ? adj.value : p.inflationAdjustedPrice,
       included,
       exclusionReason,
     };
@@ -85,31 +186,46 @@ export function evaluateHorizontalBenchmark(params: {
 
   const eligible = normalizedPeers.filter((p) => p.included);
   const excludedCount = normalizedPeers.length - eligible.length;
+  const inflationSummary = allInflationResolved
+    ? `série versionada (${params.inflationIndexLabel})`
+    : 'comparação nominal (série IPCA indisponível para parte dos anos)';
+  const supplierModeSummary =
+    mode === 'same_supplier'
+      ? 'mesmo fornecedor (identidade exigida)'
+      : 'mercado (fornecedores variados declarados)';
 
   if (eligible.length < 4) {
     return {
       ruleId: HORIZONTAL_BENCHMARK_RULE_ID,
+      mode,
       state: 'NOT_VERIFIABLE',
       evidenceLevel: 'C',
-      confidence: 0.35,
+      confidence: 0,
       serviceClass: params.serviceClass,
       unitLabel: params.unitLabel,
       subjectNominalPrice: params.subjectNominalPrice,
-      subjectAdjustedPrice: subjectAdjusted,
-      inflationIndexApplied: params.inflationIndexLabel,
+      subjectAdjustedPrice: subjectAdj.value,
+      inflationIndexApplied: allInflationResolved ? params.inflationIndexLabel : 'Nominal (sem deflação)',
+      inflationApplied: allInflationResolved,
       peerCount: eligible.length,
       excludedPeerCount: excludedCount,
-      peerMedian: eligible.length > 0 ? Number(computeMedian(eligible.map((e) => e.inflationAdjustedPrice)).toFixed(2)) : null,
+      deduplicatedPeerCount: duplicateExclusions,
+      peerMedian:
+        eligible.length > 0
+          ? Number(computeMedian(eligible.map((e) => e.inflationAdjustedPrice)).toFixed(2))
+          : null,
       mad: null,
+      madZero: false,
       robustZ: null,
       peerRatio: null,
-      statement: `Amostra comparável insuficiente (n = ${eligible.length} < 4). Inferência estatística recusada; exibir apenas como referência descritiva.`,
+      statement: `Amostra comparável independente insuficiente (n = ${eligible.length} < 4; ${excludedCount} excluído(s)). Inferência estatística recusada.`,
       notAConclusion: 'Amostra insuficiente impede qualquer conclusão sobre desvio de preço.',
       controls: {
-        inflation: `aplicado (${params.inflationIndexLabel})`,
+        inflation: inflationSummary,
         scope: `distância ≤ ${(maxScope * 100).toFixed(0)}%`,
         sla: 'filtrado',
         licensing: 'filtrado',
+        supplierMode: supplierModeSummary,
       },
       peers: normalizedPeers,
     };
@@ -118,62 +234,75 @@ export function evaluateHorizontalBenchmark(params: {
   const peerPrices = eligible.map((e) => e.inflationAdjustedPrice);
   const peerMedian = Number(computeMedian(peerPrices).toFixed(2));
   const rawMad = computeMAD(peerPrices, peerMedian);
-  // Protect against zero MAD when peers have identical prices by using 1% of median floor
-  const effectiveMad = rawMad > 0 ? rawMad : Math.max(0.01, peerMedian * 0.01);
-  const robustZ = Number(((0.6745 * (subjectAdjusted - peerMedian)) / effectiveMad).toFixed(2));
-  const peerRatio = peerMedian > 0 ? Number((subjectAdjusted / peerMedian).toFixed(2)) : null;
+  const madZero = rawMad === 0;
+  const peerRatio = peerMedian > 0 ? Number((subjectAdj.value / peerMedian).toFixed(2)) : null;
+
+  // When MAD === 0 (all comparable peers share the exact median), robust z-score is undefined (null)
+  // rather than artificially inflated via an arbitrary epsilon floor.
+  const robustZ = madZero
+    ? null
+    : Number(((0.6745 * (subjectAdj.value - peerMedian)) / rawMad).toFixed(2));
 
   const isRobustSample = eligible.length >= 8;
-  const isHighOutlier = (peerRatio ?? 0) >= 2.0 && Math.abs(robustZ) >= 3.0 && isRobustSample;
-  const isMediumOutlier = (peerRatio ?? 0) >= 1.5 && Math.abs(robustZ) >= 2.0;
+  const isHighOutlier =
+    (peerRatio ?? 0) >= 2.0 && (madZero ? true : Math.abs(robustZ ?? 0) >= 3.0) && isRobustSample;
+  const isMediumOutlier =
+    (peerRatio ?? 0) >= 1.5 && (madZero ? true : Math.abs(robustZ ?? 0) >= 2.0);
 
   let statement: string;
   let state: HorizontalBenchmarkResult['state'];
   let evidenceLevel: HorizontalBenchmarkResult['evidenceLevel'];
-  let confidence: number;
+
+  // Transparent coverage-based score (ratio of sample adequacy, NOT legal certainty)
+  const sampleAdequacy = Number(Math.min(0.9, eligible.length / 10).toFixed(2));
 
   if (isHighOutlier) {
     state = 'OBSERVATION';
     evidenceLevel = 'B';
-    confidence = 0.91;
-    statement = `Preço normalizado (${peerRatio?.toFixed(2)}× a mediana dos peers, z robusto = ${robustZ.toFixed(2)}) significativamente superior ao grupo comparável (n = ${eligible.length}).`;
+    statement = madZero
+      ? `Preço normalizado (${peerRatio?.toFixed(2)}× a mediana; MAD = 0 — todos os ${eligible.length} comparáveis idênticos) acima do grupo comparável (regra de triagem, não prova de sobrepreço).`
+      : `Preço normalizado (${peerRatio?.toFixed(2)}× a mediana dos peers, z robusto = ${robustZ?.toFixed(2)}) acima do grupo comparável (n = ${eligible.length} observações independentes).`;
   } else if (isMediumOutlier) {
     state = 'OBSERVATION';
     evidenceLevel = isRobustSample ? 'B' : 'C';
-    confidence = isRobustSample ? 0.82 : 0.64;
     statement = isRobustSample
-      ? `Preço normalizado ${peerRatio?.toFixed(2)}× acima da mediana dos peers comparáveis (z robusto = ${robustZ.toFixed(2)}, n = ${eligible.length}).`
-      : `Sinal de baixa evidência (4 ≤ n = ${eligible.length} < 8): preço ${peerRatio?.toFixed(2)}× acima da mediana comparável.`;
+      ? `Preço normalizado ${peerRatio?.toFixed(2)}× acima da mediana comparável (${madZero ? 'MAD = 0' : `z robusto = ${robustZ?.toFixed(2)}`}, n = ${eligible.length}).`
+      : `Sinal preliminar com amostra reduzida (4 ≤ n = ${eligible.length} < 8): preço ${peerRatio?.toFixed(2)}× acima da mediana comparável.`;
   } else {
     state = 'CONFIRMED_DATA';
     evidenceLevel = isRobustSample ? 'B' : 'C';
-    confidence = isRobustSample ? 0.88 : 0.68;
-    statement = `Preço normalizado dentro da faixa estatística esperada frente à mediana dos peers (razão ${peerRatio?.toFixed(2)}×, z robusto = ${robustZ.toFixed(2)}, n = ${eligible.length}).`;
+    statement = `Preço normalizado dentro da faixa estatística observada frente à mediana comparável (razão ${peerRatio?.toFixed(2)}×, ${madZero ? 'MAD = 0' : `z robusto = ${robustZ?.toFixed(2)}`}, n = ${eligible.length}).`;
   }
 
   return {
     ruleId: HORIZONTAL_BENCHMARK_RULE_ID,
+    mode,
     state,
     evidenceLevel,
-    confidence,
+    confidence: sampleAdequacy,
     serviceClass: params.serviceClass,
     unitLabel: params.unitLabel,
     subjectNominalPrice: params.subjectNominalPrice,
-    subjectAdjustedPrice: subjectAdjusted,
-    inflationIndexApplied: params.inflationIndexLabel,
+    subjectAdjustedPrice: subjectAdj.value,
+    inflationIndexApplied: allInflationResolved ? params.inflationIndexLabel : 'Nominal (sem deflação)',
+    inflationApplied: allInflationResolved,
     peerCount: eligible.length,
     excludedPeerCount: excludedCount,
+    deduplicatedPeerCount: duplicateExclusions,
     peerMedian,
     mad: Number(rawMad.toFixed(2)),
+    madZero,
     robustZ,
     peerRatio,
     statement,
-    notAConclusion: 'Não constitui prova de sobrepreço ou fraude; verificar escopo contratual, logística local e SLA específico.',
+    notAConclusion:
+      'Regra de triagem estatística; não constitui prova de sobrepreço ou fraude. Verificar escopo, logística local, implantação e SLA.',
     controls: {
-      inflation: `aplicado (${params.inflationIndexLabel})`,
+      inflation: inflationSummary,
       scope: `distância ≤ ${(maxScope * 100).toFixed(0)}%`,
       sla: 'compatível',
       licensing: 'compatível',
+      supplierMode: supplierModeSummary,
     },
     peers: normalizedPeers,
   };

@@ -239,3 +239,249 @@ export function extractFieldsFromNativeText(
     excerpts,
   };
 }
+
+/**
+ * Validates actual file header magic bytes against declared MIME type
+ * so spoofed extensions/headers are rejected before parsing.
+ */
+export function validateUploadedFileMagic(
+  bytes: Uint8Array,
+  mimeType: string
+): { valid: boolean; reason?: string } {
+  if (!bytes || bytes.length === 0) {
+    return { valid: false, reason: 'Arquivo vazio.' };
+  }
+
+  if (mimeType === 'application/pdf') {
+    const header = String.fromCharCode(...bytes.slice(0, 5));
+    if (header !== '%PDF-') {
+      return {
+        valid: false,
+        reason: 'Cabeçalho binário inválido: o arquivo declarado como PDF não inicia com assinatura %PDF-.',
+      };
+    }
+    return { valid: true };
+  }
+
+  if (mimeType === 'image/png') {
+    const ok =
+      bytes.length >= 8 &&
+      bytes[0] === 0x89 &&
+      bytes[1] === 0x50 &&
+      bytes[2] === 0x4e &&
+      bytes[3] === 0x47 &&
+      bytes[4] === 0x0d &&
+      bytes[5] === 0x0a &&
+      bytes[6] === 0x1a &&
+      bytes[7] === 0x0a;
+    return ok
+      ? { valid: true }
+      : { valid: false, reason: 'Cabeçalho binário inválido para imagem PNG.' };
+  }
+
+  if (mimeType === 'image/jpeg') {
+    const ok = bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+    return ok
+      ? { valid: true }
+      : { valid: false, reason: 'Cabeçalho binário inválido para imagem JPEG.' };
+  }
+
+  if (mimeType === 'text/plain') {
+    // Reject obvious binary files (NUL bytes in first 1024 bytes)
+    const sample = bytes.slice(0, Math.min(bytes.length, 1024));
+    for (let i = 0; i < sample.length; i++) {
+      if (sample[i] === 0x00) {
+        return {
+          valid: false,
+          reason: 'Arquivo declarado como texto plano contém bytes nulos binários.',
+        };
+      }
+    }
+    return { valid: true };
+  }
+
+  return { valid: false, reason: `Formato não suportado (${mimeType}).` };
+}
+
+/**
+ * Ensures outbound URLs target only public HTTP(S) destinations and never private/loopback/metadata hosts.
+ */
+export function isSafePublicUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host === 'localhost' ||
+      host === '0.0.0.0' ||
+      host === '::1' ||
+      host === '[::1]' ||
+      host.endsWith('.local') ||
+      host.endsWith('.internal') ||
+      /^127\./.test(host) ||
+      /^10\./.test(host) ||
+      /^169\.254\./.test(host) ||
+      /^192\.168\./.test(host) ||
+      /^172\.(1[6-9]|2\d|3[0-1])\./.test(host) ||
+      /^fe80:/i.test(host) ||
+      /^fc00:/i.test(host) ||
+      /^fd/i.test(host)
+    ) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeKey(value?: string | null): string {
+  return (value ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+export interface ContractMatchCandidate {
+  id: string;
+  contractNumber: string;
+  pncpControlNumber: string;
+  municipalityIbge: string;
+  municipalityName: string;
+  supplierCnpj: string;
+  supplierName: string;
+}
+
+export type DocumentMatchResult<T extends { id: string; contractNumber: string; pncpControlNumber: string; municipalityIbge: string; municipalityName: string; supplier: { cnpj: string; legalName: string } }> =
+  | { status: 'matched'; contract: T; matchRule: string }
+  | { status: 'ambiguous'; candidates: ContractMatchCandidate[]; reason: string }
+  | { status: 'unmatched'; reason: string };
+
+/**
+ * Strict multi-key document-to-contract reconciliation.
+ * Refuses to auto-attach based solely on supplier CNPJ or solely on ambiguous contract number.
+ */
+export function resolveDocumentContractMatch<
+  T extends {
+    id: string;
+    contractNumber: string;
+    pncpControlNumber: string;
+    municipalityIbge: string;
+    municipalityName: string;
+    supplier: { cnpj: string; legalName: string };
+  },
+>(
+  extracted: Pick<ExtractedDocumentFields, 'contractNumber' | 'cnpj' | 'ibgeCode' | 'municipalityName'> & {
+    pncpControlNumber?: string | null;
+  },
+  existingContracts: T[]
+): DocumentMatchResult<T> {
+  const toCandidate = (c: T): ContractMatchCandidate => ({
+    id: c.id,
+    contractNumber: c.contractNumber,
+    pncpControlNumber: c.pncpControlNumber,
+    municipalityIbge: c.municipalityIbge,
+    municipalityName: c.municipalityName,
+    supplierCnpj: c.supplier.cnpj,
+    supplierName: c.supplier.legalName,
+  });
+
+  // 1. Exact PNCP control number match (globally unique key)
+  if (extracted.pncpControlNumber?.trim()) {
+    const pncpKey = normalizeKey(extracted.pncpControlNumber);
+    const pncpMatches = existingContracts.filter(
+      (c) => normalizeKey(c.pncpControlNumber) === pncpKey
+    );
+    if (pncpMatches.length === 1) {
+      return {
+        status: 'matched',
+        contract: pncpMatches[0],
+        matchRule: 'numero_controle_pncp',
+      };
+    }
+  }
+
+  const numKey = normalizeKey(extracted.contractNumber);
+  const cnpjDigits = extracted.cnpj ? extracted.cnpj.replace(/\D/g, '') : '';
+  const ibgeDigits = extracted.ibgeCode && /^\d{7}$/.test(extracted.ibgeCode) ? extracted.ibgeCode : '';
+  const muniKey = normalizeKey(extracted.municipalityName);
+
+  // 2. Composite keys: contractNumber + (ibgeCode OR supplier CNPJ OR municipalityName)
+  if (numKey) {
+    const byNumber = existingContracts.filter(
+      (c) => normalizeKey(c.contractNumber) === numKey
+    );
+
+    if (byNumber.length > 0) {
+      // 2a. contractNumber + ibgeCode
+      if (ibgeDigits) {
+        const strong = byNumber.filter((c) => c.municipalityIbge === ibgeDigits);
+        if (strong.length === 1) {
+          return { status: 'matched', contract: strong[0], matchRule: 'contract_number+ibge' };
+        }
+        if (strong.length > 1 && cnpjDigits) {
+          const stronger = strong.filter((c) => c.supplier.cnpj === cnpjDigits);
+          if (stronger.length === 1) {
+            return {
+              status: 'matched',
+              contract: stronger[0],
+              matchRule: 'contract_number+ibge+cnpj',
+            };
+          }
+        }
+      }
+
+      // 2b. contractNumber + supplier CNPJ
+      if (cnpjDigits.length === 14) {
+        const strong = byNumber.filter((c) => c.supplier.cnpj === cnpjDigits);
+        if (strong.length === 1) {
+          return { status: 'matched', contract: strong[0], matchRule: 'contract_number+cnpj' };
+        }
+      }
+
+      // 2c. contractNumber + municipalityName
+      if (muniKey) {
+        const strong = byNumber.filter(
+          (c) => normalizeKey(c.municipalityName) === muniKey
+        );
+        if (strong.length === 1) {
+          return {
+            status: 'matched',
+            contract: strong[0],
+            matchRule: 'contract_number+municipality',
+          };
+        }
+      }
+
+      // Number matched one or more contracts WITHOUT corroborating municipality/CNPJ -> ambiguous!
+      return {
+        status: 'ambiguous',
+        candidates: byNumber.slice(0, 10).map(toCandidate),
+        reason:
+          byNumber.length > 1
+            ? `Número ${extracted.contractNumber} existe em ${byNumber.length} contratos distintos e não há IBGE/CNPJ corroborante para desambiguar.`
+            : `Número ${extracted.contractNumber} localizado sem IBGE ou CNPJ corroborante no documento; vinculação automática recusada para evitar falso vínculo entre entes.`,
+      };
+    }
+  }
+
+  // 3. Supplier CNPJ alone NEVER auto-attaches (a supplier may hold many contracts)
+  if (cnpjDigits.length === 14) {
+    const byCnpj = existingContracts.filter((c) => c.supplier.cnpj === cnpjDigits);
+    if (byCnpj.length > 0) {
+      return {
+        status: 'ambiguous',
+        candidates: byCnpj.slice(0, 10).map(toCandidate),
+        reason: `Apenas o CNPJ ${cnpjDigits} coincidiu com ${byCnpj.length} contrato(s) no repositório sem número de contrato compatível; vinculação automática bloqueada.`,
+      };
+    }
+  }
+
+  return {
+    status: 'unmatched',
+    reason: 'Nenhuma correspondência inequívoca por chave composta encontrada no repositório.',
+  };
+}
+

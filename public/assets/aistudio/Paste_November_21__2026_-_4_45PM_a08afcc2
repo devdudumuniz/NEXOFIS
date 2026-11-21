@@ -1,0 +1,446 @@
+MISSÃO — CONCLUIR O NEXOFIS, APLICAR AGPL-3.0-ONLY E ATUALIZAR O GITHUB
+
+Atue como responsável técnico pela entrega: arquitetura, implementação, engenharia de dados, processamento documental, segurança, QA e publicação do código.
+
+Repositório canônico: https://github.com/devdudumuniz/NEXOFIS
+Produto: NEXOFIS — plataforma aberta de inteligência e auditoria de recursos públicos.
+Autoria do projeto: Eduardo Muniz. Organização: DM Technology.
+Licença escolhida para o código próprio: AGPL-3.0-only.
+Idioma da aplicação, documentação e relatório: português brasileiro.
+
+OBJETIVO
+
+Implementar as lacunas identificadas na auditoria, aproveitar ao máximo código e componentes existentes, comprovar funcionamento e publicar as alterações no GitHub.
+
+A jornada deve permitir:
+município por nome/UF ou código IBGE → órgão/secretaria → período → contrato por número/ano, URL PNCP ou upload → coleta e análise → despesas e entregas → achados explicáveis → revisão humana → dossiê persistido e exportável.
+
+Preserve o que já funciona. Priorize correção, integração e reutilização. Não termine apenas com diagnóstico, protótipo visual ou roadmap. Execute em incrementos até cumprir os critérios de aceite. Integrações dependentes de acesso externo indisponível devem ter bloqueio concreto documentado, sem interromper trabalho independente nem aparecer como entregues.
+
+1. AUTORIZAÇÃO, BASE CANÔNICA E LIMITES
+
+Esta solicitação autoriza implementar, testar, atualizar documentação e licença, criar commits e fazer push das alterações pertinentes ao repositório indicado. Não peça novamente autorização para essas ações rotineiras.
+
+- Localize o checkout canônico pelo remoto; não presuma um diretório histórico.
+- Trabalhe na main quando permitido. Evite clones, branches e worktrees desnecessários.
+- Leia AGENTS.md, instruções aplicáveis, manifests, lockfiles, scripts e documentação existentes.
+- Inspecione status, HEAD, remoto e alterações preexistentes antes de modificar arquivos.
+- Preserve trabalho de terceiros. Não use reset destrutivo, git clean amplo, force-push ou exclusão de branches para facilitar a tarefa.
+- Se a main estiver protegida, respeite a proteção e utilize o fluxo de PR exigido; não altere regras para contorná-la. Informe exatamente onde a entrega ficou.
+- Use credenciais já autorizadas sem imprimi-las. Não coloque tokens, dados pessoais, documentos operacionais, bancos ou logs sensíveis no Git.
+- A autorização é para atualizar o código no GitHub. Não implica implantar em produção, mudar DNS, reiniciar hosts, modificar outros projetos ou usar serviços pagos.
+- Reutilize infraestrutura de desenvolvimento/QA já autorizada. Qualquer ambiente adicional deve ser isolado, configurável e não interferir em serviços existentes.
+- Não publique acusações, notificações a órgãos ou denúncias automaticamente.
+
+2. REVALIDAÇÃO INICIAL E REGISTRO DO ESCOPO
+
+A auditoria anterior examinou o commit:
+1fbf092b08ec9de40fc21ba9973ddc5860bdbae9
+
+Use-o como referência histórica; compare com a HEAD atual. Não sobrescreva correções já realizadas.
+
+Naquela versão foram observados:
+- 21 testes existentes aprovados.
+- Instalação com Bun e lock congelado, typecheck e build do frontend aprovados.
+- Instalação via npm com conflito esbuild/Vite.
+- Script lint executando apenas tsc --noEmit.
+- Falta de LICENSE, README e CI; identidade ainda LicitAudit.
+- OCR rotulado Docling/PaddleOCR, mas executado por Gemini ou parser textual.
+- Confiança, versões de extrator e páginas preenchidas com constantes.
+- Dados de demonstração misturados à operação e campos desconhecidos preenchidos por pressupostos.
+- Contratos e dossiês em memória.
+- Vínculo documental aceitando somente CNPJ ou somente número.
+- Paginação PNCP incompleta e falhas de consulta convertidas em ausência.
+- Benchmark aceitando duplicatas, fornecedores diferentes e unidades incompatíveis.
+- Ausência de evidências produzindo conformidade preliminar.
+- Catálogo jurídico usando fallbacks para datas inválidas/fora da cobertura.
+- Decisões de descarte de achados apenas no estado da interface.
+- Município/filtros perdidos ao abrir e retornar de um dossiê.
+- Operações de escrita sem autenticação/autorização no backend.
+
+Transforme estes itens e os requisitos abaixo em uma matriz rastreável: identificador, requisito, implementação existente, correção, teste, evidência e estado.
+
+Registre essa matriz em documentação do projeto, aproveitando documentos equivalentes. Diferencie PLANEJADO, EM_EXECUCAO, IMPLEMENTADO_NAO_VALIDADO, VALIDADO e BLOQUEADO. Um tipo, tela, comentário ou stub não comprova implementação.
+
+3. LICENÇA, IDENTIDADE E DOCUMENTAÇÃO PÚBLICA
+
+Aplicar AGPL-3.0-only ao código próprio:
+- Adicionar LICENSE com o texto integral e inalterado da GNU AGPL versão 3, obtido de fonte oficial.
+- Declarar AGPL-3.0-only no package.json e avisos pertinentes. Não usar or-later nos avisos do projeto.
+- Preservar copyrights e licenças de terceiros. Não relicenciar dependências, modelos ou datasets por associação.
+- Inventariar componentes efetivamente incorporados: origem, versão/commit, licença e atribuições necessárias; gerar avisos de terceiros e SBOM.
+- Incluir na interface acesso à licença e ao código correspondente à versão executada; usar commit/release real.
+- Separar licença do software das condições dos dados/documentos exportados.
+- Padronizar nome, título, metadados e identificação visual como NEXOFIS, preservando referências históricas e atribuições válidas.
+
+Criar ou atualizar README.md, CONTRIBUTING.md, SECURITY.md e documentação de arquitetura, fontes, metodologia, operação, QA e roadmap.
+
+O README deve permitir instalação reproduzível em Windows e Linux, descrever o gerenciador/runtime escolhidos, configuração, execução, testes, backup/recuperação, cobertura das fontes e limitações reais. Usar exemplos públicos e placeholders; não expor infraestrutura interna.
+
+Não inventar contatos, métricas de qualidade, badges de CI ou resultados. A política de segurança deve indicar um canal realmente disponível.
+
+4. REUTILIZAÇÃO E ARQUITETURA
+
+Preservar React/TypeScript e a base Node/Express, salvo impedimento técnico demonstrado.
+
+- Separar responsabilidades do server.ts progressivamente: API, identidade, conectores, documentos, entidades, regras, finanças, jobs e dossiês.
+- Preferir uma aplicação modular e um worker documental isolado. Não adicionar vários brokers, orquestradores ou bancos sem necessidade comprovada.
+- Reutilizar bibliotecas maduras para identidade, filas, validação, OCR e exportação, após avaliar licença, manutenção e custo operacional.
+- Integrar Docling Serve por adapter real. Avaliar PaddleOCR como complemento mediante testes representativos.
+- Avaliar o reaproveitamento de conectores do dados-publicos-mcp; verificar código, licença e cobertura atuais antes de adaptar. MCP é uma interface possível, não uma prova de integridade dos dados.
+- Cada componente deve ser mantido, adaptado, integrado ou descartado com justificativa curta. Repositórios mencionados em conversas não são dependências automaticamente.
+
+Adotar persistência relacional adequada, preferencialmente PostgreSQL compatível com a infraestrutura autorizada, e armazenamento durável dos originais.
+
+Implementar migrations versionadas, restrições de integridade, transações e recuperação. Não usar Map, arrays ou localStorage como fonte canônica de contratos, documentos, jobs ou decisões.
+
+Implementar processamento assíncrono durável:
+- IDs estáveis, chave de idempotência e deduplicação;
+- estados explícitos de fila, processamento, sucesso, falha, cancelamento e recuperação;
+- lease/heartbeat ou mecanismo equivalente;
+- retries limitados, backoff e distinção entre falha transitória e permanente;
+- retomada após reinício sem duplicar registros, despesas ou análises;
+- cancelamento e limites de CPU, memória, tempo e concorrência.
+
+Implementar atualização autônoma configurável por município/fonte, com agenda, checkpoints, detecção de alterações e reanálise somente quando dados, configuração ou regras mudarem. Registrar a próxima execução, permitir pausa/retomada e evitar consultas redundantes. Testar duas execuções consecutivas e recuperação após interrupção.
+
+Reutilizar um mecanismo de jobs compatível com a stack. A chave de processamento deve considerar documento, perfil/versão do extrator e escopo de acesso, evitando vazamento entre organizações.
+
+5. MODELO DE DADOS E VERDADE OPERACIONAL
+
+Modelar identidades e eventos separadamente:
+município, órgão, unidade gestora, secretaria, fornecedor, processo, licitação, adjudicação, contrato, item, aditivo, documento, captura de fonte, evento financeiro, entrega/medição, execução de análise, achado e decisão de revisão.
+
+- Código IBGE deve ser identificador textual validado. Não confundir município com CNPJ da prefeitura ou dos fundos.
+- Verificar o formato vigente de CNPJ nas fontes oficiais; não remover caracteres significativos nem presumir formatos históricos.
+- Distinguir CNPJ do contratante, fornecedor, matriz/filial e participante.
+- Preferir identificador oficial PNCP; usar chaves compostas documentadas quando ele não existir.
+- CNPJ sozinho ou número de contrato sozinho não autorizam vínculo automático.
+- Correspondências ambíguas devem ser apresentadas para revisão, com candidatos e motivos.
+- Não confundir edital/contratação publicada com contrato assinado.
+- Dinheiro deve usar representação decimal exata ou centavos com política explícita de arredondamento.
+- Armazenar data de captura, competência, data do evento, publicação e data da análise separadamente.
+- Preservar divergências entre fontes e suas versões; não sobrescrever silenciosamente uma fonte com outra.
+
+Estados de informação devem distinguir, quando aplicáveis:
+não informado, não coletado, fonte indisponível, coleta parcial, não localizado no escopo consultado, não aplicável, zero confirmado e valor confirmado.
+
+Remover valores presumidos para licitantes, assinatura, vigência, status, fornecedor, município ou abertura de empresa. Ausência não vira zero, regularidade, inexistência de sanção ou conformidade.
+
+Separar prioridade de investigação, cobertura da análise e qualidade da evidência. Soma de pesos não pode ser exibida como probabilidade de fraude.
+
+Retirar dados demonstrativos do fluxo operacional. Fixtures sintéticas são permitidas em testes isolados. Uma demonstração explícita nunca deve contaminar índices, benchmarking, dossiês ou consultas reais.
+
+6. CONECTORES E DESCOBERTA MUNICIPAL
+
+Criar um contrato comum para conectores com identificação, capacidades, jurisdição, períodos cobertos, autenticação necessária, paginação, checkpoints, rate limits, status de saúde e proveniência.
+
+Implementar e validar:
+
+IBGE:
+- Resolução por código ou nome/UF, cache com versão e desambiguação.
+- População obtida da fonte apropriada, com ano de referência; não presumir que a API de localidades fornece população.
+- Preservação de contexto para limites territoriais/períodos quando relevante.
+
+PNCP:
+- Conferir endpoints e schemas oficiais atuais.
+- Paginação completa, coleta incremental e limites configuráveis com indicação de cobertura parcial.
+- Separar publicações, resultados, contratos, aditivos e documentos.
+- Preservar identificadores oficiais e registrar capacidades realmente disponíveis.
+- Não presumir busca nacional por CNPJ do fornecedor se o endpoint não a oferecer; construir índice local persistente com cobertura declarada.
+- Timeout, HTTP 429/5xx e falha de schema não podem virar “nenhum contrato existente”.
+- Dados de demonstração não podem impedir sincronização.
+
+Cadastro e integridade:
+- Integrar fontes cadastrais permitidas e CEIS/CNEP, respeitando requisitos de acesso e limites.
+- Versionar cadastros/QSA e registrar lacunas, inclusive identificadores mascarados.
+- Provedor intermediário deve ser identificado como tal; não atribuir à Receita uma resposta de terceiro sem essa distinção.
+
+Execução financeira:
+- Identificar uma fonte oficial municipal/TCE/TCM com registros vinculáveis para o piloto.
+- Integrar empenhos, liquidações, pagamentos e respectivas retificações quando disponibilizados.
+- Usar SICONFI/FINBRA para os agregados que efetivamente oferecem; não apresentá-los como prova automática de pagamento individual de contrato.
+- Disponibilizar importação estruturada validada para fontes sem API, preservando origem e validação humana.
+
+O aceite deste incremento exige IBGE, PNCP, cadastro/sanções acessíveis e uma fonte financeira oficial do piloto, com cobertura declarada. Isso não dispensa nenhuma correção implementável da auditoria. Integrações nacionais adicionais constituem expansão rastreada por fonte; não são pré-requisito para encerrar o incremento validado nem podem ser apresentadas como prontas.
+
+Manter um registro de cobertura federal, estadual e municipal. Conectores de Compras.gov.br, tribunais, diários e portais locais devem ser implementados conforme disponibilidade verificável, sem inventar APIs ou afirmar cobertura nacional completa.
+
+Se uma fonte exigir acesso indisponível, implementar o contrato do adapter e o estado de indisponibilidade, documentar o bloqueio e continuar os demais itens. Não chamar esse adapter de integração validada.
+
+7. DOCUMENTOS, OCR E PROVENIÊNCIA
+
+Implementar pipeline real:
+recebimento → validação → preservação do original → classificação de páginas → extração textual/layout → OCR quando necessário → normalização → validação de campos → revisão de ambiguidades → indexação.
+
+- PDF nativo exige parser de PDF; buffer latin1 com regex não é extração da camada textual.
+- Integrar Docling Serve com execução comprovada, configuração e versão fixadas.
+- Aplicar OCR somente quando necessário; usar PaddleOCR se o corpus demonstrar benefício.
+- Não executar todos os extratores em todas as páginas sem critério.
+- Registrar motor/modelo, versão, configuração, duração, quantidade real de páginas, erros e estados parciais.
+- Não inventar confiança. Quando houver medida, documentar seu significado e como foi obtida; ela não é confiança jurídica.
+- Preservar tabelas, cabeçalhos, unidades, separadores monetários e vínculos com páginas/trechos.
+- Vincular cada campo extraído ao documento e à evidência correspondente; usar coordenadas quando disponíveis.
+- Documentos são dados não confiáveis: instruções neles contidas não alteram prompts, ferramentas, permissões ou destino de publicação.
+- Modelos generativos podem sugerir campos ou interpretação, sempre com schema, validação e evidência. Não podem preencher fatos ausentes.
+- Modelos externos devem ser opcionais e configurados explicitamente; manter um caminho operacional local sem chave paga obrigatória.
+
+Guardar bytes originais duravelmente e calcular SHA-256 sobre eles. Para páginas, derivados e payloads de fontes, registrar hashes próprios e relacionamento com o original.
+
+Eliminar hashes sentinela e versões fictícias. Não reutilizar o hash de um contrato como comprovação de consulta ao cadastro de sanções. Separar capturedAt de evaluatedAt.
+
+Criar corpus de QA com documentos públicos cuja utilização seja adequada, incluindo PDF nativo, scan, multipágina, tabela e rotação. Dados sensíveis devem ser tratados em artefatos privados. Medir precisão dos campos críticos, erros monetários, páginas/minuto, latência e uso de recursos. Não prometer desempenho sem medição.
+
+O corpus deve ter resultados esperados anotados e critérios de aceite registrados antes da execução. Comparar automaticamente valores, CNPJ, número e datas; resultados incorretos ou abaixo do critério devem impedir vínculo automático e exigir revisão. Velocidade não compensa erro nos campos críticos.
+
+8. BENCHMARK HORIZONTAL REPRODUZÍVEL
+
+Corrigir e completar o motor atual:
+
+- Oferecer modos explícitos: mesmo fornecedor e mercado.
+- No primeiro, exigir identidade compatível do fornecedor; no segundo, declarar que os fornecedores variam.
+- Comparar item/serviço, unidade, período, escopo, licenças, módulos, implantação, suporte, SLA, logística e condições pertinentes.
+- Separar cobranças recorrentes de implantação e outros custos extraordinários.
+- Converter unidades apenas com fatores documentados. Sem conversão demonstrável, excluir a referência.
+- Excluir o próprio contrato, duplicatas, versões/aditivos contados como contratos independentes e valores inválidos.
+- Contar observações independentes e mostrar composição da amostra.
+- Substituir fatores IPCA-like por série oficial versionada, com competências inicial/final e método de cálculo.
+- Se faltar a série, informar comparação nominal ou não verificável; nunca anunciar correção monetária executada.
+- Definir política de amostra mínima, mediana, MAD, MAD zero, assimetria e sensibilidade. Oito linhas não garantem robustez.
+- Não apresentar limiares 1,5x/2x ou z-scores como prova de sobrepreço; são regras de triagem contextualizadas.
+- Retirar percentuais fixos de “confiança”. Qualquer medida exibida exige definição e validação.
+- A memória de cálculo deve usar exatamente os denominadores, normalizações e exclusões executados.
+- Custo per capita só deve ser usado quando a população representar razoavelmente a escala do serviço. Licenças, usuários, refeições, atendimentos ou quantidades físicas podem ser denominadores melhores.
+
+Cada alerta deve mostrar comparáveis, exclusões, fontes, período, unidade, cálculo, limitações e hipóteses alternativas.
+
+9. MOTOR JURÍDICO E TRILHAS DE AUDITORIA
+
+Conferir fontes oficiais antes de codificar normas, limiares e exceções. Não copiar valores de mensagens antigas sem verificar vigência e aplicabilidade.
+
+Cada regra precisa de:
+ID e versão; regime jurídico; jurisdição; evento/data determinante; vigência; fonte oficial; requisitos de evidência; cálculo/predicado; exceções; estados possíveis; severidade; testes positivos, negativos e inconclusivos.
+
+- Não adotar a data de assinatura como marco universal.
+- Não presumir Lei 14.133 para todo contrato; identificar regime aplicável.
+- Datas inválidas, ausentes ou fora da cobertura normativa devem gerar estado inconclusivo, sem fallback para 2026/2024.
+- Não aplicar regras futuras ou atualizações retroativamente.
+- Catálogo deve ter cobertura temporal explícita e revisão rastreável.
+
+Implementar/corrigir as trilhas:
+
+a) Competitividade e publicidade:
+Marcas, cartas de fabricante, certificados, vistorias, exigências geográficas e prazos. Considerar justificativas/exceções legais, modalidade, objeto, calendário e republicação. Menção textual isolada não comprova ilegalidade.
+
+b) Fracionamento:
+Reconstruir agregados por unidade gestora, exercício e natureza/ramo aplicável. Preservar IDs integrantes, tratamento de cancelamentos e classificação incerta. Não confundir 12 meses móveis com exercício nem agrupar apenas por fornecedor.
+
+c) Governança:
+Matriz de riscos, planejamento/PCA e transparência conforme aplicabilidade comprovada. Matriz desconhecida quando obrigatória é não verificável; não é não aplicável. Tratar seguro-garantia separadamente, verificando hipóteses facultativas/obrigatórias.
+
+d) Preços e alterações:
+Sobrepreço relativo, quantidades, descontos e sinais de jogo de planilha; separar acréscimos, supressões, reajustes, reequilíbrio e prorrogação.
+
+e) Integridade:
+Sanção exige identidade, espécie, vigência e abrangência. Entrada no CNEP não equivale automaticamente a impedimento de contratar. UF/órgão desconhecido mantém abrangência inconclusiva.
+
+f) Vínculos societários:
+Relacionar entidades com fontes e períodos. Homônimos, endereço comum, sócios compartilhados ou sobrenomes não comprovam conluio, parentesco ou nepotismo.
+
+g) Execução:
+Divergências entre obrigação, medições, cobrança e pagamento; ordem cronológica exige reconstrução da fila pertinente e exceções. Ausência de flag não comprova ordem correta.
+
+h) Regularidade documental:
+Registrar situação e validade das certidões quando acessíveis, distinguindo consulta falha, documento vencido e situação confirmada. Não automatizar retenção de pagamento ou penalidade a partir de alerta.
+
+O produto produz achados e prioridades de investigação. Não declara fraude comprovada, dolo ou dano ao erário apenas com score ou diferença estatística.
+
+10. GASTOS, ENTREGAS E PRODUTIVIDADE
+
+Completar os painéis com cálculo derivado de registros rastreáveis:
+
+- Contratado original, obrigação atualizada, empenhado, liquidado, cobrado, pago, estornado e medido/entregue são grandezas distintas.
+- Separar totais do período e acumulados; considerar parcelas, retenções, estornos, saldo e fontes de recursos.
+- Conciliar registros duplicados de diferentes portais preservando as duas proveniências.
+- Empenho de R$ 100 + liquidação de R$ 100 + pagamento de R$ 100 representa R$ 100 pagos, nunca R$ 300.
+- Valor contratado dividido pela vigência é estimativa de custo mensal, não prova de pagamento.
+- Falta de dados de pagamento não significa gasto zero.
+
+Produtividade:
+- Definir numerador, denominador, competência, unidade, cobertura e fonte.
+- Calcular custo por entrega com despesa e entrega comparáveis.
+- Não calcular índice com quantidade ausente/zero ou períodos incompatíveis.
+- Diferenciar entrega física, produtividade e resultado social.
+- Saúde: contextualizar tipo/complexidade do atendimento e escopo.
+- Educação: distinguir alunos, matrículas, refeições e entregas contratadas.
+- Obras: usar medições, unidades físicas e cronograma; comparar avanço financeiro e físico com evidências.
+- Administração/software: considerar módulos, usuários/licenças, implantação, SLA e suporte.
+- Referências como SINAPI, BPS, FNDE, INEP ou bases de saúde só podem aparecer como consultadas quando houver captura e método demonstráveis.
+- Comparar municípios por características pertinentes; faixa populacional isolada não garante comparabilidade.
+
+11. UX COMPLETA E REVISÃO HUMANA
+
+Preservar e concluir as telas existentes:
+- Pesquisa por nome/UF ou IBGE com desambiguação obrigatória quando necessário.
+- Órgãos/unidades provenientes de registros conhecidos; não anunciar inventário completo sem cobertura.
+- Secretaria, período, contrato e filtros preservados na navegação, atualização e retorno.
+- Estado navegável pela URL, sem informações sensíveis.
+- Busca por número/ano, CNPJ e URL PNCP, com validação e resolução de ambiguidades.
+- Upload e importação com progresso real do job, falha, retry, cancelamento e processamento parcial.
+- Mensagens claras para fonte indisponível, coleta parcial e dados ausentes.
+- Dossiê com valores financeiros, entregas, comparáveis, cálculo, cobertura, hipóteses e acesso autorizado ao documento original/página.
+- Revisão de achados com autor, justificativa, data e versão.
+- Persistir descarte/restauração; painel, exportação e dossiê salvo devem refletir a mesma revisão.
+- Evitar descarte com justificativa automática inventada.
+- Garantir acessibilidade de teclado, foco, contraste, formulários e uso responsivo.
+
+Exibir detalhes técnicos de evidência quando ajudarem a verificação. Não revelar segredos, caminhos internos, hosts ou informações operacionais na interface pública.
+
+12. SEGURANÇA, LGPD E OBSERVABILIDADE
+
+- Implementar identidade/sessão com componente consolidado e configuração segura.
+- Autorizar no backend cada leitura protegida, mutação, exportação e acesso a documento.
+- Definir papéis suficientes para administrar, analisar e consultar. Bootstrap administrativo seguro, sem credencial padrão publicada.
+- Modelar separação de organizações/casos privados quando aplicável e testar acesso cruzado.
+- Definir explicitamente o que é leitura pública; repositório público não torna todo documento importado público.
+- Validar schemas de entrada e limites; aplicar proteção CSRF quando pertinente, cookies seguros e política CORS adequada.
+- Validar tipo real, tamanho, páginas, nomes e conteúdo dos uploads; usar worker isolado com limites e política de quarentena/varredura. Indisponibilidade do scanner não pode ser exibida como arquivo verificado.
+- Se houver download remoto, restringir protocolos/hosts e validar DNS, redirecionamentos e destinos privados/reservados; limitar tamanho/tempo. Não permitir acesso arbitrário à rede interna.
+- Tratar HTML, PDF e planilhas exportadas contra conteúdo ativo, XSS e injeção de fórmulas.
+- Proteger segredos; sanitizar logs; não registrar documentos, CPFs completos ou tokens inadvertidamente.
+- Minimizar dados pessoais e definir retenção, acesso, expurgo e preservação de evidências conforme a finalidade.
+- Aplicar logs estruturados, IDs de correlação, métricas de fila, erros por fonte, latência, volume, qualidade de extração e cobertura.
+- Reprocessamento e decisões devem possuir trilha append-only ou equivalente auditável.
+- Documentar backup, restore e recuperação de jobs; validar recuperação em QA.
+
+13. EXPORTAÇÃO E PACOTE DE EVIDÊNCIAS
+
+Entregar CSV, JSON, Markdown e relatório PDF pesquisável usando bibliotecas existentes, com controle de acesso.
+
+O pacote deve conter ou referenciar:
+manifesto; versão da aplicação e regras; fontes/capturas; originais autorizados ou referências resolvíveis; hashes reais; extrações; memória de cálculo; decisões humanas; limitações e data da análise.
+
+- Permitir verificar hashes e reproduzir cálculos sem depender da aparência da tela.
+- Preservar versões anteriores; alteração de documento cria nova versão.
+- Separar exportação pública sanitizada de pacote integral restrito.
+- Não publicar automaticamente pacotes no GitHub.
+
+Corrigir e validar OCDS contra uma versão oficial fixada:
+- implementation deve ficar em contracts[].implementation, conforme a versão fixada do schema;
+- status, identificadores, tags e listas de códigos devem seguir o schema;
+- não transformar empenho, liquidação, cobrança e medição em pagamentos;
+- não inventar planejamento, licitação ou adjudicação a partir do valor contratado;
+- usar campos documentados e política de identificadores compatível, sem afirmar um prefixo oficialmente registrado se não houver registro;
+- validar tanto JSON Schema quanto semântica financeira e temporal.
+
+14. TESTES, BUILD E ACEITE
+
+Definir scripts reais e reproduzíveis para install, lint, typecheck, test, build e start.
+Fixar versões de runtime/gerenciador compatíveis. Reutilizar bun.lock; não manter múltiplos lockfiles concorrentes sem justificativa.
+
+Não mascarar conflitos com --force ou --legacy-peer-deps. Revisar scripts de instalação de terceiros e executar somente os necessários e confiáveis.
+
+O comando de produção precisa iniciar o backend e servir a aplicação construída. Vite build sozinho não comprova a API nem a resolução dos imports TypeScript.
+
+Manter e ampliar os testes existentes com casos de falha relevantes. Fixtures e doubles são permitidos nos testes, identificados e isolados; não substituem validação com fontes reais.
+
+Regressões obrigatórias:
+1. Mesmo número de contrato em municípios/órgãos diferentes: nenhum vínculo incorreto.
+2. Mesmo fornecedor com vários contratos: upload não anexa ao primeiro apenas por CNPJ.
+3. Registro repetido oito vezes: uma observação independente no benchmark.
+4. Fornecedor diferente no modo mesmo fornecedor: excluído.
+5. Unidade anual versus mensal sem conversão: excluída ou convertida com fator demonstrável.
+6. MAD zero, amostra pequena, preço negativo/NaN e referência ausente: tratamento definido, sem confiança inventada.
+7. Data ausente/inválida e período fora do catálogo: nenhuma norma selecionada por adivinhação.
+8. Contrato sem fontes/documentos: cobertura insuficiente, sem declaração de conformidade.
+9. Matriz obrigatória desconhecida: não verificável.
+10. Pagamento sem fila conhecida: ordem não verificável.
+11. Sanção sem abrangência demonstrável: impedimento inconclusivo.
+12. Fracionamento com exercício, unidade ou ramo distintos: sem agregação indevida.
+13. Mesmo pagamento em duas fontes: uma despesa reconciliada.
+14. Empenho/liquidação/pagamento de R$ 100: pago total R$ 100.
+15. Produtividade sem entrega ou competência compatível: indicador não calculado.
+16. Timeout, rate limit e resposta parcial: nenhuma conclusão de inexistência.
+17. PDF nativo, scan e multipágina: extrator, páginas e trechos correspondem ao original.
+18. Reimportação e retry: sem duplicar contrato, documento ou despesas.
+19. Reinício durante job: retomada segura e originais recuperáveis.
+20. Descartar/restaurar achado: mesma revisão na tela, banco e exportação.
+21. Voltar do dossiê: município, secretaria e período preservados.
+22. Acesso anônimo/cross-organization indevido: negado conforme política.
+23. Upload malformado/excessivo e URL proibida: rejeitados controladamente.
+24. Documento alterado: divergência de hash detectada e versão anterior preservada.
+25. OCDS e relatório parcial: estrutura válida sem fatos inventados.
+
+Criar CI com instalação congelada, lint real quando configurado, typecheck, testes, build, verificação de licença e revisão automatizada contra secrets. Pinagem e permissões dos workflows devem ser apropriadas.
+
+Executar smoke da aplicação em modo de produção em ambiente isolado, teste de migrations e recuperação.
+
+Executar jornada real com ao menos um município e contrato públicos. Priorizar Barra do Choça/BA se as fontes necessárias estiverem disponíveis; caso contrário, escolher e justificar um piloto com cobertura verificável, mantendo visíveis as limitações de Barra do Choça.
+
+A jornada deve provar busca, seleção, documento original, extração, vínculo correto, análise, revisão, persistência após reinício e exportação. Conciliar pagamentos/entregas quando houver documentação; a ausência real desses dados deve aparecer como ausência, nunca ser preenchida por seed.
+
+Validar também um caso horizontal real com contratos independentes de pelo menos dois municípios, demonstrando identidade do fornecedor, escopo, unidade e exclusões. A amostra pode ser estatisticamente insuficiente: o gate comprova coleta e comparabilidade, sem exigir um alerta. Se documentos comparáveis não estiverem acessíveis, registrar o bloqueio específico.
+
+Registrar comandos, versões, resultados, duração e evidências sanitizadas. Não alterar assertivas apenas para preservar um score antigo. Não omitir falhas nem usar continue-on-error para obter gate verde.
+
+15. DOCUMENTAÇÃO, COMMITS E PUSH
+
+Organizar o trabalho em incrementos dependentes:
+A. Verdade dos dados, licença/identidade e execução reproduzível.
+B. Persistência, segurança, jobs e fluxo documental real.
+C. Coleta completa no escopo, benchmark/regras e finanças.
+D. UX final, exportações, regressões, CI e jornada real.
+
+Antes de cada commit/push:
+- revisar o diff e os arquivos incluídos;
+- executar testes pertinentes, typecheck e build aplicáveis;
+- verificar secrets e dados pessoais;
+- garantir que docs e estado de entrega correspondam ao código;
+- não versionar dependências, caches, dist, originais operacionais ou dumps.
+
+Fazer commits pequenos e coerentes e pushes após gates aprovados.
+Antes do push, revalidar a main remota e integrar mudanças concorrentes sem sobrescrevê-las. Nunca usar force-push.
+
+Manter documentação de arquitetura, requisitos, decisões, cobertura, metodologia, QA, roadmap e continuidade atualizada. Não duplicar planos conflitantes.
+
+O roadmap registra expansão e bloqueios reais. Não usar o roadmap para adiar correções implementáveis desta missão.
+
+Após publicar:
+- conferir SHA local/remoto;
+- acompanhar os workflows e corrigir falhas relacionadas;
+- verificar LICENSE, README e instruções na versão publicada;
+- informar commits e links de CI;
+- se proteção exigir PR, informar o link e que a main ainda não recebeu a alteração, sem alegar push concluído na main.
+
+16. DEFINIÇÃO DE ENTREGA E RELATÓRIO FINAL
+
+Só declarar concluído o que tiver código, execução comprovada e evidência correspondente.
+
+Entregar:
+1. Resumo do que mudou e por quê.
+2. Componentes reutilizados, versões e licenças.
+3. Matriz requisito → implementação → teste → evidência → estado.
+4. Comandos exatos de instalação/execução/QA para Windows e Linux.
+5. Resultado separado de lint, typecheck, testes, build, smoke, integração real e CI.
+6. Evidência da jornada e da recuperação após reinício.
+7. Cobertura atual das fontes e limitações dos indicadores.
+8. Procedimento de backup/restore e rollback do código.
+9. SHA final, commits, URL do repositório e estado do push/PR.
+10. Bloqueios externos remanescentes, com causa, dependência e próximo passo.
+
+Não encerrar após a primeira etapa se outras estiverem executáveis. Se houver limitação externa, conclua as partes independentes e registre o estado honesto, sem declarar a plataforma inteira pronta.
+
+Testes comprovam comportamentos e rastreabilidade; não constituem prova automática de fraude nem certificação jurídica.
+
+REFERÊNCIAS PARA VERIFICAÇÃO
+
+- Repositório: https://github.com/devdudumuniz/NEXOFIS
+- GNU AGPL v3: https://www.gnu.org/licenses/agpl-3.0.html
+- Identificador ONLY: https://spdx.org/licenses/AGPL-3.0-only.html
+- Docling Serve: https://github.com/docling-project/docling-serve
+- Docling: https://github.com/docling-project/docling
+- PaddleOCR: https://github.com/PaddlePaddle/PaddleOCR
+- Conectores candidatos: https://github.com/Licitei/dados-publicos-mcp
+- OCDS: https://standard.open-contracting.org/latest/en/schema/reference/
+
+Verifique documentação, licença, versões e acesso atuais antes de integrar. Execute o trabalho agora, com preservação do existente e validação em cada incremento.

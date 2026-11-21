@@ -13,10 +13,10 @@ import { formatCurrencyBRL, formatDateBR, formatPercentageBR } from './formatter
 import {
   getDispensationLimitForContract,
   isRiskMatrixMandatory,
-  resolveLegalRulesetForDate,
+  resolveLegalRulesetStrict,
 } from './legalRules';
 
-export const RISK_ENGINE_VERSION = 'forensic-engine-2026.11';
+export const RISK_ENGINE_VERSION = 'forensic-engine-2026.12';
 
 function daysBetween(dateA: string, dateB: string): number {
   const a = new Date(dateA).getTime();
@@ -158,37 +158,57 @@ export function analyzeExecutionChain(contract: ContractRecord): ExecutionChainS
     (contract.updatedValue / Math.max(1, durationMonths)).toFixed(2)
   );
 
-  const committedTotal = contract.payments
+  // Deduplicate identical financial events reported across multiple transparency portals
+  const seenKeys = new Set<string>();
+  const uniquePayments = contract.payments.filter((p) => {
+    if (!Number.isFinite(p.amount) || p.amount < 0) return false;
+    const key = [
+      p.type,
+      (p.documentNumber || '').trim().toLowerCase(),
+      (p.date || '').slice(0, 10),
+      Math.round(p.amount * 100),
+    ].join('|');
+    if (seenKeys.has(key)) return false;
+    seenKeys.add(key);
+    return true;
+  });
+
+  const committedTotal = uniquePayments
     .filter((p) => p.type === 'Empenho')
     .reduce((s, p) => s + p.amount, 0);
-  const liquidatedTotal = contract.payments
+  const liquidatedTotal = uniquePayments
     .filter((p) => p.type === 'Liquidação')
     .reduce((s, p) => s + p.amount, 0);
-  const paidTotal = contract.payments
+  const paidTotal = uniquePayments
     .filter((p) => p.type === 'Pagamento')
     .reduce((s, p) => s + p.amount, 0);
-  const billedTotal = contract.payments
+  const billedTotal = uniquePayments
     .filter((p) => p.type === 'Instrumento de Cobrança')
     .reduce((s, p) => s + p.amount, 0);
-  const deliveredVerifiedTotal = contract.payments
+  const deliveredVerifiedTotal = uniquePayments
     .filter((p) => p.type === 'Entrega / Medição')
     .reduce((s, p) => s + p.amount, 0);
 
   const provenExecutionAvailable =
     committedTotal > 0 || liquidatedTotal > 0 || paidTotal > 0 || billedTotal > 0;
 
-  const outOfOrder = contract.payments.filter((p) => p.paidOutOfOrder);
+  const outOfOrder = uniquePayments.filter((p) => p.paidOutOfOrder);
+  const hasKnownQueueOrder = uniquePayments.some(
+    (p) =>
+      (p.type === 'Pagamento' || p.type === 'Liquidação') &&
+      typeof p.chronologicalPosition === 'number' &&
+      Number.isFinite(p.chronologicalPosition)
+  );
+
   let chronologicalOrderStatus: ExecutionChainSummary['chronologicalOrderStatus'] = 'not_verifiable';
-  if (contract.payments.some((p) => p.type === 'Pagamento' || p.type === 'Liquidação')) {
-    if (outOfOrder.length === 0) {
-      chronologicalOrderStatus = 'valid_sequence';
-    } else if (
-      outOfOrder.some((p) => !p.outOfOrderJustification || !p.justificationPublished)
-    ) {
+  if (outOfOrder.length > 0) {
+    if (outOfOrder.some((p) => !p.outOfOrderJustification || !p.justificationPublished)) {
       chronologicalOrderStatus = 'unexplained_break';
     } else {
       chronologicalOrderStatus = 'justified_exception';
     }
+  } else if (hasKnownQueueOrder) {
+    chronologicalOrderStatus = 'valid_sequence';
   }
 
   return {
@@ -211,9 +231,18 @@ export function evaluateContractRisk(contract: ContractRecord): RiskAssessment {
   const evidences: EvidenceItem[] = [];
   const evaluatedAt = new Date().toISOString();
 
-  // Legal Time Travel: resolve monetary thresholds & decree valid on signatureDate
-  const appliedLegalRuleset = resolveLegalRulesetForDate(contract.signatureDate);
+  // Legal Time Travel: strict temporal resolution without silent fallback
+  const legalResolution = resolveLegalRulesetStrict(contract.signatureDate);
+  const appliedLegalRuleset = legalResolution.ruleset;
   const rulesetVersion = appliedLegalRuleset.ruleId;
+  if (legalResolution.status === 'inconclusive') {
+    nonApplicableChecks.push({
+      code: 'BR-LEGAL-TEMPORAL',
+      title: 'Resolução normativa temporal (Lei 14.133/2021)',
+      state: 'NOT_VERIFIABLE',
+      rationale: legalResolution.reason,
+    });
+  }
 
   const variationPct =
     contract.originalValue > 0
@@ -256,22 +285,39 @@ export function evaluateContractRisk(contract: ContractRecord): RiskAssessment {
     return id;
   };
 
-  // 1. BR-SANC-001: Sanctions with temporal validity & entity/sphere scope verification
-  const effectiveSanctions = contract.supplier.sanctions.filter((s) => {
-    const dateWithinPeriod =
-      s.startDate <= contract.signatureDate && contract.signatureDate <= s.endDate;
-    if (!dateWithinPeriod) return false;
+  // 1. BR-SANC-001: Sanctions with temporal validity & strict entity/sphere scope verification
+  const activeSanctionsOnDate = contract.supplier.sanctions.filter(
+    (s) =>
+      Boolean(contract.signatureDate) &&
+      s.startDate <= contract.signatureDate &&
+      contract.signatureDate <= s.endDate
+  );
+
+  const ambiguousSanctions = activeSanctionsOnDate.filter(
+    (s) =>
+      (s.scope === 'Estadual' && !s.scopeUf?.trim()) ||
+      (s.scope === 'Órgão Sancionador' && !s.sanctioningOrgan?.trim())
+  );
+
+  const effectiveSanctions = activeSanctionsOnDate.filter((s) => {
     if (s.scope === 'Nacional') return true;
-    if (s.scope === 'Estadual') return !s.scopeUf || s.scopeUf === contract.uf;
+    if (s.scope === 'Estadual') {
+      return Boolean(s.scopeUf?.trim()) && s.scopeUf!.trim().toUpperCase() === contract.uf.toUpperCase();
+    }
     // Órgão Sancionador only restricts the sanctioning organ itself
-    return s.sanctioningOrgan.toLowerCase().includes(contract.municipalityName.toLowerCase());
+    const organ = s.sanctioningOrgan?.trim().toLowerCase() ?? '';
+    if (!organ) return false;
+    return (
+      organ.includes(contract.municipalityName.toLowerCase()) ||
+      organ.includes(contract.entityName.toLowerCase())
+    );
   });
 
   if (effectiveSanctions.length > 0) {
     const first = effectiveSanctions[0];
     const evId = pushEvidence({
       indicatorCode: 'BR-SANC-001',
-      ruleVersion: '2.0.0',
+      ruleVersion: '2.1.0',
       sourceSystem: first.sourceSystem,
       documentId: primaryDoc?.id ?? 'REG-CGU',
       documentTitle: `${first.registry} — ${first.sanctioningOrgan}`,
@@ -286,7 +332,7 @@ export function evaluateContractRisk(contract: ContractRecord): RiskAssessment {
     indicators.push({
       findingId: nextFindingId(),
       code: 'BR-SANC-001',
-      ruleVersion: '2.0.0',
+      ruleVersion: '2.1.0',
       legalRulesetVersion: rulesetVersion,
       framework: 'Integridade / Sanções',
       state: 'CONFIRMED_DATA',
@@ -306,6 +352,13 @@ export function evaluateContractRisk(contract: ContractRecord): RiskAssessment {
       calculation: `Identidade (CNPJ) + vigência (${first.startDate}..${first.endDate}) + abrangência (${first.scope}) verificadas simultaneamente.`,
       legalReference: 'Lei nº 14.133/2021, art. 14, III e art. 156',
       evidenceIds: [evId],
+    });
+  } else if (ambiguousSanctions.length > 0) {
+    nonApplicableChecks.push({
+      code: 'BR-SANC-001',
+      title: 'Sanção vigente com abrangência incompleta no cadastro',
+      state: 'NOT_VERIFIABLE',
+      rationale: `Há ${ambiguousSanctions.length} sanção(ões) vigente(s) em ${formatDateBR(contract.signatureDate)}, porém sem UF de abrangência estadual ou órgão sancionador especificado — impossível confirmar impedimento aplicável ao ente contratante sem diligência.`,
     });
   } else if (contract.supplier.sanctions.length > 0) {
     nonApplicableChecks.push({
@@ -661,7 +714,15 @@ export function evaluateContractRisk(contract: ContractRecord): RiskAssessment {
       contract.legalDispensationLimit ??
       getDispensationLimitForContract(appliedLegalRuleset, contract.dispensationArticle ?? 'art75_II');
 
-    if (contract.branchClassificationUncertain) {
+    if (temporalLimit === null) {
+      nonApplicableChecks.push({
+        code: 'BR-FRAC-001',
+        title: 'Fracionamento de despesa (limite normativo indisponível para a data)',
+        state: 'NOT_VERIFIABLE',
+        rationale:
+          'Sem decreto temporal válido para a data da assinatura; o motor recusa inferir limite monetário de dispensa por fallback.',
+      });
+    } else if (contract.branchClassificationUncertain) {
       nonApplicableChecks.push({
         code: 'BR-FRAC-001',
         title: 'Fracionamento de despesa (ramo de atividade incerto)',
@@ -725,10 +786,17 @@ export function evaluateContractRisk(contract: ContractRecord): RiskAssessment {
     ruleset: appliedLegalRuleset,
   });
 
-  if (riskMatrixReq.mandatory && contract.riskMatrixPresent === false) {
+  if (!riskMatrixReq.verifiable) {
+    nonApplicableChecks.push({
+      code: 'BR-RISKMAT-001',
+      title: 'Matriz de riscos obrigatória (art. 22, § 3º)',
+      state: 'NOT_VERIFIABLE',
+      rationale: riskMatrixReq.reason,
+    });
+  } else if (riskMatrixReq.mandatory && contract.riskMatrixPresent === false) {
     const evId = pushEvidence({
       indicatorCode: 'BR-RISKMAT-001',
-      ruleVersion: '1.0.0',
+      ruleVersion: '1.1.0',
       sourceSystem: 'PNCP / Edital e Anexos',
       documentId: editalDoc?.id ?? primaryDoc?.id ?? 'EDITAL-MR',
       documentTitle: editalDoc?.title ?? 'Edital / Contrato',
@@ -743,7 +811,7 @@ export function evaluateContractRisk(contract: ContractRecord): RiskAssessment {
     indicators.push({
       findingId: nextFindingId(),
       code: 'BR-RISKMAT-001',
-      ruleVersion: '1.0.0',
+      ruleVersion: '1.1.0',
       legalRulesetVersion: rulesetVersion,
       framework: 'Regra Jurídica Temporal',
       state: 'INSUFFICIENT_EVIDENCE',
@@ -762,6 +830,20 @@ export function evaluateContractRisk(contract: ContractRecord): RiskAssessment {
       calculation: riskMatrixReq.reason,
       legalReference: 'Lei nº 14.133/2021, art. 22, § 3º',
       evidenceIds: [evId],
+    });
+  } else if (riskMatrixReq.mandatory && contract.riskMatrixPresent === undefined) {
+    nonApplicableChecks.push({
+      code: 'BR-RISKMAT-001',
+      title: 'Matriz de riscos obrigatória (presença não verificada)',
+      state: 'NOT_VERIFIABLE',
+      rationale: `${riskMatrixReq.reason} Presença do anexo não foi verificada nos documentos coletados (riskMatrixPresent desconhecido).`,
+    });
+  } else if (riskMatrixReq.mandatory && contract.riskMatrixPresent === true) {
+    nonApplicableChecks.push({
+      code: 'BR-RISKMAT-001',
+      title: 'Matriz de riscos obrigatória (art. 22, § 3º)',
+      state: 'CONFIRMED_DATA',
+      rationale: `${riskMatrixReq.reason} Matriz de riscos confirmada nos anexos do processo.`,
     });
   } else {
     nonApplicableChecks.push({
@@ -966,64 +1048,82 @@ export function evaluateContractRisk(contract: ContractRecord): RiskAssessment {
   // 12. BR-EFIC-001: Spend vs Output efficiency (Produtividade com denominador operacional)
   if (contract.productivity) {
     const prod = contract.productivity;
-    const costDeviationPct =
-      prod.benchmarkUnitCost > 0
-        ? ((prod.actualUnitCost - prod.benchmarkUnitCost) / prod.benchmarkUnitCost) * 100
-        : 0;
-    const physicalGap =
-      prod.financialProgressPct !== undefined && prod.physicalProgressPct !== undefined
-        ? prod.financialProgressPct - prod.physicalProgressPct
-        : 0;
+    const validProductivityInputs =
+      Number.isFinite(prod.deliveredOutput) &&
+      prod.deliveredOutput > 0 &&
+      Number.isFinite(prod.contractedOutput) &&
+      prod.contractedOutput > 0 &&
+      Number.isFinite(prod.actualUnitCost) &&
+      prod.actualUnitCost > 0 &&
+      Number.isFinite(prod.benchmarkUnitCost) &&
+      prod.benchmarkUnitCost > 0;
 
-    if (costDeviationPct >= 20 || physicalGap >= 20) {
-      const evId = pushEvidence({
-        indicatorCode: 'BR-EFIC-001',
-        ruleVersion: '2.0.0',
-        sourceSystem: prod.benchmarkSource,
-        documentId: primaryDoc?.id ?? 'PRODUTIVIDADE',
-        documentTitle: `Indicador de Produtividade — ${prod.domain}`,
-        pageNumber: 1,
-        excerpt:
-          physicalGap >= 20
-            ? `Avanço financeiro de ${prod.financialProgressPct}% frente a avanço físico medido de ${prod.physicalProgressPct}% (descompasso de ${physicalGap} p.p.).`
-            : `Custo operacional efetivo de ${formatCurrencyBRL(prod.actualUnitCost)}/${prod.unitLabel} frente à referência ${formatCurrencyBRL(prod.benchmarkUnitCost)}/${prod.unitLabel} (+${costDeviationPct.toFixed(1)}%).`,
-        normalizedValue: `${formatCurrencyBRL(prod.actualUnitCost)}/${prod.unitLabel}`,
-        calculation:
-          physicalGap >= 20
-            ? `Avanço Financeiro (${prod.financialProgressPct}%) − Avanço Físico (${prod.physicalProgressPct}%) = ${physicalGap} p.p.`
-            : `(${prod.actualUnitCost.toFixed(2)} − ${prod.benchmarkUnitCost.toFixed(2)}) ÷ ${prod.benchmarkUnitCost.toFixed(2)} = +${costDeviationPct.toFixed(2)}%`,
-        sha256: primaryDoc?.sha256 ?? 'efficiency-hash',
-        retrievedAt: evaluatedAt,
-      });
-
-      indicators.push({
-        findingId: nextFindingId(),
+    if (!validProductivityInputs) {
+      nonApplicableChecks.push({
         code: 'BR-EFIC-001',
-        ruleVersion: '2.0.0',
-        legalRulesetVersion: rulesetVersion,
-        framework: 'Produtividade',
-        state: 'OBSERVATION',
-        evidenceLevel: 'B',
-        confidence: 0.86,
-        title:
-          physicalGap >= 20
-            ? `Descompasso físico-financeiro (${physicalGap} p.p.)`
-            : `Custo por entrega ${Math.round(costDeviationPct)}% acima do parâmetro`,
-        severity: costDeviationPct >= 35 || physicalGap >= 30 ? 'ALTA' : 'MÉDIA',
-        weightPoints: costDeviationPct >= 35 || physicalGap >= 30 ? 12 : 8,
-        summary:
-          physicalGap >= 20
-            ? `Execução financeira (${prod.financialProgressPct}%) supera o avanço físico entregue (${prod.physicalProgressPct}%).`
-            : `Custo efetivo por output mensurável (${formatCurrencyBRL(prod.actualUnitCost)}/${prod.unitLabel}) excede o parâmetro (${formatCurrencyBRL(prod.benchmarkUnitCost)}/${prod.unitLabel}).`,
-        notAConclusion: 'Avaliar boletins de medição pendentes de lançamento ou custos de mobilização inicial previstos em cronograma.',
-        alternativeHypotheses: [
-          'Adiantamento contratual de mobilização ou aquisição de insumos em estoque já medidos fisicamente mas pendentes de lançamento no portal.',
-        ],
-        dataUsed: `${prod.domain} · Entregue: ${prod.deliveredOutput.toLocaleString('pt-BR')} / ${prod.contractedOutput.toLocaleString('pt-BR')} ${prod.unitLabel}`,
-        source: prod.benchmarkSource,
-        calculation: `Eficiência = output público mensurável ÷ despesa real (${formatCurrencyBRL(prod.actualUnitCost)}/${prod.unitLabel})`,
-        evidenceIds: [evId],
+        title: `Produtividade operacional (${prod.domain})`,
+        state: 'NOT_VERIFIABLE',
+        rationale:
+          'Entregas medidas, quantidade contratada ou custo unitário de referência zerados/inválidos; cálculo de eficiência recusado.',
       });
+    } else {
+      const costDeviationPct =
+        ((prod.actualUnitCost - prod.benchmarkUnitCost) / prod.benchmarkUnitCost) * 100;
+      const physicalGap =
+        prod.financialProgressPct !== undefined && prod.physicalProgressPct !== undefined
+          ? prod.financialProgressPct - prod.physicalProgressPct
+          : 0;
+
+      if (costDeviationPct >= 20 || physicalGap >= 20) {
+        const evId = pushEvidence({
+          indicatorCode: 'BR-EFIC-001',
+          ruleVersion: '2.1.0',
+          sourceSystem: prod.benchmarkSource,
+          documentId: primaryDoc?.id ?? 'PRODUTIVIDADE',
+          documentTitle: `Indicador de Produtividade — ${prod.domain}`,
+          pageNumber: 1,
+          excerpt:
+            physicalGap >= 20
+              ? `Avanço financeiro de ${prod.financialProgressPct}% frente a avanço físico medido de ${prod.physicalProgressPct}% (descompasso de ${physicalGap} p.p.).`
+              : `Custo operacional efetivo de ${formatCurrencyBRL(prod.actualUnitCost)}/${prod.unitLabel} frente à referência ${formatCurrencyBRL(prod.benchmarkUnitCost)}/${prod.unitLabel} (+${costDeviationPct.toFixed(1)}%).`,
+          normalizedValue: `${formatCurrencyBRL(prod.actualUnitCost)}/${prod.unitLabel}`,
+          calculation:
+            physicalGap >= 20
+              ? `Avanço Financeiro (${prod.financialProgressPct}%) − Avanço Físico (${prod.physicalProgressPct}%) = ${physicalGap} p.p.`
+              : `(${prod.actualUnitCost.toFixed(2)} − ${prod.benchmarkUnitCost.toFixed(2)}) ÷ ${prod.benchmarkUnitCost.toFixed(2)} = +${costDeviationPct.toFixed(2)}%`,
+          sha256: primaryDoc?.sha256 ?? 'efficiency-hash',
+          retrievedAt: evaluatedAt,
+        });
+
+        indicators.push({
+          findingId: nextFindingId(),
+          code: 'BR-EFIC-001',
+          ruleVersion: '2.1.0',
+          legalRulesetVersion: rulesetVersion,
+          framework: 'Produtividade',
+          state: 'OBSERVATION',
+          evidenceLevel: 'B',
+          confidence: 0.86,
+          title:
+            physicalGap >= 20
+              ? `Descompasso físico-financeiro (${physicalGap} p.p.)`
+              : `Custo por entrega ${Math.round(costDeviationPct)}% acima do parâmetro`,
+          severity: costDeviationPct >= 35 || physicalGap >= 30 ? 'ALTA' : 'MÉDIA',
+          weightPoints: costDeviationPct >= 35 || physicalGap >= 30 ? 12 : 8,
+          summary:
+            physicalGap >= 20
+              ? `Execução financeira (${prod.financialProgressPct}%) supera o avanço físico entregue (${prod.physicalProgressPct}%).`
+              : `Custo efetivo por output mensurável (${formatCurrencyBRL(prod.actualUnitCost)}/${prod.unitLabel}) excede o parâmetro (${formatCurrencyBRL(prod.benchmarkUnitCost)}/${prod.unitLabel}).`,
+          notAConclusion: 'Avaliar boletins de medição pendentes de lançamento ou custos de mobilização inicial previstos em cronograma.',
+          alternativeHypotheses: [
+            'Adiantamento contratual de mobilização ou aquisição de insumos em estoque já medidos fisicamente mas pendentes de lançamento no portal.',
+          ],
+          dataUsed: `${prod.domain} · Entregue: ${prod.deliveredOutput.toLocaleString('pt-BR')} / ${prod.contractedOutput.toLocaleString('pt-BR')} ${prod.unitLabel}`,
+          source: prod.benchmarkSource,
+          calculation: `Eficiência = output público mensurável ÷ despesa real (${formatCurrencyBRL(prod.actualUnitCost)}/${prod.unitLabel})`,
+          evidenceIds: [evId],
+        });
+      }
     }
   }
 
@@ -1041,6 +1141,20 @@ export function evaluateContractRisk(contract: ContractRecord): RiskAssessment {
   const rawScore = indicators.reduce((sum, ind) => sum + ind.weightPoints, 0);
   const score = Math.min(100, Math.max(0, rawScore));
 
+  // Declared evidentiary coverage: refuse "Conformidade preliminar" when no source or document exists
+  const hasSources = contract.sourceRecords.length > 0;
+  const hasDocs = contract.documents.length > 0;
+  const hasMonetaryData = contract.originalValue > 0 || contract.updatedValue > 0;
+  const hasItemsOrBench = contract.items.length > 0 || Boolean(contract.benchmarkPeers);
+  const hasPayments = contract.payments.length > 0;
+
+  let coverageStatus: NonNullable<RiskAssessment['coverageStatus']> = 'ADEQUATE';
+  if (!hasSources && !hasDocs) {
+    coverageStatus = 'INSUFFICIENT';
+  } else if (!hasMonetaryData || (!hasItemsOrBench && !hasPayments)) {
+    coverageStatus = 'PARTIAL';
+  }
+
   let classification: RiskAssessment['classification'];
   let headline: string;
   if (score >= 70) {
@@ -1052,6 +1166,9 @@ export function evaluateContractRisk(contract: ContractRecord): RiskAssessment {
   } else if (score >= 20) {
     classification = 'Atenção moderada';
     headline = `RISCO ${score}/100 — atenção moderada`;
+  } else if (coverageStatus === 'INSUFFICIENT') {
+    classification = 'Cobertura insuficiente';
+    headline = `RISCO ${score}/100 — cobertura insuficiente para conformidade`;
   } else {
     classification = 'Conformidade preliminar';
     headline = `RISCO ${score}/100 — sem indícios críticos detectados`;
@@ -1060,6 +1177,7 @@ export function evaluateContractRisk(contract: ContractRecord): RiskAssessment {
   return {
     score,
     classification,
+    coverageStatus,
     headline,
     variationPct,
     amendmentTotalPct,

@@ -5,13 +5,24 @@ import {
   Check,
   Download,
   FileCode2,
+  FileDown,
   RefreshCw,
   RotateCcw,
   ShieldAlert,
   XCircle,
 } from 'lucide-react';
-import type { EvaluatedContract, FindingState, RiskIndicator } from '../types/audit';
-import { checkLiveSupplierCnpj, saveDossier } from '../lib/api';
+import type {
+  EvaluatedContract,
+  FindingReviewRecord,
+  FindingState,
+  RiskIndicator,
+} from '../types/audit';
+import {
+  checkLiveSupplierCnpj,
+  fetchFindingReviews,
+  saveDossier,
+  submitFindingReview,
+} from '../lib/api';
 import {
   formatBytes,
   formatCnpj,
@@ -20,6 +31,7 @@ import {
   formatPercentageBR,
 } from '../lib/formatters';
 import { buildAuditDossierMarkdown, mapContractToOCDS } from '../lib/ocdsMapper';
+import { downloadAuditReportPdf } from '../lib/pdfReportGenerator';
 import { getRiskToneClass, SeverityText } from './RiskText';
 import { EntityGraphTab } from './EntityGraphTab';
 
@@ -102,12 +114,13 @@ export function ContractDossierView({
     assessment.indicators[0]?.code ?? null
   );
 
-  // Auditor dismissal state per findingId
-  const [dismissedFindings, setDismissedFindings] = useState<
-    Record<string, { rationale: string; dismissedAt: string }>
-  >({});
+  // Persisted append-only auditor review log
+  const [reviewHistory, setReviewHistory] = useState<FindingReviewRecord[]>(contract.reviews ?? []);
   const [dismissingCode, setDismissingCode] = useState<string | null>(null);
   const [dismissRationaleInput, setDismissRationaleInput] = useState('');
+  const [reviewAuthorInput, setReviewAuthorInput] = useState('Auditor(a) Responsável');
+  const [submittingReview, setSubmittingReview] = useState(false);
+  const [reviewError, setReviewError] = useState<string | null>(null);
 
   // Save dossier state
   const [showSaveBox, setShowSaveBox] = useState(false);
@@ -115,7 +128,7 @@ export function ContractDossierView({
   const [savingDossier, setSavingDossier] = useState(false);
   const [savedFeedback, setSavedFeedback] = useState<string | null>(null);
 
-  // Live Receita/CNPJ enrichment state
+  // Live CNPJ enrichment state (intermediary provider)
   const [checkingCnpj, setCheckingCnpj] = useState(false);
   const [liveCnpjResult, setLiveCnpjResult] = useState<{
     enriched: boolean;
@@ -126,16 +139,45 @@ export function ContractDossierView({
     primaryCnaeDescription?: string;
   } | null>(null);
 
-  // Reset local selection when switching contracts (e.g., from EntityGraphTab)
+  // Reset local selection and reload persisted finding reviews when switching contracts
   useEffect(() => {
+    let cancelled = false;
     setActiveTab('overview');
     setSelectedIndicatorCode(assessment.indicators[0]?.code ?? null);
-    setDismissedFindings({});
+    setReviewHistory(contract.reviews ?? []);
     setDismissingCode(null);
     setDismissRationaleInput('');
+    setReviewError(null);
     setLiveCnpjResult(null);
     setSavedFeedback(null);
+
+    fetchFindingReviews(contract.id)
+      .then((rows) => {
+        if (!cancelled) setReviewHistory(rows);
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
   }, [contract.id]);
+
+  // Derive active dismissed findings from the append-only review history (last action wins)
+  const dismissedFindings: Record<
+    string,
+    { rationale: string; dismissedAt: string; author: string }
+  > = {};
+  for (const rev of reviewHistory) {
+    if (rev.action === 'dismiss') {
+      dismissedFindings[rev.findingId] = {
+        rationale: rev.rationale,
+        dismissedAt: rev.createdAt,
+        author: rev.author,
+      };
+    } else if (rev.action === 'restore') {
+      delete dismissedFindings[rev.findingId];
+    }
+  }
 
   const selectedIndicator: RiskIndicator | undefined =
     assessment.indicators.find((i) => i.code === selectedIndicatorCode) ??
@@ -160,31 +202,65 @@ export function ContractDossierView({
       ? `RISCO ${displayScore}/100 — ajustado após ${dismissedCount} descarte(s) auditado(s)`
       : assessment.headline;
 
-  const handleConfirmDismiss = (indicator: RiskIndicator) => {
-    const rationale =
-      dismissRationaleInput.trim() ||
-      'Descartado pelo auditor após análise documental complementar.';
-    setDismissedFindings((prev) => ({
-      ...prev,
-      [indicator.findingId]: {
+  const handleConfirmDismiss = async (indicator: RiskIndicator) => {
+    const rationale = dismissRationaleInput.trim();
+    if (rationale.length < 8) {
+      setReviewError(
+        'Informe uma justificativa técnica detalhada (mínimo de 8 caracteres) para registrar o descarte.'
+      );
+      return;
+    }
+    setSubmittingReview(true);
+    setReviewError(null);
+    try {
+      const res = await submitFindingReview(contract.id, indicator.findingId, {
+        action: 'dismiss',
         rationale,
-        dismissedAt: new Date().toISOString(),
-      },
-    }));
-    setDismissingCode(null);
-    setDismissRationaleInput('');
+        author: reviewAuthorInput.trim() || 'Auditor(a) Responsável',
+        ruleVersion: indicator.ruleVersion,
+      });
+      setReviewHistory(res.reviews);
+      setDismissingCode(null);
+      setDismissRationaleInput('');
+    } catch (err) {
+      setReviewError(err instanceof Error ? err.message : 'Falha ao persistir descarte.');
+    } finally {
+      setSubmittingReview(false);
+    }
   };
 
-  const handleRestoreFinding = (findingId: string) => {
-    setDismissedFindings((prev) => {
-      const next = { ...prev };
-      delete next[findingId];
-      return next;
-    });
+  const handleRestoreFinding = async (indicator: RiskIndicator) => {
+    setSubmittingReview(true);
+    setReviewError(null);
+    try {
+      const res = await submitFindingReview(contract.id, indicator.findingId, {
+        action: 'restore',
+        rationale: 'Reativação manual registrada pelo auditor para nova verificação documental.',
+        author: reviewAuthorInput.trim() || 'Auditor(a) Responsável',
+        ruleVersion: indicator.ruleVersion,
+      });
+      setReviewHistory(res.reviews);
+    } catch (err) {
+      setReviewError(err instanceof Error ? err.message : 'Falha ao reativar achado.');
+    } finally {
+      setSubmittingReview(false);
+    }
+  };
+
+  const handleExportPdfReport = () => {
+    try {
+      const filename = downloadAuditReportPdf(contract, {
+        analystNote,
+        reviews: reviewHistory,
+      });
+      setSavedFeedback(`Relatório PDF gerado e baixado (${filename}).`);
+    } catch {
+      setSavedFeedback('Não foi possível gerar o relatório em PDF neste momento.');
+    }
   };
 
   const handleExportMarkdown = () => {
-    const md = buildAuditDossierMarkdown(contract, analystNote);
+    const md = buildAuditDossierMarkdown({ ...contract, reviews: reviewHistory }, analystNote);
     downloadTextFile(
       `dossie-${contract.municipalityIbge}-${contract.contractNumber.replace('/', '-')}.md`,
       md,
@@ -277,10 +353,19 @@ export function ContractDossierView({
           <button
             type="button"
             onClick={handleExportMarkdown}
-            className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-md transition-colors whitespace-nowrap"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-md transition-colors whitespace-nowrap"
           >
             <Download className="w-3.5 h-3.5" aria-hidden="true" />
-            Exportar Dossiê (.md)
+            Dossiê (.md)
+          </button>
+          <button
+            type="button"
+            data-testid="export-pdf-report-btn"
+            onClick={handleExportPdfReport}
+            className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-md transition-colors whitespace-nowrap"
+          >
+            <FileDown className="w-3.5 h-3.5" aria-hidden="true" />
+            Exportar Relatório
           </button>
         </div>
       </div>
@@ -347,7 +432,11 @@ export function ContractDossierView({
               <span>{contract.entityName}</span>
             </div>
 
-            <h1 className="text-xl lg:text-2xl font-bold text-slate-900 leading-snug">
+            <h1
+              className={`font-bold text-slate-900 leading-snug ${
+                contract.object.length > 140 ? 'text-base lg:text-lg' : 'text-xl lg:text-2xl'
+              }`}
+            >
               {contract.object}
             </h1>
 
@@ -568,14 +657,29 @@ export function ContractDossierView({
         <div className="space-y-6">
           {assessment.indicators.length === 0 ? (
             <section className="bg-white border border-slate-200 rounded-lg p-8 text-center">
-              <p className="text-base font-semibold text-emerald-800">
-                Nenhum indicador de risco acionado para este contrato.
-              </p>
-              <p className="text-xs text-slate-600 mt-1 max-w-xl mx-auto">
-                Todas as verificações aplicáveis do Motor Forense Próprio (sanções vigentes e no
-                escopo, regras jurídicas temporais, preços, aditivos, CNAE e ordem cronológica)
-                resultaram em conformidade preliminar.
-              </p>
+              {assessment.coverageStatus === 'INSUFFICIENT' ? (
+                <>
+                  <p className="text-base font-semibold text-amber-800">
+                    Cobertura documental insuficiente para afirmar conformidade.
+                  </p>
+                  <p className="text-xs text-slate-600 mt-1 max-w-xl mx-auto">
+                    Este contrato não possui fontes oficiais reconciliadas nem documentos anexados
+                    no repositório. O motor recusa classificá-lo como regular até obtenção de
+                    evidências primárias.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p className="text-base font-semibold text-emerald-800">
+                    Nenhum indicador de risco acionado para este contrato.
+                  </p>
+                  <p className="text-xs text-slate-600 mt-1 max-w-xl mx-auto">
+                    Todas as verificações aplicáveis do Motor Forense Próprio (sanções vigentes e no
+                    escopo, regras jurídicas temporais, preços, aditivos, CNAE e ordem cronológica)
+                    resultaram em conformidade preliminar (cobertura: {assessment.coverageStatus ?? 'ADEQUATE'}).
+                  </p>
+                </>
+              )}
             </section>
           ) : (
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
@@ -679,19 +783,20 @@ export function ContractDossierView({
                           <div className="p-3.5 rounded-md bg-slate-50 border border-slate-300 text-xs space-y-1.5">
                             <div className="flex items-center justify-between gap-2">
                               <span className="font-semibold text-slate-800">
-                                Achado descartado pelo auditor (DISMISSED)
+                                Achado descartado pelo auditor (DISMISSED · persistido em SQLite)
                               </span>
                               <button
                                 type="button"
-                                onClick={() => handleRestoreFinding(selectedIndicator.findingId)}
-                                className="inline-flex items-center gap-1 text-blue-700 hover:text-blue-800 font-medium"
+                                disabled={submittingReview}
+                                onClick={() => handleRestoreFinding(selectedIndicator)}
+                                className="inline-flex items-center gap-1 text-blue-700 hover:text-blue-800 font-medium disabled:opacity-50"
                               >
                                 <RotateCcw className="w-3.5 h-3.5" aria-hidden="true" />
                                 Reativar achado
                               </button>
                             </div>
                             <p className="text-slate-600">
-                              Justificativa registrada: {dismissedEntry.rationale}
+                              Justificativa registrada ({dismissedEntry.author}): {dismissedEntry.rationale}
                             </p>
                           </div>
                         )}
@@ -779,38 +884,71 @@ export function ContractDossierView({
                           </div>
                         )}
 
-                        {/* Auditor Dismissal Workflow */}
+                        {/* Auditor Dismissal Workflow (Persisted append-only with mandatory human rationale) */}
                         {!dismissedEntry && (
                           <div className="pt-4 border-t border-slate-200">
                             {dismissingCode === selectedIndicator.code ? (
                               <div className="space-y-2.5">
-                                <label
-                                  htmlFor="dismiss-rationale"
-                                  className="block text-xs font-semibold text-slate-800"
-                                >
-                                  Justificativa técnica para descartar este achado (DISMISSED)
-                                </label>
-                                <input
-                                  id="dismiss-rationale"
-                                  type="text"
-                                  value={dismissRationaleInput}
-                                  onChange={(e) => setDismissRationaleInput(e.target.value)}
-                                  placeholder="Ex.: Certidão de reabilitação apresentada nos autos do processo administrativo..."
-                                  className="w-full h-9 px-3 text-xs bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600"
-                                />
+                                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                                  <div className="sm:col-span-1">
+                                    <label
+                                      htmlFor="review-author"
+                                      className="block text-xs font-semibold text-slate-800 mb-1"
+                                    >
+                                      Auditor(a)
+                                    </label>
+                                    <input
+                                      id="review-author"
+                                      type="text"
+                                      value={reviewAuthorInput}
+                                      onChange={(e) => setReviewAuthorInput(e.target.value)}
+                                      className="w-full h-9 px-3 text-xs bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                    />
+                                  </div>
+                                  <div className="sm:col-span-2">
+                                    <label
+                                      htmlFor="dismiss-rationale"
+                                      className="block text-xs font-semibold text-slate-800 mb-1"
+                                    >
+                                      Justificativa técnica obrigatória (mín. 8 caracteres)
+                                    </label>
+                                    <input
+                                      id="dismiss-rationale"
+                                      type="text"
+                                      value={dismissRationaleInput}
+                                      onChange={(e) => {
+                                        setDismissRationaleInput(e.target.value);
+                                        setReviewError(null);
+                                      }}
+                                      placeholder="Ex.: Certidão de reabilitação apresentada nos autos do processo administrativo..."
+                                      className="w-full h-9 px-3 text-xs bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600"
+                                    />
+                                  </div>
+                                </div>
+                                {reviewError && (
+                                  <p role="alert" className="text-xs text-red-700 font-medium">
+                                    {reviewError}
+                                  </p>
+                                )}
                                 <div className="flex items-center gap-2">
                                   <button
                                     type="button"
+                                    disabled={
+                                      submittingReview || dismissRationaleInput.trim().length < 8
+                                    }
                                     onClick={() => handleConfirmDismiss(selectedIndicator)}
-                                    className="px-3 py-1.5 text-xs font-semibold text-white bg-slate-800 hover:bg-slate-900 rounded-md"
+                                    className="px-3 py-1.5 text-xs font-semibold text-white bg-slate-800 hover:bg-slate-900 rounded-md disabled:opacity-50"
                                   >
-                                    Confirmar Descarte (DISMISSED)
+                                    {submittingReview
+                                      ? 'Registrando...'
+                                      : 'Confirmar Descarte (DISMISSED)'}
                                   </button>
                                   <button
                                     type="button"
                                     onClick={() => {
                                       setDismissingCode(null);
                                       setDismissRationaleInput('');
+                                      setReviewError(null);
                                     }}
                                     className="px-3 py-1.5 text-xs text-slate-600 hover:text-slate-900"
                                   >

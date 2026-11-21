@@ -230,12 +230,14 @@ export interface BenchmarkPeer {
   scopeDistance: number;
   slaComparable: boolean;
   licensingComparable: boolean;
+  conversionFactor?: number;
   included: boolean;
   exclusionReason?: string;
 }
 
 export interface HorizontalBenchmarkResult {
   ruleId: string;
+  mode?: 'same_supplier' | 'market';
   state: FindingState;
   evidenceLevel: EvidenceLevel;
   confidence: number;
@@ -244,10 +246,13 @@ export interface HorizontalBenchmarkResult {
   subjectNominalPrice: number;
   subjectAdjustedPrice: number;
   inflationIndexApplied: string;
+  inflationApplied?: boolean;
   peerCount: number;
   excludedPeerCount: number;
+  deduplicatedPeerCount?: number;
   peerMedian: number | null;
   mad: number | null;
+  madZero?: boolean;
   robustZ: number | null;
   peerRatio: number | null;
   statement: string;
@@ -257,6 +262,7 @@ export interface HorizontalBenchmarkResult {
     scope: string;
     sla: string;
     licensing: string;
+    supplierMode?: string;
   };
   peers: BenchmarkPeer[];
 }
@@ -325,13 +331,26 @@ export interface ExecutionChainSummary {
   chronologicalOrderStatus: 'valid_sequence' | 'justified_exception' | 'unexplained_break' | 'not_verifiable';
 }
 
+export interface FindingReviewRecord {
+  id: string;
+  contractId: string;
+  findingId: string;
+  action: 'dismiss' | 'restore';
+  author: string;
+  rationale: string;
+  ruleVersion: string;
+  createdAt: string;
+}
+
 export interface RiskAssessment {
   score: number;
   classification:
     | 'Revisão humana prioritária'
     | 'Revisão humana recomendada'
     | 'Atenção moderada'
-    | 'Conformidade preliminar';
+    | 'Conformidade preliminar'
+    | 'Cobertura insuficiente';
+  coverageStatus?: 'ADEQUATE' | 'PARTIAL' | 'INSUFFICIENT';
   headline: string;
   variationPct: number;
   amendmentTotalPct: number;
@@ -398,11 +417,13 @@ export interface ContractRecord {
     inflationIndexLabel: string;
     peers: BenchmarkPeer[];
   };
+  cnpjRole?: 'fornecedor' | 'orgao_contratante' | 'subcontratado';
   dataSourceOrigin: 'PNCP API Oficial' | 'Espelho Municipal Licitarium' | 'Upload Documental';
 }
 
 export interface EvaluatedContract extends ContractRecord {
   assessment: RiskAssessment;
+  reviews?: FindingReviewRecord[];
 }
 
 export interface OCDSRelease {
@@ -415,8 +436,8 @@ export interface OCDSRelease {
     id: string;
     name: string;
   };
-  planning: {
-    budget: {
+  planning?: {
+    budget?: {
       amount: { amount: number; currency: 'BRL' };
       project: string;
     };
@@ -425,39 +446,39 @@ export interface OCDSRelease {
     id: string;
     title: string;
     procurementMethodDetails: string;
-    numberOfTenderers: number;
-    value: { amount: number; currency: 'BRL' };
+    numberOfTenderers?: number;
+    value?: { amount: number; currency: 'BRL' };
   };
-  awards: Array<{
+  awards?: Array<{
     id: string;
     status: string;
     date: string;
-    value: { amount: number; currency: 'BRL' };
+    value?: { amount: number; currency: 'BRL' };
     suppliers: Array<{ id: string; name: string }>;
   }>;
   contracts: Array<{
     id: string;
-    awardID: string;
+    awardID?: string;
     title: string;
     status: string;
     period: { startDate: string; endDate: string };
-    value: { amount: number; currency: 'BRL' };
+    value?: { amount: number; currency: 'BRL' };
     amendments: Array<{
       id: string;
       date: string;
       rationale: string;
       description: string;
     }>;
+    implementation: {
+      transactions: Array<{
+        id: string;
+        date: string;
+        value: { amount: number; currency: 'BRL' };
+        payer: { name: string };
+        payee: { name: string };
+      }>;
+    };
   }>;
-  implementation: {
-    transactions: Array<{
-      id: string;
-      date: string;
-      value: { amount: number; currency: 'BRL' };
-      payer: { name: string };
-      payee: { name: string };
-    }>;
-  };
 }
 
 export interface SavedDossierSummary {

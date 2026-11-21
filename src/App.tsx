@@ -1,26 +1,84 @@
 import { useEffect, useState } from 'react';
 import {
+  BarChart3,
   Building2,
   ChevronRight,
+  ExternalLink,
   FileSearch,
   FileUp,
   FolderArchive,
   Menu,
+  Scale,
   X,
 } from 'lucide-react';
 import type { EvaluatedContract, Municipality, SavedDossierSummary } from './types/audit';
 import { deleteSavedDossier, fetchContractById, fetchSavedDossiers } from './lib/api';
 import { MunicipalityView } from './components/MunicipalityView';
-import { ContractSearchView } from './components/ContractSearchView';
+import { ContractSearchView, type ContractSearchFilterState } from './components/ContractSearchView';
 import { DocumentUploadView } from './components/DocumentUploadView';
 import { ContractDossierView } from './components/ContractDossierView';
 import { SavedDossiersView } from './components/SavedDossiersView';
+import { RiskDashboardView } from './components/RiskDashboardView';
 
-type ActiveSection = 'municipio' | 'contrato' | 'documento' | 'dossies';
+type ActiveSection = 'dashboard' | 'municipio' | 'contrato' | 'documento' | 'dossies';
+
+function readInitialUrlState(): {
+  section: ActiveSection;
+  ibge: string;
+  entityId: string;
+  q: string;
+  year: string;
+  startDate: string;
+  endDate: string;
+} {
+  if (typeof window === 'undefined') {
+    return {
+      section: 'municipio',
+      ibge: '2902906',
+      entityId: 'ALL',
+      q: '123/2026',
+      year: '',
+      startDate: '',
+      endDate: '',
+    };
+  }
+  const params = new URLSearchParams(window.location.search);
+  const rawSec = params.get('sec');
+  const section: ActiveSection =
+    rawSec === 'dashboard' ||
+    rawSec === 'contrato' ||
+    rawSec === 'documento' ||
+    rawSec === 'dossies'
+      ? rawSec
+      : 'municipio';
+  const rawIbge = params.get('ibge') ?? '';
+  const ibge = /^\d{7}$/.test(rawIbge) ? rawIbge : '2902906';
+  const entityId = params.get('ent') || 'ALL';
+  const q = params.get('q') ?? '123/2026';
+  const year = params.get('year') ?? '';
+  const startDate = params.get('from') ?? '';
+  const endDate = params.get('to') ?? '';
+  return { section, ibge, entityId, q, year, startDate, endDate };
+}
 
 export default function App() {
-  const [section, setSection] = useState<ActiveSection>('municipio');
-  const [activeIbge, setActiveIbge] = useState<string>('2910800');
+  const initial = readInitialUrlState();
+  const [section, setSection] = useState<ActiveSection>(initial.section);
+  const [activeIbge, setActiveIbge] = useState<string>(initial.ibge);
+  const [selectedEntityId, setSelectedEntityId] = useState<string>(initial.entityId);
+  const [periodFilter, setPeriodFilter] = useState<{ startDate: string; endDate: string }>({
+    startDate: initial.startDate,
+    endDate: initial.endDate,
+  });
+  const [searchFilters, setSearchFilters] = useState<ContractSearchFilterState>({
+    query: initial.q,
+    ibgeFilter: '',
+    municipalityInput: '',
+    yearFilter: initial.year,
+    startDate: initial.startDate,
+    endDate: initial.endDate,
+    minRisk: 0,
+  });
   const [activeContract, setActiveContract] = useState<EvaluatedContract | null>(null);
   const [breadcrumbCtx, setBreadcrumbCtx] = useState<{
     municipality: Municipality | null;
@@ -28,6 +86,7 @@ export default function App() {
   }>({ municipality: null, entityName: null });
   const [savedDossiers, setSavedDossiers] = useState<SavedDossierSummary[]>([]);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [licenseModalOpen, setLicenseModalOpen] = useState(false);
 
   const refreshDossiers = () => {
     fetchSavedDossiers()
@@ -38,6 +97,35 @@ export default function App() {
   useEffect(() => {
     refreshDossiers();
   }, []);
+
+  // Keep navigation state synchronized in URL query parameters so back/reload preserves context
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams();
+    params.set('sec', section);
+    if (section === 'dashboard') {
+      if (periodFilter.startDate) params.set('from', periodFilter.startDate);
+      if (periodFilter.endDate) params.set('to', periodFilter.endDate);
+    } else if (section === 'municipio') {
+      params.set('ibge', activeIbge);
+      if (selectedEntityId && selectedEntityId !== 'ALL') {
+        params.set('ent', selectedEntityId);
+      }
+      if (periodFilter.startDate) params.set('from', periodFilter.startDate);
+      if (periodFilter.endDate) params.set('to', periodFilter.endDate);
+    } else if (section === 'contrato') {
+      if (searchFilters.query) params.set('q', searchFilters.query);
+      if (searchFilters.yearFilter) params.set('year', searchFilters.yearFilter);
+      if (searchFilters.startDate) params.set('from', searchFilters.startDate);
+      if (searchFilters.endDate) params.set('to', searchFilters.endDate);
+    }
+    if (activeContract) {
+      params.set('contract', activeContract.id);
+    }
+    const qs = params.toString();
+    const nextUrl = qs ? `${window.location.pathname}?${qs}` : window.location.pathname;
+    window.history.replaceState(null, '', nextUrl);
+  }, [section, activeIbge, selectedEntityId, periodFilter, searchFilters, activeContract]);
 
   const handleNavigate = (target: ActiveSection) => {
     setSection(target);
@@ -78,6 +166,12 @@ export default function App() {
     count?: number;
   }> = [
     {
+      id: 'dashboard',
+      label: 'Dashboard',
+      hint: 'Riscos agregados (SQLite)',
+      icon: BarChart3,
+    },
+    {
       id: 'municipio',
       label: 'Município',
       hint: 'IBGE → Órgãos → Contratos',
@@ -92,13 +186,13 @@ export default function App() {
     {
       id: 'documento',
       label: 'Documento',
-      hint: 'Upload PDF e OCR seletivo',
+      hint: 'Upload PDF e extração nativa',
       icon: FileUp,
     },
     {
       id: 'dossies',
       label: 'Dossiês Salvos',
-      hint: 'Trilhas arquivadas',
+      hint: 'Trilhas arquivadas (SQLite)',
       icon: FolderArchive,
       count: savedDossiers.length,
     },
@@ -114,7 +208,7 @@ export default function App() {
             onClick={() => handleNavigate('municipio')}
             className="text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap"
           >
-            LicitAudit
+            Nexofis
           </button>
         </div>
 
@@ -156,9 +250,21 @@ export default function App() {
           })}
         </nav>
 
-        <div className="p-4 border-t border-slate-200 text-[11px] text-slate-500 space-y-1">
-          <div className="font-medium text-slate-700">Fontes conectadas</div>
-          <div>IBGE · PNCP · Receita/CNPJ · CGU/TCU · Painel de Preços · SINAPI</div>
+        <div className="p-4 border-t border-slate-200 text-[11px] text-slate-500 space-y-2">
+          <div className="space-y-1">
+            <div className="font-medium text-slate-700">Fontes conectadas</div>
+            <div>IBGE · PNCP Nacional · CNPJ (intermediários) · SQLite Local</div>
+          </div>
+          <div className="pt-2 border-t border-slate-100 flex items-center justify-between text-[10px] text-slate-500 font-mono">
+            <span>NEXOFIS v0.1.0</span>
+            <button
+              type="button"
+              onClick={() => setLicenseModalOpen(true)}
+              className="text-blue-700 hover:text-blue-800 underline underline-offset-2"
+            >
+              AGPL-3.0-only
+            </button>
+          </div>
         </div>
       </aside>
 
@@ -172,7 +278,7 @@ export default function App() {
           />
           <aside className="relative z-50 w-72 max-w-[82vw] bg-white h-full border-r border-slate-200 flex flex-col">
             <div className="h-14 px-5 flex items-center justify-between border-b border-slate-200">
-              <span className="text-lg font-bold tracking-tight text-slate-900">LicitAudit</span>
+              <span className="text-lg font-bold tracking-tight text-slate-900">Nexofis</span>
               <button
                 type="button"
                 aria-label="Fechar menu de navegação"
@@ -201,6 +307,19 @@ export default function App() {
                 );
               })}
             </nav>
+            <div className="mt-auto p-4 border-t border-slate-200 flex items-center justify-between text-[10px] text-slate-500 font-mono">
+              <span>NEXOFIS v0.1.0</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileMenuOpen(false);
+                  setLicenseModalOpen(true);
+                }}
+                className="text-blue-700 underline underline-offset-2"
+              >
+                AGPL-3.0-only
+              </button>
+            </div>
           </aside>
         </div>
       )}
@@ -224,17 +343,19 @@ export default function App() {
                 type="button"
                 onClick={() => {
                   setActiveContract(null);
-                  setSection('municipio');
+                  setSection(section);
                 }}
                 className="hover:text-slate-900 font-medium whitespace-nowrap shrink-0"
               >
-                {section === 'municipio'
-                  ? 'Municípios'
-                  : section === 'contrato'
-                    ? 'Contratos'
-                    : section === 'documento'
-                      ? 'Documentos'
-                      : 'Dossiês'}
+                {section === 'dashboard'
+                  ? 'Dashboard de Riscos'
+                  : section === 'municipio'
+                    ? 'Municípios'
+                    : section === 'contrato'
+                      ? 'Contratos'
+                      : section === 'documento'
+                        ? 'Documentos'
+                        : 'Dossiês'}
               </button>
 
               {section === 'municipio' && breadcrumbCtx.municipality && (
@@ -291,14 +412,32 @@ export default function App() {
               onDossierSaved={refreshDossiers}
               onSelectContract={handleOpenContract}
             />
+          ) : section === 'dashboard' ? (
+            <RiskDashboardView
+              startDate={periodFilter.startDate}
+              endDate={periodFilter.endDate}
+              onPeriodChange={setPeriodFilter}
+              onSelectContract={handleOpenContract}
+            />
           ) : section === 'municipio' ? (
             <MunicipalityView
               initialIbgeCode={activeIbge}
+              selectedEntityId={selectedEntityId}
+              startDate={periodFilter.startDate}
+              endDate={periodFilter.endDate}
+              onPeriodChange={setPeriodFilter}
+              onIbgeChange={(nextIbge) => {
+                setActiveIbge(nextIbge);
+                setSelectedEntityId('ALL');
+              }}
+              onEntityChange={setSelectedEntityId}
               onSelectContract={handleOpenContract}
               onContextChange={setBreadcrumbCtx}
             />
           ) : section === 'contrato' ? (
             <ContractSearchView
+              filterState={searchFilters}
+              onFilterStateChange={setSearchFilters}
               onSelectContract={handleOpenContract}
               onNavigateToDocument={() => handleNavigate('documento')}
             />
@@ -310,13 +449,90 @@ export default function App() {
               onOpenContractId={handleOpenContractById}
               onDeleteDossier={handleDeleteDossier}
               onExploreMunicipality={() => {
-                setActiveIbge('2910800');
+                setActiveIbge('2902906');
+                setSelectedEntityId('ALL');
                 handleNavigate('municipio');
               }}
             />
           )}
         </main>
       </div>
+
+      {/* AGPL-3.0-only Governance & Source Offer Modal */}
+      {licenseModalOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="nexofis-license-title"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/50"
+        >
+          <div className="bg-white border border-slate-200 rounded-lg max-w-lg w-full p-6 space-y-4 shadow-xl">
+            <div className="flex items-start justify-between gap-4 border-b border-slate-200 pb-3">
+              <div className="flex items-center gap-2">
+                <Scale className="w-4 h-4 text-blue-700 shrink-0" aria-hidden="true" />
+                <h2 id="nexofis-license-title" className="text-base font-bold text-slate-900">
+                  NEXOFIS · Licença e Código-Fonte
+                </h2>
+              </div>
+              <button
+                type="button"
+                aria-label="Fechar aviso de licença"
+                onClick={() => setLicenseModalOpen(false)}
+                className="p-1 text-slate-400 hover:text-slate-700"
+              >
+                <X className="w-4 h-4" aria-hidden="true" />
+              </button>
+            </div>
+
+            <div className="text-xs text-slate-700 space-y-3 leading-relaxed">
+              <p>
+                O software <strong>NEXOFIS</strong> (Eduardo Muniz — DM Technology) é distribuído
+                sob a licença <span className="font-mono font-semibold">GNU AGPL-3.0-only</span>.
+                Qualquer instância executada em rede assegura aos usuários o acesso ao código-fonte
+                correspondente (seção 13 da AGPLv3).
+              </p>
+              <p className="p-3 bg-slate-50 border border-slate-200 rounded text-slate-600">
+                <strong>Separação Software × Dados Públicos:</strong> A licença{' '}
+                <span className="font-mono">AGPL-3.0-only</span> aplica-se exclusivamente ao
+                código-fonte do NEXOFIS. Os contratos, empenhos, cadastros e documentos públicos
+                consultados permanecem sob a governança de seus respectivos órgãos e da Lei de
+                Acesso à Informação (Lei nº 12.527/2011) e LGPD (Lei nº 13.709/2018).
+              </p>
+              <div className="flex flex-wrap items-center gap-4 pt-1">
+                <a
+                  href="https://github.com/devdudumuniz/NEXOFIS"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1.5 font-semibold text-blue-700 hover:text-blue-800"
+                >
+                  Código-fonte no GitHub
+                  <ExternalLink className="w-3.5 h-3.5" aria-hidden="true" />
+                </a>
+                <a
+                  href="https://www.gnu.org/licenses/agpl-3.0.txt"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1.5 font-medium text-slate-700 hover:text-slate-900"
+                >
+                  Texto integral AGPL-3.0
+                  <ExternalLink className="w-3.5 h-3.5" aria-hidden="true" />
+                </a>
+              </div>
+            </div>
+
+            <div className="flex justify-end pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setLicenseModalOpen(false)}
+                className="px-4 py-1.5 text-xs font-semibold text-white bg-slate-800 hover:bg-slate-900 rounded-md"
+              >
+                Fechar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
+

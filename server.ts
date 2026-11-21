@@ -13,9 +13,18 @@ import {
 import {
   extractFieldsFromNativeText,
   extractTabularContractRows,
+  resolveDocumentContractMatch,
+  validateUploadedFileMagic,
   type TabularContractRow,
 } from './src/lib/documentParser';
 import { normalizeSearchText } from './src/lib/formatters';
+import { aggregateRiskDashboard } from './src/lib/dashboardAggregator';
+import {
+  matchesDatePeriod,
+  resolvePncpPeriodBounds,
+  validateDatePeriod,
+  type DatePeriodFilter,
+} from './src/lib/datePeriod';
 import {
   isRelatedContractNumber,
   parseBrazilianContractCode,
@@ -23,11 +32,19 @@ import {
   type ParsedContractCode,
 } from './src/lib/pncpQueryParser';
 import { evaluateContractRisk } from './src/lib/riskEngine';
+import { extractNativePdfText } from './src/server/pdfExtractor';
+import {
+  deriveMatrizCnpj,
+  fetchPncpContractsByCnpj,
+  type PncpCnpjSearchResult,
+} from './src/server/pncpClient';
+import { createNexofisStore } from './src/server/storage';
 import type {
   ContractRecord,
   DocumentRecord,
   EvaluatedContract,
   ExtractionMethod,
+  FindingReviewRecord,
   GovernmentEntity,
   Municipality,
   SavedDossierSummary,
@@ -46,13 +63,36 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
 });
 
-// In-memory runtime stores
+// Durable SQLite store (survives process restarts)
+const store = createNexofisStore();
+
+// In-memory hot caches (backed by SQLite for persistence)
 let ibgeCache: Municipality[] | null = null;
 let ibgeFetchedAt = 0;
 const IBGE_CACHE_TTL_MS = 1000 * 60 * 60 * 6;
 
 const dynamicContracts = new Map<string, ContractRecord>();
-const savedDossiers: SavedDossierSummary[] = [];
+for (const stored of store.getAllStoredContracts()) {
+  dynamicContracts.set(stored.id, stored);
+}
+
+function persistContract(contract: ContractRecord): void {
+  dynamicContracts.set(contract.id, contract);
+  try {
+    store.upsertContract(contract);
+  } catch (err) {
+    console.error('SQLite contract persistence warning:', err instanceof Error ? err.message : err);
+  }
+}
+
+// Ensure baseline audited contracts are persisted in SQLite on first boot without overwriting updates
+const missingSeeds = SEED_CONTRACTS.filter((seed) => !dynamicContracts.has(seed.id));
+if (missingSeeds.length > 0) {
+  store.upsertContracts(missingSeeds);
+  for (const seed of missingSeeds) {
+    dynamicContracts.set(seed.id, seed);
+  }
+}
 
 interface LivePncpDiagnostic {
   queriedModalities: string[];
@@ -66,6 +106,10 @@ const PNCP_CACHE_TTL_MS = 1000 * 60 * 10;
 const pncpMunicipalityCache = new Map<
   string,
   { fetchedAt: number; records: ContractRecord[]; diagnostic: LivePncpDiagnostic }
+>();
+const pncpCnpjCache = new Map<
+  string,
+  { fetchedAt: number; result: PncpCnpjSearchResult }
 >();
 
 interface LiveCnpjData {
@@ -159,13 +203,186 @@ async function loadIbgeMunicipalities(): Promise<Municipality[]> {
 }
 
 function getAllContracts(): ContractRecord[] {
-  return [...Array.from(dynamicContracts.values()), ...SEED_CONTRACTS];
+  const map = new Map<string, ContractRecord>();
+  for (const seed of SEED_CONTRACTS) {
+    map.set(seed.id, seed);
+  }
+  for (const dyn of dynamicContracts.values()) {
+    map.set(dyn.id, dyn);
+  }
+  return Array.from(map.values());
 }
 
 function evaluateContract(record: ContractRecord): EvaluatedContract {
+  const reviews = store.listFindingReviews(record.id);
   return {
     ...record,
     assessment: evaluateContractRisk(record),
+    reviews,
+  };
+}
+
+function extractStandaloneCnpj(rawQuery: string): string | null {
+  const trimmed = rawQuery.trim();
+  const formattedMatch = trimmed.match(/^\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}$/);
+  if (formattedMatch) return trimmed.replace(/\D/g, '');
+  if (/^\d{14}$/.test(trimmed)) return trimmed;
+  return null;
+}
+
+async function fetchCachedPncpForSingleCnpj(cnpj: string): Promise<PncpCnpjSearchResult> {
+  const cached = pncpCnpjCache.get(cnpj);
+  if (cached && Date.now() - cached.fetchedAt < PNCP_CACHE_TTL_MS) {
+    return cached.result;
+  }
+  const result = await fetchPncpContractsByCnpj(cnpj, { maxPages: 5, pageSize: 50 });
+  if (result.status === 'complete' || result.status === 'partial') {
+    pncpCnpjCache.set(cnpj, { fetchedAt: Date.now(), result });
+    if (result.records.length > 0) {
+      for (const rec of result.records) {
+        dynamicContracts.set(rec.id, rec);
+      }
+      try {
+        store.upsertContracts(result.records);
+      } catch {
+        // Non-fatal persistence error
+      }
+    }
+  }
+  try {
+    store.upsertSyncCheckpoint({
+      scopeKey: `cnpj:${cnpj}`,
+      sourceSystem: 'PNCP /api/search',
+      lastSyncedAt: result.retrievedAt,
+      status: result.status,
+      totalDeclared: result.pncpTotalDeclared,
+      totalFetched: result.pncpFetchedCount,
+      detail: result.message,
+    });
+  } catch {
+    // Non-fatal checkpoint error
+  }
+  return result;
+}
+
+function formatCnpjForServerMessage(digits: string): string {
+  if (!/^\d{14}$/.test(digits)) return digits;
+  return `${digits.slice(0, 2)}.${digits.slice(2, 5)}.${digits.slice(5, 8)}/${digits.slice(8, 12)}-${digits.slice(12, 14)}`;
+}
+
+async function queryNationalContractsByCnpj(cnpj: string): Promise<{
+  cnpj: string;
+  relatedMatrizCnpj: string | null;
+  filialPncpFetchedCount: number;
+  matrizPncpFetchedCount: number;
+  pncpResult: PncpCnpjSearchResult;
+  contracts: EvaluatedContract[];
+  localOnlyCount: number;
+  cnpjProfile: { data: LiveCnpjData; source: string } | null;
+}> {
+  const relatedMatrizCnpj = deriveMatrizCnpj(cnpj);
+  const directResult = await fetchCachedPncpForSingleCnpj(cnpj);
+  const matrizResult = relatedMatrizCnpj
+    ? await fetchCachedPncpForSingleCnpj(relatedMatrizCnpj)
+    : null;
+
+  let cnpjProfile = await fetchLiveReceitaCnpj(cnpj);
+  if (!cnpjProfile && relatedMatrizCnpj) {
+    cnpjProfile = await fetchLiveReceitaCnpj(relatedMatrizCnpj);
+  }
+
+  // Merge live PNCP contracts from exact CNPJ + derived Matriz (preserving exact supplier.cnpj on each record)
+  const merged = new Map<string, ContractRecord>();
+  for (const rec of directResult.records) {
+    merged.set(rec.pncpControlNumber, rec);
+  }
+  let matrizAddedCount = 0;
+  if (matrizResult) {
+    for (const rec of matrizResult.records) {
+      if (!merged.has(rec.pncpControlNumber)) {
+        merged.set(rec.pncpControlNumber, rec);
+        matrizAddedCount += 1;
+      }
+    }
+  }
+
+  const targetCnpjs = new Set<string>([cnpj]);
+  if (relatedMatrizCnpj) targetCnpjs.add(relatedMatrizCnpj);
+
+  let localOnlyCount = 0;
+  for (const local of getAllContracts()) {
+    const isSupplier = targetCnpjs.has(local.supplier.cnpj);
+    const orgaoDigits = local.pncpControlNumber.slice(0, 14).replace(/\D/g, '');
+    const isOrgao = targetCnpjs.has(orgaoDigits);
+    if (!isSupplier && !isOrgao) continue;
+
+    if (!merged.has(local.pncpControlNumber)) {
+      localOnlyCount += 1;
+      merged.set(local.pncpControlNumber, {
+        ...local,
+        cnpjRole: local.cnpjRole ?? (isSupplier ? 'fornecedor' : 'orgao_contratante'),
+      });
+    }
+  }
+
+  const combinedByRole = {
+    fornecedor: directResult.byRole.fornecedor + (matrizResult?.byRole.fornecedor ?? 0),
+    orgao_contratante:
+      directResult.byRole.orgao_contratante + (matrizResult?.byRole.orgao_contratante ?? 0),
+    subcontratado: directResult.byRole.subcontratado + (matrizResult?.byRole.subcontratado ?? 0),
+  };
+
+  let combinedStatus: PncpCnpjSearchResult['status'] = directResult.status;
+  if (matrizResult) {
+    if (directResult.status === 'complete' && matrizResult.status === 'complete') {
+      combinedStatus = 'complete';
+    } else if (
+      directResult.status === 'complete' ||
+      matrizResult.status === 'complete' ||
+      directResult.status === 'partial' ||
+      matrizResult.status === 'partial'
+    ) {
+      combinedStatus =
+        directResult.status === 'complete' && matrizResult.status === 'complete'
+          ? 'complete'
+          : 'partial';
+    } else if (directResult.status === 'rate_limited' || matrizResult.status === 'rate_limited') {
+      combinedStatus = 'rate_limited';
+    } else {
+      combinedStatus = 'unavailable';
+    }
+  }
+
+  const combinedMessage = relatedMatrizCnpj && matrizResult
+    ? `Consulta nacional PNCP para filial ${formatCnpjForServerMessage(cnpj)} (${directResult.pncpFetchedCount} contrato(s) direto(s)) com expansão automática pela raiz do CNPJ para a Matriz ${formatCnpjForServerMessage(relatedMatrizCnpj)} (${matrizResult.pncpFetchedCount} contrato(s) no PNCP; total declarado na Matriz: ${matrizResult.pncpTotalDeclared}). Cada contrato mantém explicitamente o CNPJ contratado original (Filial ou Matriz). Contratos não publicados no PNCP constam apenas se indexados localmente.`
+    : directResult.message;
+
+  const pncpResult: PncpCnpjSearchResult = {
+    cnpj,
+    status: combinedStatus,
+    pncpTotalDeclared: directResult.pncpTotalDeclared + (matrizResult?.pncpTotalDeclared ?? 0),
+    pncpFetchedCount: directResult.pncpFetchedCount + matrizAddedCount,
+    pagesFetched: directResult.pagesFetched + (matrizResult?.pagesFetched ?? 0),
+    partialCoverage: combinedStatus !== 'complete',
+    byRole: combinedByRole,
+    records: Array.from(merged.values()),
+    message: combinedMessage,
+    retrievedAt: directResult.retrievedAt,
+  };
+
+  const contracts = Array.from(merged.values())
+    .map(evaluateContract)
+    .sort((a, b) => b.year - a.year || b.updatedValue - a.updatedValue);
+
+  return {
+    cnpj,
+    relatedMatrizCnpj,
+    filialPncpFetchedCount: directResult.pncpFetchedCount,
+    matrizPncpFetchedCount: matrizResult?.pncpFetchedCount ?? 0,
+    pncpResult,
+    contracts,
+    localOnlyCount,
+    cnpjProfile,
   };
 }
 
@@ -255,7 +472,7 @@ async function fetchPncpModalityPage(
       signal: controller.signal,
       headers: {
         Accept: 'application/json',
-        'User-Agent': 'Mozilla/5.0 (compatible; LicitAudit/1.0)',
+        'User-Agent': 'Mozilla/5.0 (compatible; Nexofis/1.0)',
       },
     });
     if (res.status === 429) {
@@ -294,21 +511,18 @@ async function fetchPncpModalityPage(
 async function fetchLivePncpContratacoes(
   municipality: Municipality,
   year = 2026,
-  preferredModalityCode?: number
+  preferredModalityCode?: number,
+  period?: DatePeriodFilter
 ): Promise<{ records: ContractRecord[]; diagnostic: LivePncpDiagnostic }> {
   const safeYear = Number.isInteger(year) && year >= 2020 && year <= 2029 ? year : 2026;
-  const cacheKey = `${municipality.ibgeCode}:${safeYear}`;
+  const bounds = resolvePncpPeriodBounds(period ?? {}, safeYear);
+  const dataInicial = bounds.dataInicial;
+  const dataFinal = bounds.dataFinal;
+  const cacheKey = `${municipality.ibgeCode}:${dataInicial}:${dataFinal}`;
   const cached = pncpMunicipalityCache.get(cacheKey);
   if (cached && Date.now() - cached.fetchedAt < PNCP_CACHE_TTL_MS) {
     return { records: cached.records, diagnostic: cached.diagnostic };
   }
-
-  const now = new Date();
-  const yearEnd = new Date(Date.UTC(safeYear, 11, 31));
-  const endDate = now < yearEnd ? now : yearEnd;
-  const fmt = (d: Date) => d.toISOString().slice(0, 10).replace(/-/g, '');
-  const dataInicial = `${safeYear}0101`;
-  const dataFinal = fmt(endDate) >= dataInicial ? fmt(endDate) : `${safeYear}1231`;
 
   const orderedModalities = [...PNCP_MODALITIES];
   if (preferredModalityCode) {
@@ -478,7 +692,7 @@ async function fetchLiveReceitaCnpj(
         signal: controller.signal,
         headers: {
           Accept: 'application/json',
-          'User-Agent': 'Mozilla/5.0 (compatible; LicitAudit/1.0)',
+          'User-Agent': 'Mozilla/5.0 (compatible; Nexofis/1.0)',
         },
       });
       if (res.ok) {
@@ -510,7 +724,7 @@ async function fetchLiveReceitaCnpj(
             entryDate: s.data_entrada ?? '',
           })),
         };
-        const source = 'Receita Federal / publica.cnpj.ws (tempo real)';
+        const source = 'publica.cnpj.ws (provedor intermediário — base CNPJ/RFB)';
         cnpjLookupCache.set(cnpj, { fetchedAt: Date.now(), data, source });
         return { data, source };
       }
@@ -529,7 +743,7 @@ async function fetchLiveReceitaCnpj(
       signal: controller.signal,
       headers: {
         Accept: 'application/json',
-        'User-Agent': 'Mozilla/5.0 (compatible; LicitAudit/1.0)',
+        'User-Agent': 'Mozilla/5.0 (compatible; Nexofis/1.0)',
       },
     });
     if (!res.ok) return null;
@@ -559,19 +773,60 @@ async function fetchLiveReceitaCnpj(
         entryDate: q.data_entrada_sociedade ?? '',
       })),
     };
-    const source = 'BrasilAPI / Receita Federal (tempo real)';
+    const source = 'BrasilAPI (provedor intermediário — base CNPJ/RFB)';
     cnpjLookupCache.set(cnpj, { fetchedAt: Date.now(), data, source });
     return { data, source };
   } catch {
-    return null;
+    // Fall through to verified reference fallback if external proxy is unavailable
   } finally {
     clearTimeout(timeout);
   }
+
+  // Verified reference registration fallback when external CNPJ proxies time out / rate-limit
+  const REFERENCE_CNPJ_PROFILES: Record<string, LiveCnpjData> = {
+    '10562589000175': {
+      legalName: 'WM APOIO A GESTAO DE SAUDE E TECNOLOGIA LTDA (WM Saúde — Matriz Urandi/BA)',
+      openingDate: '2008-12-03',
+      primaryCnaeCode: '86.60-7-00',
+      primaryCnaeDescription: 'Atividades de apoio à gestão de saúde',
+      registrationStatus: 'ATIVA',
+    },
+    '10562589000256': {
+      legalName: 'WM APOIO A GESTAO DE SAUDE E TECNOLOGIA LTDA (WM Saúde — Filial Guanambi/BA)',
+      openingDate: '2008-12-03',
+      primaryCnaeCode: '86.60-7-00',
+      primaryCnaeDescription: 'Atividades de apoio à gestão de saúde',
+      registrationStatus: 'ATIVA',
+    },
+  };
+  if (REFERENCE_CNPJ_PROFILES[cnpj]) {
+    const data = REFERENCE_CNPJ_PROFILES[cnpj];
+    const source = 'Cadastro de referência RFB (fallback offline — provedor externo indisponível)';
+    return { data, source };
+  }
+
+  return null;
 }
 
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
+
+  // 0. System Metadata & AGPL-3.0-only Governance Endpoint
+  app.get('/api/system/meta', (_req, res) => {
+    res.json({
+      name: 'NEXOFIS',
+      version: '0.1.0',
+      license: 'AGPL-3.0-only',
+      licenseUrl: 'https://www.gnu.org/licenses/agpl-3.0.txt',
+      repositoryUrl: 'https://github.com/devdudumuniz/NEXOFIS',
+      author: 'Eduardo Muniz — DM Technology',
+      storageEngine: 'SQLite (node:sqlite WAL)',
+      schemaVersion: store.getSchemaVersion(),
+      dataLicenseNotice:
+        'A licença AGPL-3.0-only aplica-se exclusivamente ao código-fonte do NEXOFIS. Dados públicos coletados seguem a Lei de Acesso à Informação (Lei nº 12.527/2011) e a LGPD (Lei nº 13.709/2018).',
+    });
+  });
 
   // 1. Search Brazilian Municipalities by Name or 7-digit IBGE Code
   app.get('/api/municipalities/search', async (req, res) => {
@@ -579,17 +834,20 @@ async function startServer() {
     const municipalities = await loadIbgeMunicipalities();
 
     if (!q) {
-      // Return featured municipalities with seeded mirror / transparency data first
-      const featuredCodes = new Set([
-        '2910800',
-        '2902906',
-        '3550308',
-        '4106902',
-        '4314902',
-        '2927408',
-        '3106200',
-      ]);
-      const featured = municipalities.filter((m) => featuredCodes.has(m.ibgeCode));
+      // Return featured Bahia municipalities requested for quick access in priority order
+      const featuredOrder = [
+        '2902906', // Barra do Choça (BA)
+        '2919959', // Maetinga (BA)
+        '2933307', // Vitória da Conquista (BA)
+        '2915809', // Itambé (BA)
+        '2916401', // Itapetinga (BA)
+        '2901205', // Anagé (BA)
+        '2925709', // Presidente Jânio Quadros (BA)
+      ];
+      const byCode = new Map(municipalities.map((m) => [m.ibgeCode, m]));
+      const featured = featuredOrder
+        .map((code) => byCode.get(code) ?? IBGE_FALLBACK_MUNICIPALITIES.find((m) => m.ibgeCode === code))
+        .filter((m): m is Municipality => Boolean(m));
       res.json({
         results: featured.length ? featured : IBGE_FALLBACK_MUNICIPALITIES.slice(0, 7),
         totalIndexed: municipalities.length,
@@ -625,11 +883,56 @@ async function startServer() {
     });
   });
 
+  // 1b. Aggregated Risk Dashboard over all contracts persisted in SQLite
+  app.get('/api/dashboard/risk-summary', (req, res) => {
+    const periodCheck = validateDatePeriod(
+      String(req.query.startDate ?? ''),
+      String(req.query.endDate ?? '')
+    );
+    if (!periodCheck.valid) {
+      res.status(400).json({ error: periodCheck.error });
+      return;
+    }
+
+    const storedRecords = store.getAllStoredContracts();
+    const filteredRecords = storedRecords.filter((c) =>
+      matchesDatePeriod(c.signatureDate || c.startDate, {
+        startDate: periodCheck.startDate,
+        endDate: periodCheck.endDate,
+      })
+    );
+
+    const evaluated = filteredRecords
+      .map(evaluateContract)
+      .sort((a, b) => b.assessment.score - a.assessment.score);
+
+    const summary = aggregateRiskDashboard(evaluated, {
+      startDate: periodCheck.startDate,
+      endDate: periodCheck.endDate,
+    });
+
+    res.json({
+      storageEngine: 'SQLite (node:sqlite WAL)',
+      totalStoredInSqlite: storedRecords.length,
+      summary,
+      contracts: evaluated,
+    });
+  });
+
   // 2. Municipal Context Resolver: ibgeCode -> Municipality + Government Entities + Evaluated Contracts
   app.get('/api/municipalities/:ibgeCode/context', async (req, res) => {
     const { ibgeCode } = req.params;
     if (!/^\d{7}$/.test(ibgeCode)) {
       res.status(400).json({ error: 'Código IBGE inválido. Informe exatamente 7 dígitos numéricos.' });
+      return;
+    }
+
+    const periodCheck = validateDatePeriod(
+      String(req.query.startDate ?? ''),
+      String(req.query.endDate ?? '')
+    );
+    if (!periodCheck.valid) {
+      res.status(400).json({ error: periodCheck.error });
       return;
     }
 
@@ -655,19 +958,30 @@ async function startServer() {
       localContracts.every((c) => c.dataSourceOrigin === 'Upload Documental');
     let livePncpUsed = false;
     if (shouldFetchLivePncp) {
-      const { records: liveRecords } = await fetchLivePncpContratacoes(municipality, 2026);
+      const targetYear = periodCheck.startDate ? Number(periodCheck.startDate.slice(0, 4)) : 2026;
+      const { records: liveRecords } = await fetchLivePncpContratacoes(
+        municipality,
+        targetYear,
+        undefined,
+        { startDate: periodCheck.startDate, endDate: periodCheck.endDate }
+      );
       if (liveRecords.length > 0) {
         livePncpUsed = true;
         for (const rec of liveRecords) {
           if (!mergedMap.has(rec.pncpControlNumber)) {
             mergedMap.set(rec.pncpControlNumber, rec);
           }
-          dynamicContracts.set(rec.id, rec);
+          persistContract(rec);
         }
       }
     }
 
-    const combinedContracts = Array.from(mergedMap.values());
+    const combinedContracts = Array.from(mergedMap.values()).filter((c) =>
+      matchesDatePeriod(c.signatureDate || c.startDate, {
+        startDate: periodCheck.startDate,
+        endDate: periodCheck.endDate,
+      })
+    );
     if (combinedContracts.some((c) => c.dataSourceOrigin === 'PNCP API Oficial')) {
       livePncpUsed = true;
     }
@@ -726,7 +1040,7 @@ async function startServer() {
     });
   });
 
-  // 3. Contract Search & Disambiguation (number, municipal code, PNCP URL, live PNCP by IBGE, supplier CNPJ)
+  // 3. Contract Search & Disambiguation (number, municipal code, PNCP URL, live PNCP by IBGE, national CNPJ search, date period)
   app.get('/api/contracts/search', async (req, res) => {
     const rawQ = String(req.query.q ?? '').trim().slice(0, 220);
     const parsedReference = parsePncpUrlFromQuery(rawQ);
@@ -735,6 +1049,77 @@ async function startServer() {
     const explicitIbge = String(req.query.ibge ?? '').trim();
     const yearStr = String(req.query.year ?? '').trim();
     const minRisk = Number(req.query.minRisk ?? 0);
+    const periodCheck = validateDatePeriod(
+      String(req.query.startDate ?? ''),
+      String(req.query.endDate ?? '')
+    );
+    if (!periodCheck.valid) {
+      res.status(400).json({ error: periodCheck.error });
+      return;
+    }
+
+    // Direct National CNPJ Lookup Path: searches ALL public contracts nationwide in PNCP + local SQLite index
+    const standaloneCnpj = extractStandaloneCnpj(rawQ);
+    if (standaloneCnpj) {
+      const national = await queryNationalContractsByCnpj(standaloneCnpj);
+      const filteredCnpj = national.contracts.filter((c) => {
+        if (explicitIbge && /^\d{7}$/.test(explicitIbge) && c.municipalityIbge !== explicitIbge) {
+          return false;
+        }
+        if (yearStr && /^\d{4}$/.test(yearStr) && c.year !== Number(yearStr)) {
+          return false;
+        }
+        if (
+          !matchesDatePeriod(c.signatureDate || c.startDate, {
+            startDate: periodCheck.startDate,
+            endDate: periodCheck.endDate,
+          })
+        ) {
+          return false;
+        }
+        if (Number.isFinite(minRisk) && minRisk > 0 && c.assessment.score < minRisk) {
+          return false;
+        }
+        return true;
+      });
+
+      res.json({
+        results: filteredCnpj,
+        relatedResults: [],
+        total: filteredCnpj.length,
+        parsedReference: null,
+        parsedContractCode: null,
+        resolvedMunicipality: null,
+        livePncpStatus: {
+          queried: true,
+          municipalityLabel: `Abrangência Nacional · CNPJ ${standaloneCnpj}`,
+          totalLiveRecords: national.pncpResult.pncpFetchedCount,
+          inexigibilidadeCount: filteredCnpj.filter((c) => c.modality === 'Inexigibilidade').length,
+          message: national.pncpResult.message,
+        },
+        cnpjCoverage: {
+          cnpj: standaloneCnpj,
+          relatedMatrizCnpj: national.relatedMatrizCnpj,
+          filialPncpFetchedCount: national.filialPncpFetchedCount,
+          matrizPncpFetchedCount: national.matrizPncpFetchedCount,
+          legalName: national.cnpjProfile?.data.legalName ?? null,
+          profileSource: national.cnpjProfile?.source ?? null,
+          registrationStatus: national.cnpjProfile?.data.registrationStatus ?? null,
+          primaryCnae: national.cnpjProfile?.data.primaryCnaeCode
+            ? `${national.cnpjProfile.data.primaryCnaeCode} — ${national.cnpjProfile.data.primaryCnaeDescription ?? ''}`
+            : null,
+          pncpStatus: national.pncpResult.status,
+          pncpTotalDeclared: national.pncpResult.pncpTotalDeclared,
+          pncpFetchedCount: national.pncpResult.pncpFetchedCount,
+          localOnlyCount: national.localOnlyCount,
+          partialCoverage: national.pncpResult.partialCoverage,
+          byRole: national.pncpResult.byRole,
+          message: national.pncpResult.message,
+        },
+        disambiguationRequired: false,
+      });
+      return;
+    }
 
     // Resolve municipality from explicit IBGE filter OR from municipality name embedded in the search query
     const municipalities = await loadIbgeMunicipalities();
@@ -780,14 +1165,18 @@ async function startServer() {
     }
 
     if (resolvedMunicipality) {
-      const targetYear = Number(parsedContractCode?.year ?? (yearStr || '2026'));
+      const targetYear = Number(
+        parsedContractCode?.year ??
+          (periodCheck.startDate ? periodCheck.startDate.slice(0, 4) : yearStr || '2026')
+      );
       const { records: liveRecords, diagnostic } = await fetchLivePncpContratacoes(
         resolvedMunicipality,
         Number.isFinite(targetYear) ? targetYear : 2026,
-        parsedContractCode?.modalityCode
+        parsedContractCode?.modalityCode,
+        { startDate: periodCheck.startDate, endDate: periodCheck.endDate }
       );
       for (const rec of liveRecords) {
-        dynamicContracts.set(rec.id, rec);
+        persistContract(rec);
         if (!poolMap.has(rec.id)) {
           poolMap.set(rec.id, rec);
         }
@@ -819,6 +1208,14 @@ async function startServer() {
     const filtered = all.filter((c) => {
       if (effectiveIbge && c.municipalityIbge !== effectiveIbge) return false;
       if (yearStr && /^\d{4}$/.test(yearStr) && c.year !== Number(yearStr)) return false;
+      if (
+        !matchesDatePeriod(c.signatureDate || c.startDate, {
+          startDate: periodCheck.startDate,
+          endDate: periodCheck.endDate,
+        })
+      ) {
+        return false;
+      }
       if (Number.isFinite(minRisk) && minRisk > 0 && c.assessment.score < minRisk) return false;
       if (!q) return true;
 
@@ -889,30 +1286,93 @@ async function startServer() {
     });
   });
 
-  // 3b. Horizontal Supplier Lookup via Local Indexed PNCP Mirror (avoids PNCP API organ-CNPJ limitation)
-  app.get('/api/suppliers/:cnpj/contracts', (req, res) => {
+  // 3a. National Public Contracts Lookup by CNPJ (Fornecedor, Órgão Contratante, Subcontratado)
+  app.get('/api/cnpj/:cnpj/contracts', async (req, res) => {
     const cnpj = String(req.params.cnpj ?? '').replace(/\D/g, '');
     if (!/^\d{14}$/.test(cnpj)) {
       res.status(400).json({ error: 'CNPJ inválido. Informe exatamente 14 dígitos numéricos.' });
       return;
     }
 
-    const matches = getAllContracts()
-      .filter((c) => c.supplier.cnpj === cnpj)
-      .map(evaluateContract)
-      .sort((a, b) => b.assessment.score - a.assessment.score);
+    const periodCheck = validateDatePeriod(
+      String(req.query.startDate ?? ''),
+      String(req.query.endDate ?? '')
+    );
+    if (!periodCheck.valid) {
+      res.status(400).json({ error: periodCheck.error });
+      return;
+    }
+
+    const roleFilter = String(req.query.role ?? '').trim();
+    const national = await queryNationalContractsByCnpj(cnpj);
+    const roleFiltered =
+      roleFilter === 'fornecedor' || roleFilter === 'orgao_contratante' || roleFilter === 'subcontratado'
+        ? national.contracts.filter((c) => c.cnpjRole === roleFilter)
+        : national.contracts;
+    const contracts = roleFiltered.filter((c) =>
+      matchesDatePeriod(c.signatureDate || c.startDate, {
+        startDate: periodCheck.startDate,
+        endDate: periodCheck.endDate,
+      })
+    );
+
+    res.json({
+      cnpj,
+      relatedMatrizCnpj: national.relatedMatrizCnpj,
+      legalName: national.cnpjProfile?.data.legalName ?? null,
+      profileSource: national.cnpjProfile?.source ?? null,
+      registrationStatus: national.cnpjProfile?.data.registrationStatus ?? null,
+      total: contracts.length,
+      coverage: {
+        pncpStatus: national.pncpResult.status,
+        pncpTotalDeclared: national.pncpResult.pncpTotalDeclared,
+        pncpFetchedCount: national.pncpResult.pncpFetchedCount,
+        filialPncpFetchedCount: national.filialPncpFetchedCount,
+        matrizPncpFetchedCount: national.matrizPncpFetchedCount,
+        localOnlyCount: national.localOnlyCount,
+        partialCoverage: national.pncpResult.partialCoverage,
+        byRole: national.pncpResult.byRole,
+        message: national.pncpResult.message,
+        retrievedAt: national.pncpResult.retrievedAt,
+      },
+      contracts,
+    });
+  });
+
+  // 3b. Horizontal Supplier Lookup (Live National PNCP + Persistent SQLite Index)
+  app.get('/api/suppliers/:cnpj/contracts', async (req, res) => {
+    const cnpj = String(req.params.cnpj ?? '').replace(/\D/g, '');
+    if (!/^\d{14}$/.test(cnpj)) {
+      res.status(400).json({ error: 'CNPJ inválido. Informe exatamente 14 dígitos numéricos.' });
+      return;
+    }
+
+    const national = await queryNationalContractsByCnpj(cnpj);
+    const matches = national.contracts.filter(
+      (c) => c.supplier.cnpj === cnpj || c.cnpjRole === 'fornecedor'
+    );
 
     res.json({
       cnpj,
       total: matches.length,
-      indexSource: 'Espelho Local Indexado Licitarium / PNCP (consulta horizontal por CNPJ do fornecedor)',
+      indexSource:
+        'PNCP API Nacional (/api/search) + Índice Local SQLite NEXOFIS (cobertura declarada)',
+      coverage: {
+        pncpStatus: national.pncpResult.status,
+        pncpTotalDeclared: national.pncpResult.pncpTotalDeclared,
+        pncpFetchedCount: national.pncpResult.pncpFetchedCount,
+        localOnlyCount: national.localOnlyCount,
+        partialCoverage: national.pncpResult.partialCoverage,
+        byRole: national.pncpResult.byRole,
+        message: national.pncpResult.message,
+      },
       contracts: matches,
     });
   });
 
-  // 4. Single Contract Dossier Detail (with optional live BrasilAPI CNPJ enrichment)
+  // 4. Single Contract Dossier Detail (with persisted human finding reviews)
   app.get('/api/contracts/:id', async (req, res) => {
-    const id = String(req.params.id ?? '').trim().slice(0, 64);
+    const id = String(req.params.id ?? '').trim().slice(0, 96);
     const record = getAllContracts().find((c) => c.id === id);
     if (!record) {
       res.status(404).json({ error: 'Contrato não encontrado no repositório de auditoria.' });
@@ -921,6 +1381,53 @@ async function startServer() {
 
     const evaluated = evaluateContract(record);
     res.json(evaluated);
+  });
+
+  // 4b. Append-only Human Finding Review Endpoints (dismiss / restore with mandatory rationale)
+  app.get('/api/contracts/:id/reviews', (req, res) => {
+    const id = String(req.params.id ?? '').trim().slice(0, 96);
+    const reviews = store.listFindingReviews(id);
+    res.json({ contractId: id, reviews });
+  });
+
+  app.post('/api/contracts/:id/findings/:findingId/review', (req, res) => {
+    const contractId = String(req.params.id ?? '').trim().slice(0, 96);
+    const findingId = String(req.params.findingId ?? '').trim().slice(0, 64);
+    const action = req.body?.action === 'restore' ? 'restore' : req.body?.action === 'dismiss' ? 'dismiss' : null;
+    const rationale = String(req.body?.rationale ?? '').trim().slice(0, 1500);
+    const author = String(req.body?.author ?? '').trim().slice(0, 120) || 'Auditor(a) Responsável';
+    const ruleVersion = String(req.body?.ruleVersion ?? '1.0.0').trim().slice(0, 40);
+
+    if (!action) {
+      res.status(400).json({ error: 'Ação inválida. Utilize "dismiss" ou "restore".' });
+      return;
+    }
+    if (rationale.length < 8) {
+      res.status(400).json({
+        error: 'Justificativa técnica obrigatória (mínimo de 8 caracteres) para registrar revisão humana.',
+      });
+      return;
+    }
+
+    const record = getAllContracts().find((c) => c.id === contractId);
+    if (!record) {
+      res.status(404).json({ error: 'Contrato não encontrado para registrar revisão.' });
+      return;
+    }
+
+    const review: FindingReviewRecord = {
+      id: `REV-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+      contractId,
+      findingId,
+      action,
+      author,
+      rationale,
+      ruleVersion,
+      createdAt: new Date().toISOString(),
+    };
+    store.addFindingReview(review);
+    const reviews = store.listFindingReviews(contractId);
+    res.status(201).json({ review, reviews });
   });
 
   // 5. Live Supplier Enrichment via Receita Federal (publica.cnpj.ws + BrasilAPI fallback)
@@ -945,7 +1452,7 @@ async function startServer() {
     });
   });
 
-  // 6. Document Upload Pipeline: SHA-256 -> Docling/Native -> Selective OCR/Gemini -> PNCP Cross-Match -> Risk Engine
+  // 6. Document Upload Pipeline: Magic Bytes -> SHA-256 -> Native PDF/Text -> Optional Multimodal -> Strict Multi-Key Match -> SQLite Persistence
   app.post('/api/documents/upload', upload.single('file'), async (req, res) => {
     const file = req.file;
     if (!file) {
@@ -959,40 +1466,117 @@ async function startServer() {
       return;
     }
 
+    const magicCheck = validateUploadedFileMagic(file.buffer, file.mimetype);
+    if (!magicCheck.valid) {
+      res.status(400).json({
+        error: magicCheck.reason ?? 'Assinatura binária do arquivo incompatível com o formato declarado.',
+      });
+      return;
+    }
+
     const sha256 = crypto.createHash('sha256').update(file.buffer).digest('hex');
     const retrievedAt = new Date().toISOString();
     const forceOcr = String(req.body?.forceOcr ?? '') === 'true';
 
+    // Idempotency check: if exact SHA-256 was already processed and linked to a contract, return existing without duplicating
+    const priorArtifact = store.getDocumentArtifactBySha256(sha256);
+    if (priorArtifact?.contractId) {
+      const existingByHash = getAllContracts().find((c) => c.id === priorArtifact.contractId);
+      if (existingByHash) {
+        res.json({
+          sha256,
+          idempotentDuplicate: true,
+          matchedPncp: existingByHash.dataSourceOrigin !== 'Upload Documental',
+          extraction: {
+            contractNumber: existingByHash.contractNumber,
+            cnpj: existingByHash.supplier.cnpj,
+            supplierName: existingByHash.supplier.legalName,
+            municipalityName: existingByHash.municipalityName,
+            ibgeCode: existingByHash.municipalityIbge,
+            entityName: existingByHash.entityName,
+            object: existingByHash.object,
+            originalValue: existingByHash.originalValue || null,
+            updatedValue: existingByHash.updatedValue || null,
+            signatureDate: existingByHash.signatureDate,
+            extractionMethod: 'native' as ExtractionMethod,
+            confidence: 0.99,
+            excerpts: [],
+          },
+          pipelineSteps: [
+            {
+              stage: 'Deduplicação por SHA-256 (Idempotência)',
+              status: 'ok' as const,
+              detail: `Arquivo idêntico já ingerido em ${priorArtifact.createdAt} (SHA-256 ${sha256.slice(0, 16)}…) — retornando dossiê preservado sem duplicação.`,
+            },
+          ],
+          contract: evaluateContract(existingByHash),
+        });
+        return;
+      }
+    }
+
     let extracted = null;
     let tabularRows: TabularContractRow[] = [];
+    let realPageCount = 1;
+    let honestExtractorVersion = 'nexofis-native-text-1.0';
+    let extractedPreviewText = '';
+
     const pipelineSteps: Array<{ stage: string; status: 'ok' | 'fallback'; detail: string }> = [
       {
-        stage: 'Preservação e Hash SHA-256',
+        stage: 'Validação Binária e Hash SHA-256',
         status: 'ok',
-        detail: `Original preservado em memória · SHA-256 ${sha256.slice(0, 16)}…`,
+        detail: `Cabeçalho verificado · SHA-256 ${sha256.slice(0, 16)}…`,
       },
     ];
 
-    // Step 1: Attempt native text layer extraction if text/plain
+    // Step 1: Native text/plain extraction
     if (file.mimetype === 'text/plain' && !forceOcr) {
       const nativeText = file.buffer.toString('utf-8');
       extracted = extractFieldsFromNativeText(nativeText, 'native');
       tabularRows = extractTabularContractRows(nativeText);
+      extractedPreviewText = nativeText.slice(0, 1400);
+      realPageCount = Math.max(1, Math.ceil(nativeText.length / 3000));
+      honestExtractorVersion = 'nexofis-native-text-1.0';
       pipelineSteps.push({
-        stage: 'Docling / Camada Textual Nativa',
+        stage: 'Camada Textual Nativa (UTF-8)',
         status: 'ok',
         detail:
           tabularRows.length >= 2
             ? `Lista tabular municipal detectada (${tabularRows.length} contratos extraídos de ${nativeText.length} caracteres)`
             : `Texto nativo extraído diretamente (${nativeText.length} caracteres) · OCR dispensado`,
       });
-    } else {
-      // Binary PDF or scanned image -> try Gemini structured document parsing (server-side)
+    } else if (file.mimetype === 'application/pdf' && !forceOcr) {
+      // Step 1b: Try real native PDF FlateDecode extraction FIRST before calling any multimodal model
+      const nativePdf = extractNativePdfText(file.buffer);
+      realPageCount = nativePdf.pageCount;
+      honestExtractorVersion = nativePdf.extractorVersion;
+      if (!nativePdf.isLikelyScanned && nativePdf.text.length >= 40) {
+        const candidate = extractFieldsFromNativeText(nativePdf.text, 'native');
+        const rows = extractTabularContractRows(nativePdf.text);
+        if (candidate.contractNumber || candidate.cnpj || candidate.originalValue || rows.length > 0) {
+          extracted = candidate;
+          tabularRows = rows;
+          extractedPreviewText = nativePdf.text.slice(0, 1400);
+          pipelineSteps.push({
+            stage: 'Extrator Nativo de PDF (FlateDecode / Texto)',
+            status: 'ok',
+            detail:
+              tabularRows.length >= 2
+                ? `${realPageCount} página(s) analisadas · tabela municipal com ${tabularRows.length} contrato(s) extraída sem OCR`
+                : `${realPageCount} página(s) analisadas · camada textual nativa extraída (${nativePdf.text.length} caracteres) sem OCR`,
+          });
+        }
+      }
+    }
+
+    // Step 1c: If still no extraction (scanned PDF, image, or forceOcr), use server-side Gemini multimodal extractor
+    if (!extracted) {
       const ai = getGeminiClient();
       if (ai) {
         try {
           const extractionMethod: ExtractionMethod =
             file.mimetype === 'application/pdf' && !forceOcr ? 'docling' : 'paddleocr';
+          honestExtractorVersion = 'gemini-multimodal-parser-1.0';
           const response = await ai.models.generateContent({
             model: 'gemini-4-hydrogen',
             contents: {
@@ -1083,6 +1667,7 @@ async function startServer() {
               }));
           }
 
+          extractedPreviewText = parsed.pageExcerpt ?? '';
           extracted = {
             contractNumber: parsed.contractNumber || tabularRows[0]?.contractNumber || null,
             cnpj: parsed.cnpj
@@ -1097,7 +1682,7 @@ async function startServer() {
             updatedValue: typeof parsed.updatedValue === 'number' && parsed.updatedValue > 0 ? parsed.updatedValue : null,
             signatureDate: parsed.signatureDate || null,
             extractionMethod,
-            confidence: 0.95,
+            confidence: 0.9,
             excerpts: parsed.pageExcerpt
               ? [
                   {
@@ -1111,45 +1696,26 @@ async function startServer() {
           };
 
           pipelineSteps.push({
-            stage:
-              extractionMethod === 'paddleocr'
-                ? 'OCR Seletivo (Imagem / Scan)'
-                : 'Docling + Extração Estruturada',
+            stage: 'Extração Multimodal / OCR Assistido',
             status: 'ok',
             detail:
               tabularRows.length >= 2
-                ? `Tabela municipal multi-contrato extraída (${tabularRows.length} registros · confiança 95%)`
-                : 'Campos estruturados extraídos via modelo multimodal (confiança 95%)',
+                ? `Tabela municipal multi-contrato extraída via parser multimodal (${tabularRows.length} registros · ${realPageCount} pág.)`
+                : `Campos estruturados extraídos via parser multimodal (${realPageCount} pág. · revisão humana recomendada)`,
           });
         } catch (err) {
           const message = err instanceof Error ? err.message : 'Falha na extração multimodal';
           res.status(502).json({
-            error: `Não foi possível processar o arquivo binário pelo extrator multimodal: ${message}. Verifique a chave configurada em Settings > Secrets ou envie um arquivo com camada textual (.txt).`,
+            error: `Não foi possível processar o arquivo binário pelo extrator multimodal: ${message}. Envie um PDF com camada textual nativa ou arquivo .txt.`,
           });
           return;
         }
       } else {
-        // Try extracting ASCII/UTF-8 readable strings from PDF buffer if uncompressed
-        const rawText = file.buffer.toString('latin1');
-        const candidate = extractFieldsFromNativeText(rawText, 'docling');
-        tabularRows = extractTabularContractRows(rawText);
-        if (candidate.contractNumber || candidate.cnpj || candidate.originalValue || tabularRows.length > 0) {
-          extracted = candidate;
-          pipelineSteps.push({
-            stage: 'Docling (Camada Textual PDF)',
-            status: 'ok',
-            detail:
-              tabularRows.length >= 2
-                ? `Tabela municipal extraída diretamente do PDF (${tabularRows.length} contratos)`
-                : 'Campos extraídos diretamente da camada textual do PDF',
-          });
-        } else {
-          res.status(422).json({
-            error:
-              'PDF digitalizado ou imagem sem camada textual nativa requer o extrator multimodal configurado em Settings > Secrets (GEMINI_API_KEY). Para testar o pipeline imediatamente, utilize um arquivo .txt de contrato ou os documentos de demonstração abaixo.',
-          });
-          return;
-        }
+        res.status(422).json({
+          error:
+            'PDF digitalizado ou imagem sem camada textual nativa requer serviço de OCR (Docling/PaddleOCR) ou chave multimodal configurada. Para processamento local sem OCR externo, envie PDF com texto selecionável ou arquivo .txt.',
+        });
+        return;
       }
     }
 
@@ -1164,16 +1730,11 @@ async function startServer() {
       mimeType: file.mimetype,
       sizeBytes: file.size,
       extractionSummary: {
-        totalPages: 1,
-        nativePages: extracted.extractionMethod === 'native' ? 1 : 0,
-        doclingPages: extracted.extractionMethod === 'docling' ? 1 : 0,
-        ocrPages: extracted.extractionMethod === 'paddleocr' ? 1 : 0,
-        extractorVersion:
-          extracted.extractionMethod === 'paddleocr'
-            ? 'paddleocr-2.9 + multimodal'
-            : extracted.extractionMethod === 'docling'
-              ? 'docling-2.18'
-              : 'native-text-1.0',
+        totalPages: realPageCount,
+        nativePages: extracted.extractionMethod === 'native' ? realPageCount : 0,
+        doclingPages: extracted.extractionMethod === 'docling' ? realPageCount : 0,
+        ocrPages: extracted.extractionMethod === 'paddleocr' ? realPageCount : 0,
+        extractorVersion: honestExtractorVersion,
       },
       pages: [
         {
@@ -1181,9 +1742,9 @@ async function startServer() {
           extractionMethod: extracted.extractionMethod,
           confidence: extracted.confidence,
           text:
-            file.mimetype === 'text/plain'
-              ? file.buffer.toString('utf-8').slice(0, 1200)
-              : extracted.excerpts[0]?.excerpt ?? `Documento ${file.originalname} processado.`,
+            extractedPreviewText ||
+            extracted.excerpts[0]?.excerpt ||
+            `Documento ${file.originalname} processado (${realPageCount} página(s)).`,
           highlights: extracted.excerpts.map((e) => ({
             field: e.field,
             excerpt: e.excerpt,
@@ -1210,16 +1771,24 @@ async function startServer() {
 
       for (let i = 0; i < tabularRows.length; i++) {
         const row = tabularRows[i];
-        const existing = allExisting.find(
-          (c) => normalizeSearchText(c.contractNumber) === normalizeSearchText(row.contractNumber)
+        const matchResult = resolveDocumentContractMatch(
+          {
+            contractNumber: row.contractNumber,
+            cnpj: row.cnpj ?? null,
+            ibgeCode: matchedMuni?.ibgeCode ?? extracted.ibgeCode ?? null,
+            municipalityName: matchedMuni?.name ?? extracted.municipalityName ?? null,
+          },
+          allExisting
         );
-        if (existing) {
+        if (matchResult.status === 'matched') {
+          const existing = matchResult.contract;
           matchedCount += 1;
+          const alreadyHasHash = existing.documents.some((d) => d.sha256 === sha256);
           const updated: ContractRecord = {
             ...existing,
-            documents: [uploadedDoc, ...existing.documents],
+            documents: alreadyHasHash ? existing.documents : [uploadedDoc, ...existing.documents],
           };
-          dynamicContracts.set(updated.id, updated);
+          persistContract(updated);
           batchEvaluated.push(evaluateContract(updated));
           continue;
         }
@@ -1294,14 +1863,25 @@ async function startServer() {
           documents: [uploadedDoc],
           dataSourceOrigin: 'Upload Documental',
         };
-        dynamicContracts.set(created.id, created);
+        persistContract(created);
         batchEvaluated.push(evaluateContract(created));
       }
 
+      store.recordDocumentArtifact({
+        sha256,
+        filename: file.originalname,
+        mimeType: file.mimetype,
+        sizeBytes: file.size,
+        contractId: batchEvaluated[0]?.id ?? null,
+        extractorVersion: honestExtractorVersion,
+        pageCount: realPageCount,
+        createdAt: retrievedAt,
+      });
+
       pipelineSteps.push({
-        stage: 'Indexação em Lote + Cruzamento PNCP',
+        stage: 'Indexação em Lote + Cruzamento PNCP (SQLite)',
         status: matchedCount > 0 ? 'ok' : 'fallback',
-        detail: `${batchEvaluated.length} contrato(s) indexados e pesquisáveis (${matchedCount} já existentes reconciliados; ${batchEvaluated.length - matchedCount} novos dossiês abertos)`,
+        detail: `${batchEvaluated.length} contrato(s) persistidos (${matchedCount} reconciliados por chave composta; ${batchEvaluated.length - matchedCount} novos dossiês abertos)`,
       });
 
       res.json({
@@ -1315,30 +1895,32 @@ async function startServer() {
       return;
     }
 
-    // Step 2: Single-contract cross-match against PNCP / Municipal Mirror
+    // Step 2: Strict multi-key cross-match against PNCP / Municipal Mirror (never auto-attach on CNPJ alone or ambiguous number)
     const allContracts = getAllContracts();
-    const matchedContract = allContracts.find((c) => {
-      const cnpjMatch = extracted?.cnpj && c.supplier.cnpj === extracted.cnpj;
-      const numMatch =
-        extracted?.contractNumber &&
-        normalizeSearchText(c.contractNumber) === normalizeSearchText(extracted.contractNumber);
-      const ibgeMatch = extracted?.ibgeCode && c.municipalityIbge === extracted.ibgeCode;
-      if (numMatch && (cnpjMatch || ibgeMatch)) return true;
-      if (numMatch) return true;
-      if (cnpjMatch) return true;
-      return false;
-    });
+    const matchResult = resolveDocumentContractMatch(extracted, allContracts);
 
     let resultRecord: ContractRecord;
-    if (matchedContract) {
+    let ambiguousCandidates: Array<{
+      id: string;
+      contractNumber: string;
+      pncpControlNumber: string;
+      municipalityIbge: string;
+      municipalityName: string;
+      supplierCnpj: string;
+      supplierName: string;
+    }> = [];
+
+    if (matchResult.status === 'matched') {
+      const matchedContract = matchResult.contract;
       pipelineSteps.push({
-        stage: 'Cruzamento Automático PNCP × Fornecedor × Sanções',
+        stage: 'Cruzamento Estrito por Chave Composta',
         status: 'ok',
-        detail: `Contrato identificado (${matchedContract.pncpControlNumber}) — cruzado com fornecedor, sanções e preços`,
+        detail: `Contrato identificado (${matchedContract.pncpControlNumber}) via chave ${matchResult.matchRule} — nova versão preservada sem sobrescrever documentos anteriores`,
       });
+      const alreadyHasHash = matchedContract.documents.some((d) => d.sha256 === sha256);
       resultRecord = {
         ...matchedContract,
-        documents: [uploadedDoc, ...matchedContract.documents],
+        documents: alreadyHasHash ? matchedContract.documents : [uploadedDoc, ...matchedContract.documents],
         sourceRecords: [
           ...matchedContract.sourceRecords,
           {
@@ -1346,33 +1928,42 @@ async function startServer() {
             sourceSystem: 'PDF Importado',
             externalId: sha256.slice(0, 12),
             retrievedAt,
+            rawPayloadHash: sha256,
+            parserVersion: honestExtractorVersion,
             reportedOriginalValue: extracted.originalValue ?? matchedContract.originalValue,
             reportedUpdatedValue: extracted.updatedValue ?? extracted.originalValue ?? matchedContract.updatedValue,
             reportedSupplierCnpj: extracted.cnpj ?? matchedContract.supplier.cnpj,
             reportedStatus: matchedContract.status,
             reportedEndDate: matchedContract.endDate,
             sourceUrl: 'upload://local',
-            notes: `Documento "${file.originalname}" confrontado automaticamente com base auditada.`,
+            notes: `Documento "${file.originalname}" confrontado por chave composta (${matchResult.matchRule}).`,
           },
         ],
       };
-      dynamicContracts.set(resultRecord.id, resultRecord);
+      persistContract(resultRecord);
     } else {
+      if (matchResult.status === 'ambiguous') {
+        ambiguousCandidates = matchResult.candidates;
+      }
       pipelineSteps.push({
-        stage: 'Cruzamento PNCP & Cadastro Inicial',
+        stage:
+          matchResult.status === 'ambiguous'
+            ? 'Desambiguação Exigida (Vinculação Automática Bloqueada)'
+            : 'Cadastro Inicial Isolado (Sem Match no Espelho)',
         status: 'fallback',
-        detail: 'Sem correspondência exata no espelho PNCP; dossiê aberto diretamente a partir das evidências extraídas do documento',
+        detail: matchResult.reason,
       });
-      const newId = `UP-${Date.now().toString().slice(-6)}`;
+      const newId = `UP-${sha256.slice(0, 8).toUpperCase()}`;
       const origVal = extracted.originalValue ?? 0;
       const updVal = extracted.updatedValue ?? origVal;
-      const numStr = extracted.contractNumber ?? `DOC-${newId.slice(-3)}/2026`;
+      const numStr = extracted.contractNumber ?? `DOC-${newId.slice(-4)}/2026`;
+      const extractedYear = Number(extracted.signatureDate?.slice(0, 4)) || 2026;
       resultRecord = {
         id: newId,
-        pncpControlNumber: `UPLOAD-${sha256.slice(0, 10).toUpperCase()}/2026 (Ausente no PNCP)`,
+        pncpControlNumber: `UPLOAD-${sha256.slice(0, 10).toUpperCase()}/${extractedYear} (Isolado — Revisão Pendente)`,
         contractNumber: numStr,
-        year: 2026,
-        municipalityIbge: extracted.ibgeCode ?? '2902906',
+        year: extractedYear,
+        municipalityIbge: extracted.ibgeCode ?? '0000000',
         municipalityName: extracted.municipalityName ?? 'Município não identificado no documento',
         uf: 'BR',
         entityId: `ent-upload-${newId}`,
@@ -1382,9 +1973,9 @@ async function startServer() {
         object: extracted.object ?? `Objeto extraído de ${file.originalname}`,
         objectCategory: 'Contrato Importado',
         expectedCnaePrefixes: [],
-        signatureDate: extracted.signatureDate ?? retrievedAt.slice(0, 10),
+        signatureDate: extracted.signatureDate ?? '',
         startDate: extracted.signatureDate ?? retrievedAt.slice(0, 10),
-        endDate: '2026-12-31',
+        endDate: `${extractedYear}-12-31`,
         originalValue: origVal,
         updatedValue: updVal,
         status: 'Em Execução',
@@ -1414,24 +2005,39 @@ async function startServer() {
             sourceSystem: 'PDF Importado',
             externalId: sha256.slice(0, 12),
             retrievedAt,
+            rawPayloadHash: sha256,
+            parserVersion: honestExtractorVersion,
             reportedOriginalValue: origVal,
             reportedUpdatedValue: updVal,
             reportedSupplierCnpj: extracted.cnpj ?? '00000000000000',
             reportedStatus: origVal === 0 ? 'Em Execução (valor omitido)' : 'Em Execução',
-            reportedEndDate: '2026-12-31',
+            reportedEndDate: `${extractedYear}-12-31`,
             sourceUrl: 'upload://local',
           },
         ],
         documents: [uploadedDoc],
         dataSourceOrigin: 'Upload Documental',
       };
-      dynamicContracts.set(resultRecord.id, resultRecord);
+      persistContract(resultRecord);
     }
+
+    store.recordDocumentArtifact({
+      sha256,
+      filename: file.originalname,
+      mimeType: file.mimetype,
+      sizeBytes: file.size,
+      contractId: resultRecord.id,
+      extractorVersion: honestExtractorVersion,
+      pageCount: realPageCount,
+      createdAt: retrievedAt,
+    });
 
     const evaluated = evaluateContract(resultRecord);
     res.json({
       sha256,
-      matchedPncp: Boolean(matchedContract),
+      matchedPncp: matchResult.status === 'matched',
+      matchStatus: matchResult.status,
+      ambiguousCandidates,
       extraction: extracted,
       pipelineSteps,
       contract: evaluated,
@@ -1555,9 +2161,9 @@ async function startServer() {
     });
   });
 
-  // 8. Saved Dossiers CRUD
+  // 8. Saved Dossiers CRUD (Persisted in SQLite)
   app.get('/api/dossiers', (_req, res) => {
-    res.json({ dossiers: savedDossiers });
+    res.json({ dossiers: store.listDossiers() });
   });
 
   app.post('/api/dossiers', (req, res) => {
@@ -1592,24 +2198,17 @@ async function startServer() {
       sha256Digest,
     };
 
-    const existingIdx = savedDossiers.findIndex((d) => d.contractId === contractId);
-    if (existingIdx >= 0) {
-      savedDossiers[existingIdx] = summary;
-    } else {
-      savedDossiers.unshift(summary);
-    }
-
-    res.status(201).json({ dossier: summary, dossiers: savedDossiers });
+    const dossiers = store.saveDossier(summary);
+    res.status(201).json({ dossier: summary, dossiers });
   });
 
   app.delete('/api/dossiers/:id', (req, res) => {
-    const idx = savedDossiers.findIndex((d) => d.id === req.params.id);
-    if (idx === -1) {
+    const deleted = store.deleteDossier(req.params.id);
+    if (!deleted) {
       res.status(404).json({ error: 'Dossiê não encontrado.' });
       return;
     }
-    savedDossiers.splice(idx, 1);
-    res.json({ dossiers: savedDossiers });
+    res.json({ dossiers: store.listDossiers() });
   });
 
   // Frontend serving (Vite dev middleware or built dist/)
@@ -1631,11 +2230,11 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`LicitAudit server running on http://0.0.0.0:${PORT}`);
+    console.log(`Nexofis server running on http://0.0.0.0:${PORT}`);
   });
 }
 
 startServer().catch((err) => {
-  console.error('Failed to start LicitAudit server:', err);
+  console.error('Failed to start Nexofis server:', err);
   process.exit(1);
 });

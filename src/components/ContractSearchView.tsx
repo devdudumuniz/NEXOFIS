@@ -1,27 +1,45 @@
 import { useEffect, useState } from 'react';
 import { ArrowRight, FileUp, Info, Search, X } from 'lucide-react';
 import type { EvaluatedContract, Municipality } from '../types/audit';
-import { searchContracts, searchMunicipalities } from '../lib/api';
+import { searchContracts, searchMunicipalities, type CnpjCoverageInfo } from '../lib/api';
 import type { ParsedContractCode } from '../lib/pncpQueryParser';
 import { formatCnpj, formatCurrencyBRL } from '../lib/formatters';
+import { validateDatePeriod } from '../lib/datePeriod';
+import { DatePeriodControls } from './DatePeriodControls';
 import { RiskScoreInline } from './RiskText';
 
+export interface ContractSearchFilterState {
+  query: string;
+  ibgeFilter: string;
+  municipalityInput: string;
+  yearFilter: string;
+  startDate: string;
+  endDate: string;
+  minRisk: number;
+}
+
 interface ContractSearchViewProps {
+  filterState?: ContractSearchFilterState;
+  onFilterStateChange?: (next: ContractSearchFilterState) => void;
   onSelectContract: (contract: EvaluatedContract) => void;
   onNavigateToDocument?: () => void;
 }
 
 export function ContractSearchView({
+  filterState,
+  onFilterStateChange,
   onSelectContract,
   onNavigateToDocument,
 }: ContractSearchViewProps) {
-  const [query, setQuery] = useState('123/2026');
-  const [ibgeFilter, setIbgeFilter] = useState('');
-  const [municipalityInput, setMunicipalityInput] = useState('');
+  const [query, setQuery] = useState(filterState?.query ?? '123/2026');
+  const [ibgeFilter, setIbgeFilter] = useState(filterState?.ibgeFilter ?? '');
+  const [municipalityInput, setMunicipalityInput] = useState(filterState?.municipalityInput ?? '');
   const [municipalitySuggestions, setMunicipalitySuggestions] = useState<Municipality[]>([]);
   const [showMunicipalityMenu, setShowMunicipalityMenu] = useState(false);
-  const [yearFilter, setYearFilter] = useState('2026');
-  const [minRisk, setMinRisk] = useState<number>(0);
+  const [yearFilter, setYearFilter] = useState(filterState?.yearFilter ?? '');
+  const [startDate, setStartDate] = useState(filterState?.startDate ?? '');
+  const [endDate, setEndDate] = useState(filterState?.endDate ?? '');
+  const [minRisk, setMinRisk] = useState<number>(filterState?.minRisk ?? 0);
 
   const [results, setResults] = useState<EvaluatedContract[]>([]);
   const [relatedResults, setRelatedResults] = useState<EvaluatedContract[]>([]);
@@ -40,8 +58,21 @@ export function ContractSearchView({
     inexigibilidadeCount: number;
     message: string;
   } | null>(null);
+  const [cnpjCoverage, setCnpjCoverage] = useState<CnpjCoverageInfo | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    onFilterStateChange?.({
+      query,
+      ibgeFilter,
+      municipalityInput,
+      yearFilter,
+      startDate,
+      endDate,
+      minRisk,
+    });
+  }, [query, ibgeFilter, municipalityInput, yearFilter, startDate, endDate, minRisk]);
 
   // Live IBGE autocomplete for all 5,571 Brazilian municipalities
   useEffect(() => {
@@ -63,8 +94,18 @@ export function ContractSearchView({
     q?: string;
     ibge?: string;
     year?: string;
+    startDate?: string;
+    endDate?: string;
     minRisk?: number;
   }) => {
+    const nextStart = override?.startDate !== undefined ? override.startDate : startDate;
+    const nextEnd = override?.endDate !== undefined ? override.endDate : endDate;
+    const periodCheck = validateDatePeriod(nextStart, nextEnd);
+    if (!periodCheck.valid) {
+      setError(periodCheck.error ?? 'Período de datas inválido.');
+      return;
+    }
+
     setLoading(true);
     setError(null);
     try {
@@ -72,6 +113,8 @@ export function ContractSearchView({
         q: override?.q ?? query,
         ibge: override?.ibge ?? ibgeFilter,
         year: override?.year ?? yearFilter,
+        startDate: nextStart || undefined,
+        endDate: nextEnd || undefined,
         minRisk: override?.minRisk ?? minRisk,
       });
       setResults(res.results);
@@ -80,6 +123,7 @@ export function ContractSearchView({
       setParsedReference(res.parsedReference ?? null);
       setParsedContractCode(res.parsedContractCode ?? null);
       setLivePncpStatus(res.livePncpStatus ?? null);
+      setCnpjCoverage(res.cnpjCoverage ?? null);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao consultar contratos.');
     } finally {
@@ -89,7 +133,7 @@ export function ContractSearchView({
 
   useEffect(() => {
     runSearch();
-  }, [ibgeFilter, yearFilter, minRisk]);
+  }, [ibgeFilter, yearFilter, startDate, endDate, minRisk]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -110,6 +154,14 @@ export function ContractSearchView({
 
   const renderContractRow = (contract: EvaluatedContract) => {
     const valueOmitted = contract.originalValue === 0 && contract.updatedValue === 0;
+    const roleLabel =
+      contract.cnpjRole === 'fornecedor'
+        ? 'Papel: Fornecedor'
+        : contract.cnpjRole === 'orgao_contratante'
+          ? 'Papel: Órgão Contratante'
+          : contract.cnpjRole === 'subcontratado'
+            ? 'Papel: Subcontratado'
+            : null;
     return (
       <div
         key={contract.id}
@@ -135,6 +187,11 @@ export function ContractSearchView({
 
           <div className="text-xs font-medium text-slate-600">
             {contract.entityName} · {contract.modality}
+            {roleLabel && (
+              <>
+                {' '}· <span className="font-mono text-blue-700">{roleLabel}</span>
+              </>
+            )}
           </div>
           <p className="text-sm text-slate-900">{contract.object}</p>
           <div className="text-xs text-slate-500">
@@ -142,7 +199,15 @@ export function ContractSearchView({
             <span className="text-slate-800 font-medium">{contract.supplier.legalName}</span>{' '}
             {contract.supplier.cnpj !== '00000000000000' && (
               <span className="font-mono tabular-nums">
-                ({formatCnpj(contract.supplier.cnpj)})
+                ({formatCnpj(contract.supplier.cnpj)}
+                {cnpjCoverage?.relatedMatrizCnpj &&
+                contract.supplier.cnpj === cnpjCoverage.relatedMatrizCnpj
+                  ? ' · Matriz'
+                  : cnpjCoverage?.relatedMatrizCnpj &&
+                      contract.supplier.cnpj === cnpjCoverage.cnpj
+                    ? ' · Filial'
+                    : ''}
+                )
               </span>
             )}
           </div>
@@ -299,6 +364,19 @@ export function ContractSearchView({
               Pesquisar
             </button>
           </div>
+
+          <div className="md:col-span-12 pt-2 border-t border-slate-100">
+            <div className="max-w-xl">
+              <DatePeriodControls
+                idPrefix="contract-search"
+                startDate={startDate}
+                endDate={endDate}
+                onStartDateChange={setStartDate}
+                onEndDateChange={setEndDate}
+                showPresets
+              />
+            </div>
+          </div>
         </form>
 
         <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-slate-500">
@@ -306,13 +384,63 @@ export function ContractSearchView({
           <button
             type="button"
             onClick={() => {
+              setQuery('10.562.589/0002-56');
+              handleClearMunicipality();
+              setYearFilter('');
+              setStartDate('');
+              setEndDate('');
+              runSearch({ q: '10.562.589/0002-56', ibge: '', year: '', startDate: '', endDate: '' });
+            }}
+            className="text-blue-700 font-semibold hover:text-blue-800 underline underline-offset-4"
+          >
+            CNPJ Nacional: WM Saúde (10.562.589/0002-56 · Filial + Matriz)
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setQuery('08.562.959/0001-22');
+              handleClearMunicipality();
+              setYearFilter('');
+              setStartDate('');
+              setEndDate('');
+              runSearch({ q: '08.562.959/0001-22', ibge: '', year: '', startDate: '', endDate: '' });
+            }}
+            className="text-blue-700 font-medium hover:text-blue-800 underline underline-offset-4"
+          >
+            CNPJ Nacional: Plenna (08.562.959/0001-22)
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setQuery('13.265.251/0002-20');
+              handleClearMunicipality();
+              setYearFilter('');
+              setStartDate('');
+              setEndDate('');
+              runSearch({ q: '13.265.251/0002-20', ibge: '', year: '', startDate: '', endDate: '' });
+            }}
+            className="text-blue-700 font-medium hover:text-blue-800 underline underline-offset-4"
+          >
+            CNPJ Nacional: Movel Motores (13.265.251/0002-20)
+          </button>
+          <button
+            type="button"
+            onClick={() => {
               setQuery('IN012/2026FMS');
               setIbgeFilter('2902906');
               setMunicipalityInput('Barra do Choça/BA (2902906)');
               setYearFilter('2026');
-              runSearch({ q: 'IN012/2026FMS', ibge: '2902906', year: '2026' });
+              setStartDate('2026-01-01');
+              setEndDate('2026-12-31');
+              runSearch({
+                q: 'IN012/2026FMS',
+                ibge: '2902906',
+                year: '2026',
+                startDate: '2026-01-01',
+                endDate: '2026-12-31',
+              });
             }}
-            className="text-blue-700 font-medium hover:text-blue-800 underline underline-offset-4"
+            className="text-slate-700 hover:text-blue-700 underline underline-offset-4"
           >
             IN012/2026FMS (Barra do Choça / BA)
           </button>
@@ -321,7 +449,16 @@ export function ContractSearchView({
             onClick={() => {
               setQuery('123/2026');
               handleClearMunicipality();
-              runSearch({ q: '123/2026', ibge: '' });
+              setYearFilter('2026');
+              setStartDate('2026-01-01');
+              setEndDate('2026-12-31');
+              runSearch({
+                q: '123/2026',
+                ibge: '',
+                year: '2026',
+                startDate: '2026-01-01',
+                endDate: '2026-12-31',
+              });
             }}
             className="text-slate-700 hover:text-blue-700 underline underline-offset-4"
           >
@@ -332,38 +469,112 @@ export function ContractSearchView({
             onClick={() => {
               setQuery('');
               handleClearMunicipality();
+              setYearFilter('');
+              setStartDate('');
+              setEndDate('');
               setMinRisk(0);
-              runSearch({ q: '', ibge: '', minRisk: 0 });
+              runSearch({ q: '', ibge: '', year: '', startDate: '', endDate: '', minRisk: 0 });
             }}
             className="text-slate-700 hover:text-blue-700 underline underline-offset-4"
           >
             Listar toda a base auditada
           </button>
-          <button
-            type="button"
-            onClick={() => {
-              setQuery('27841920000163');
-              handleClearMunicipality();
-              runSearch({ q: '27841920000163', ibge: '' });
-            }}
-            className="text-slate-700 hover:text-blue-700 underline underline-offset-4"
-          >
-            CNPJ sancionado (27.841.920/0001-63)
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              const pncpUrl = 'https://pncp.gov.br/app/contratos/14043574000151/2026/123';
-              setQuery(pncpUrl);
-              handleClearMunicipality();
-              runSearch({ q: pncpUrl, ibge: '' });
-            }}
-            className="text-slate-700 hover:text-blue-700 underline underline-offset-4"
-          >
-            URL PNCP (Feira de Santana 123/2026)
-          </button>
         </div>
       </section>
+
+      {cnpjCoverage && (
+        <section
+          data-testid="cnpj-national-coverage"
+          className={`border rounded-lg p-5 space-y-4 ${
+            cnpjCoverage.pncpStatus === 'rate_limited' || cnpjCoverage.pncpStatus === 'unavailable'
+              ? 'bg-amber-50 border-amber-200'
+              : 'bg-white border-slate-200'
+          }`}
+        >
+          <div className="flex flex-col md:flex-row md:items-start justify-between gap-3 pb-4 border-b border-slate-200">
+            <div className="space-y-1">
+              <div className="text-xs font-mono text-blue-700 font-semibold">
+                BUSCA NACIONAL POR CNPJ · {formatCnpj(cnpjCoverage.cnpj)}
+                {cnpjCoverage.relatedMatrizCnpj && (
+                  <span className="text-slate-600 font-normal">
+                    {' '}
+                    + Matriz {formatCnpj(cnpjCoverage.relatedMatrizCnpj)}
+                  </span>
+                )}
+              </div>
+              <h2 className="text-base font-bold text-slate-900">
+                {cnpjCoverage.legalName ?? `CNPJ ${formatCnpj(cnpjCoverage.cnpj)}`}
+              </h2>
+              <div className="text-xs text-slate-600 flex flex-wrap gap-x-3 gap-y-1">
+                {cnpjCoverage.registrationStatus && (
+                  <span>
+                    Situação: <strong className="text-slate-900">{cnpjCoverage.registrationStatus}</strong>
+                  </span>
+                )}
+                {cnpjCoverage.primaryCnae && <span>CNAE: {cnpjCoverage.primaryCnae}</span>}
+                {cnpjCoverage.relatedMatrizCnpj && (
+                  <span className="font-mono text-slate-700">
+                    Filial: {cnpjCoverage.filialPncpFetchedCount ?? 0} · Matriz:{' '}
+                    {cnpjCoverage.matrizPncpFetchedCount ?? 0}
+                  </span>
+                )}
+                {cnpjCoverage.profileSource && (
+                  <span className="text-slate-500">Cadastro via {cnpjCoverage.profileSource}</span>
+                )}
+              </div>
+            </div>
+            <div className="font-mono text-xs shrink-0 text-slate-700">
+              PNCP:{' '}
+              <strong
+                className={
+                  cnpjCoverage.pncpStatus === 'complete'
+                    ? 'text-emerald-700'
+                    : 'text-amber-800'
+                }
+              >
+                {cnpjCoverage.pncpStatus.toUpperCase()}
+              </strong>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-4 text-xs">
+            <div>
+              <div className="text-slate-500">Declarados no PNCP</div>
+              <div className="font-mono tabular-nums text-lg font-semibold text-slate-900 mt-0.5">
+                {cnpjCoverage.pncpTotalDeclared}
+              </div>
+            </div>
+            <div>
+              <div className="text-slate-500">Capturados no PNCP</div>
+              <div className="font-mono tabular-nums text-lg font-semibold text-slate-900 mt-0.5">
+                {cnpjCoverage.pncpFetchedCount}
+              </div>
+            </div>
+            <div>
+              <div className="text-slate-500">Como Fornecedor</div>
+              <div className="font-mono tabular-nums text-lg font-semibold text-blue-700 mt-0.5">
+                {cnpjCoverage.byRole.fornecedor}
+              </div>
+            </div>
+            <div>
+              <div className="text-slate-500">Como Órgão Contratante</div>
+              <div className="font-mono tabular-nums text-lg font-semibold text-slate-900 mt-0.5">
+                {cnpjCoverage.byRole.orgao_contratante}
+              </div>
+            </div>
+            <div>
+              <div className="text-slate-500">Extras no Índice Local</div>
+              <div className="font-mono tabular-nums text-lg font-semibold text-slate-900 mt-0.5">
+                {cnpjCoverage.localOnlyCount}
+              </div>
+            </div>
+          </div>
+
+          <p className="text-xs text-slate-700 leading-relaxed pt-2 border-t border-slate-100">
+            {cnpjCoverage.message}
+          </p>
+        </section>
+      )}
 
       {parsedReference && (
         <div
@@ -417,7 +628,7 @@ export function ContractSearchView({
         </div>
       )}
 
-      {livePncpStatus && (
+      {livePncpStatus && !cnpjCoverage && (
         <div
           data-testid="live-pncp-status"
           className="bg-blue-50/50 border border-blue-200 rounded-lg px-4 py-3 text-xs text-slate-800 flex items-start gap-2.5"

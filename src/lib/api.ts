@@ -1,11 +1,20 @@
 import type {
   EvaluatedContract,
+  FindingReviewRecord,
   GovernmentEntity,
   Municipality,
   SavedDossierSummary,
 } from '../types/audit';
 import type { ExtractedDocumentFields } from './documentParser';
+import type { RiskDashboardSummary } from './dashboardAggregator';
 import type { ParsedContractCode } from './pncpQueryParser';
+
+export interface RiskDashboardResponse {
+  storageEngine: string;
+  totalStoredInSqlite: number;
+  summary: RiskDashboardSummary;
+  contracts: EvaluatedContract[];
+}
 
 export interface MunicipalityContextResponse {
   municipality: Municipality;
@@ -20,9 +29,42 @@ export interface MunicipalityContextResponse {
   };
 }
 
+export interface CnpjCoverageInfo {
+  cnpj: string;
+  relatedMatrizCnpj?: string | null;
+  filialPncpFetchedCount?: number;
+  matrizPncpFetchedCount?: number;
+  legalName: string | null;
+  profileSource: string | null;
+  registrationStatus: string | null;
+  primaryCnae: string | null;
+  pncpStatus: 'complete' | 'partial' | 'rate_limited' | 'unavailable';
+  pncpTotalDeclared: number;
+  pncpFetchedCount: number;
+  localOnlyCount: number;
+  partialCoverage: boolean;
+  byRole: {
+    fornecedor: number;
+    orgao_contratante: number;
+    subcontratado: number;
+  };
+  message: string;
+}
+
 export interface DocumentUploadResponse {
   sha256: string;
+  idempotentDuplicate?: boolean;
   matchedPncp: boolean;
+  matchStatus?: 'matched' | 'ambiguous' | 'unmatched';
+  ambiguousCandidates?: Array<{
+    id: string;
+    contractNumber: string;
+    pncpControlNumber: string;
+    municipalityIbge: string;
+    municipalityName: string;
+    supplierCnpj: string;
+    supplierName: string;
+  }>;
   extraction: ExtractedDocumentFields;
   pipelineSteps: Array<{
     stage: string;
@@ -45,10 +87,31 @@ export async function searchMunicipalities(query: string): Promise<{
   return res.json();
 }
 
+export async function fetchRiskDashboardSummary(period?: {
+  startDate?: string;
+  endDate?: string;
+}): Promise<RiskDashboardResponse> {
+  const qs = new URLSearchParams();
+  if (period?.startDate) qs.set('startDate', period.startDate);
+  if (period?.endDate) qs.set('endDate', period.endDate);
+  const suffix = qs.toString() ? `?${qs.toString()}` : '';
+  const res = await fetch(`/api/dashboard/risk-summary${suffix}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Falha ao carregar painel de riscos.' }));
+    throw new Error(err.error || 'Falha ao carregar painel de riscos.');
+  }
+  return res.json();
+}
+
 export async function fetchMunicipalityContext(
-  ibgeCode: string
+  ibgeCode: string,
+  period?: { startDate?: string; endDate?: string }
 ): Promise<MunicipalityContextResponse> {
-  const res = await fetch(`/api/municipalities/${encodeURIComponent(ibgeCode)}/context`);
+  const qs = new URLSearchParams();
+  if (period?.startDate) qs.set('startDate', period.startDate);
+  if (period?.endDate) qs.set('endDate', period.endDate);
+  const suffix = qs.toString() ? `?${qs.toString()}` : '';
+  const res = await fetch(`/api/municipalities/${encodeURIComponent(ibgeCode)}/context${suffix}`);
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: 'Falha ao carregar contexto municipal.' }));
     throw new Error(err.error || 'Falha ao carregar contexto municipal.');
@@ -60,6 +123,8 @@ export async function searchContracts(params: {
   q?: string;
   ibge?: string;
   year?: string;
+  startDate?: string;
+  endDate?: string;
   minRisk?: number;
 }): Promise<{
   results: EvaluatedContract[];
@@ -81,14 +146,20 @@ export async function searchContracts(params: {
     inexigibilidadeCount: number;
     message: string;
   } | null;
+  cnpjCoverage?: CnpjCoverageInfo | null;
 }> {
   const qs = new URLSearchParams();
   if (params.q) qs.set('q', params.q);
   if (params.ibge) qs.set('ibge', params.ibge);
   if (params.year) qs.set('year', params.year);
+  if (params.startDate) qs.set('startDate', params.startDate);
+  if (params.endDate) qs.set('endDate', params.endDate);
   if (params.minRisk) qs.set('minRisk', String(params.minRisk));
   const res = await fetch(`/api/contracts/search?${qs.toString()}`);
-  if (!res.ok) throw new Error('Falha ao buscar contratos.');
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Falha ao buscar contratos.' }));
+    throw new Error(err.error || 'Falha ao buscar contratos.');
+  }
   return res.json();
 }
 
@@ -112,6 +183,38 @@ export async function fetchContractById(id: string): Promise<EvaluatedContract> 
   return res.json();
 }
 
+export async function fetchFindingReviews(contractId: string): Promise<FindingReviewRecord[]> {
+  const res = await fetch(`/api/contracts/${encodeURIComponent(contractId)}/reviews`);
+  if (!res.ok) return [];
+  const data = (await res.json()) as { reviews: FindingReviewRecord[] };
+  return Array.isArray(data.reviews) ? data.reviews : [];
+}
+
+export async function submitFindingReview(
+  contractId: string,
+  findingId: string,
+  payload: {
+    action: 'dismiss' | 'restore';
+    rationale: string;
+    author?: string;
+    ruleVersion?: string;
+  }
+): Promise<{ review: FindingReviewRecord; reviews: FindingReviewRecord[] }> {
+  const res = await fetch(
+    `/api/contracts/${encodeURIComponent(contractId)}/findings/${encodeURIComponent(findingId)}/review`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }
+  );
+  const data = await res.json().catch(() => ({ error: 'Falha ao registrar revisão humana.' }));
+  if (!res.ok) {
+    throw new Error(data.error || 'Falha ao registrar revisão humana.');
+  }
+  return data as { review: FindingReviewRecord; reviews: FindingReviewRecord[] };
+}
+
 export async function checkLiveSupplierCnpj(cnpj: string): Promise<{
   enriched: boolean;
   source?: string;
@@ -127,7 +230,7 @@ export async function checkLiveSupplierCnpj(cnpj: string): Promise<{
   };
 }> {
   const res = await fetch(`/api/suppliers/${encodeURIComponent(cnpj)}/live-check`);
-  if (!res.ok) throw new Error('Falha ao consultar CNPJ na Receita Federal.');
+  if (!res.ok) throw new Error('Falha ao consultar CNPJ na base externa.');
   return res.json();
 }
 
@@ -193,3 +296,4 @@ export async function deleteSavedDossier(id: string): Promise<SavedDossierSummar
   const data = (await res.json()) as { dossiers: SavedDossierSummary[] };
   return data.dossiers;
 }
+

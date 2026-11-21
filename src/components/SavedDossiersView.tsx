@@ -1,6 +1,9 @@
+import { useState } from 'react';
 import { ArrowRight, FolderOpen, Trash2 } from 'lucide-react';
 import type { SavedDossierSummary } from '../types/audit';
+import { matchesDatePeriod } from '../lib/datePeriod';
 import { formatDateBR } from '../lib/formatters';
+import { DatePeriodControls } from './DatePeriodControls';
 import { RiskScoreInline } from './RiskText';
 
 interface SavedDossiersViewProps {
@@ -16,39 +19,73 @@ export function SavedDossiersView({
   onDeleteDossier,
   onExploreMunicipality,
 }: SavedDossiersViewProps) {
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
+
+  const filteredDossiers = dossiers.filter((dos) =>
+    matchesDatePeriod(dos.savedAt, {
+      startDate: startDate || undefined,
+      endDate: endDate || undefined,
+    })
+  );
+
   return (
     <div className="space-y-6">
-      <section className="bg-white border border-slate-200 rounded-lg p-6">
-        <h1 className="text-2xl font-bold tracking-tight text-slate-900">
-          Dossiês de Auditoria Arquivados
-        </h1>
-        <p className="text-sm text-slate-600 mt-1 max-w-3xl">
-          Investigações salvas com resumo de risco, nota do auditor e hash SHA-256 de verificação
-          para reprodutibilidade em relatórios de controladoria, TCE ou Ministério Público.
-        </p>
+      <section className="bg-white border border-slate-200 rounded-lg p-6 space-y-4">
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight text-slate-900">
+            Dossiês de Auditoria Arquivados
+          </h1>
+          <p className="text-sm text-slate-600 mt-1 max-w-3xl">
+            Investigações salvas em SQLite com resumo de risco, nota do auditor e hash SHA-256 de
+            verificação para reprodutibilidade em relatórios de controladoria, TCE ou Ministério
+            Público.
+          </p>
+        </div>
+
+        <div className="pt-3 border-t border-slate-100 max-w-xl">
+          <DatePeriodControls
+            idPrefix="saved-dossiers"
+            startDate={startDate}
+            endDate={endDate}
+            onStartDateChange={setStartDate}
+            onEndDateChange={setEndDate}
+            compact
+          />
+        </div>
       </section>
 
-      {dossiers.length === 0 ? (
+      {filteredDossiers.length === 0 ? (
         <section className="bg-white border border-slate-200 rounded-lg p-12 text-center">
           <FolderOpen className="w-8 h-8 text-slate-300 mx-auto mb-3" aria-hidden="true" />
           <p className="text-sm font-semibold text-slate-800">
-            Nenhum dossiê salvo nesta sessão.
+            {dossiers.length === 0
+              ? 'Nenhum dossiê salvo no banco SQLite.'
+              : 'Nenhum dossiê encontrado no período informado.'}
           </p>
           <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
-            Abra qualquer contrato na investigação municipal ou via upload de PDF e clique em
-            “Salvar Dossiê” para registrar suas conclusões com digest SHA-256.
+            {dossiers.length === 0
+              ? 'Abra qualquer contrato na investigação municipal ou via upload de PDF e clique em “Salvar Dossiê” para registrar suas conclusões com digest SHA-256.'
+              : 'Limpe ou amplie a data de início e a data final para visualizar todos os dossiês arquivados.'}
           </p>
           <button
             type="button"
-            onClick={onExploreMunicipality}
+            onClick={
+              dossiers.length === 0
+                ? onExploreMunicipality
+                : () => {
+                    setStartDate('');
+                    setEndDate('');
+                  }
+            }
             className="mt-5 px-4 py-2 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-md transition-colors"
           >
-            Explorar Contratos Municipais
+            {dossiers.length === 0 ? 'Explorar Contratos Municipais' : 'Limpar período'}
           </button>
         </section>
       ) : (
         <section className="bg-white border border-slate-200 rounded-lg divide-y divide-slate-200">
-          {dossiers.map((dos) => (
+          {filteredDossiers.map((dos) => (
             <div
               key={dos.id}
               className="p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4"

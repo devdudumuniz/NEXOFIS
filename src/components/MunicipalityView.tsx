@@ -12,10 +12,18 @@ import {
   formatCurrencyCompactBRL,
   formatPercentageBR,
 } from '../lib/formatters';
+import { validateDatePeriod } from '../lib/datePeriod';
+import { DatePeriodControls } from './DatePeriodControls';
 import { RiskScoreInline } from './RiskText';
 
 interface MunicipalityViewProps {
   initialIbgeCode: string;
+  selectedEntityId?: string;
+  startDate?: string;
+  endDate?: string;
+  onPeriodChange?: (next: { startDate: string; endDate: string }) => void;
+  onIbgeChange?: (ibgeCode: string) => void;
+  onEntityChange?: (entityId: string) => void;
   onSelectContract: (contract: EvaluatedContract) => void;
   onContextChange: (ctx: {
     municipality: Municipality | null;
@@ -24,15 +32,23 @@ interface MunicipalityViewProps {
 }
 
 const QUICK_MUNICIPALITIES = [
-  { ibgeCode: '2910800', label: 'Feira de Santana (BA) · 2910800' },
   { ibgeCode: '2902906', label: 'Barra do Choça (BA) · 2902906' },
-  { ibgeCode: '3550308', label: 'São Paulo (SP) · 3550308' },
-  { ibgeCode: '4106902', label: 'Curitiba (PR) · 4106902' },
-  { ibgeCode: '4314902', label: 'Porto Alegre (RS) · 4314902' },
+  { ibgeCode: '2919959', label: 'Maetinga (BA) · 2919959' },
+  { ibgeCode: '2933307', label: 'Vitória da Conquista (BA) · 2933307' },
+  { ibgeCode: '2915809', label: 'Itambé (BA) · 2915809' },
+  { ibgeCode: '2916401', label: 'Itapetinga (BA) · 2916401' },
+  { ibgeCode: '2901205', label: 'Anagé (BA) · 2901205' },
+  { ibgeCode: '2925709', label: 'Presidente Jânio Quadros (BA) · 2925709' },
 ];
 
 export function MunicipalityView({
   initialIbgeCode,
+  selectedEntityId: controlledEntityId,
+  startDate: controlledStartDate,
+  endDate: controlledEndDate,
+  onPeriodChange,
+  onIbgeChange,
+  onEntityChange,
   onSelectContract,
   onContextChange,
 }: MunicipalityViewProps) {
@@ -41,32 +57,67 @@ export function MunicipalityView({
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [totalIndexed, setTotalIndexed] = useState<number>(0);
 
-  const [activeIbge, setActiveIbge] = useState<string>(initialIbgeCode);
+  const [activeIbge, setActiveIbgeState] = useState<string>(initialIbgeCode);
   const [context, setContext] = useState<MunicipalityContextResponse | null>(null);
-  const [selectedEntityId, setSelectedEntityId] = useState<string>('ALL');
+  const [internalEntityId, setInternalEntityId] = useState<string>(controlledEntityId ?? 'ALL');
+  const [internalStartDate, setInternalStartDate] = useState<string>(controlledStartDate ?? '');
+  const [internalEndDate, setInternalEndDate] = useState<string>(controlledEndDate ?? '');
   const [riskFilter, setRiskFilter] = useState<'ALL' | 'HIGH' | 'LOW'>('ALL');
   const [tableFilter, setTableFilter] = useState('');
 
   const [loadingContext, setLoadingContext] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  const selectedEntityId = controlledEntityId ?? internalEntityId;
+  const startDate = controlledStartDate ?? internalStartDate;
+  const endDate = controlledEndDate ?? internalEndDate;
+
+  const setPeriod = (nextStart: string, nextEnd: string) => {
+    setInternalStartDate(nextStart);
+    setInternalEndDate(nextEnd);
+    onPeriodChange?.({ startDate: nextStart, endDate: nextEnd });
+  };
+  const setSelectedEntityId = (nextId: string) => {
+    setInternalEntityId(nextId);
+    onEntityChange?.(nextId);
+  };
+  const setActiveIbge = (nextIbge: string) => {
+    setActiveIbgeState(nextIbge);
+    onIbgeChange?.(nextIbge);
+  };
+
   // Sync if parent resets initialIbgeCode
   useEffect(() => {
-    setActiveIbge(initialIbgeCode);
+    setActiveIbgeState(initialIbgeCode);
   }, [initialIbgeCode]);
 
-  // Fetch municipality context whenever activeIbge changes
+  // Fetch municipality context whenever activeIbge or period changes
   useEffect(() => {
+    const periodCheck = validateDatePeriod(startDate, endDate);
+    if (!periodCheck.valid) {
+      setError(periodCheck.error ?? 'Período de datas inválido.');
+      return;
+    }
+
     let cancelled = false;
     setLoadingContext(true);
     setError(null);
-    setSelectedEntityId('ALL');
 
-    fetchMunicipalityContext(activeIbge)
+    fetchMunicipalityContext(activeIbge, {
+      startDate: startDate || undefined,
+      endDate: endDate || undefined,
+    })
       .then((data) => {
         if (cancelled) return;
         setContext(data);
-        onContextChange({ municipality: data.municipality, entityName: null });
+        const preservedEnt = data.entities.find((e) => e.id === selectedEntityId);
+        if (!preservedEnt && selectedEntityId !== 'ALL') {
+          setSelectedEntityId('ALL');
+        }
+        onContextChange({
+          municipality: data.municipality,
+          entityName: preservedEnt ? preservedEnt.shortName : null,
+        });
       })
       .catch((err) => {
         if (cancelled) return;
@@ -80,7 +131,7 @@ export function MunicipalityView({
     return () => {
       cancelled = true;
     };
-  }, [activeIbge]);
+  }, [activeIbge, startDate, endDate]);
 
   // Update breadcrumb entity name when user clicks an entity
   useEffect(() => {
@@ -187,7 +238,7 @@ export function MunicipalityView({
                   setQuery(e.target.value);
                   setShowSuggestions(true);
                 }}
-                placeholder="Ex.: Feira de Santana ou 2910800"
+                placeholder="Ex.: Barra do Choça ou 2902906"
                 className="w-full h-11 pl-10 pr-4 text-sm bg-white border border-slate-300 rounded-md text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-blue-600 focus:border-blue-600"
                 autoComplete="off"
               />
@@ -225,6 +276,17 @@ export function MunicipalityView({
             </button>
           </div>
         </form>
+
+        <div className="mt-4 pt-4 border-t border-slate-100 max-w-xl">
+          <DatePeriodControls
+            idPrefix="municipality-search"
+            startDate={startDate}
+            endDate={endDate}
+            onStartDateChange={(val) => setPeriod(val, endDate)}
+            onEndDateChange={(val) => setPeriod(startDate, val)}
+            showPresets
+          />
+        </div>
 
         <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-slate-500">
           <span>Acesso rápido:</span>

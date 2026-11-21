@@ -68,24 +68,74 @@ export const TEMPORAL_LEGAL_RULESETS: TemporalLegalRule[] = [
   },
 ];
 
-export function resolveLegalRulesetForDate(isoDate: string): TemporalLegalRule {
-  const cleanDate = isoDate?.slice(0, 10) || '2026-01-01';
+export const INCONCLUSIVE_LEGAL_RULESET: TemporalLegalRule = {
+  ruleId: 'BR-LEGAL-INCONCLUSIVE',
+  jurisdiction: 'BR-INCONCLUSIVE',
+  legalBasis: 'Norma não determinável automaticamente (data ausente, inválida ou fora da cobertura temporal 2024–2026 do catálogo)',
+  effectiveFrom: '',
+  effectiveUntil: null,
+  applicabilityExpression: 'date_missing_or_outside_catalog_coverage',
+  requiredEvidence: ['data_evento_valida', 'regime_juridico_comprovado'],
+  severityIfConfirmed: 'MÉDIA',
+  severityIfUnverified: 'MÉDIA',
+  sourceVersionHash: 'inconclusive-no-fallback',
+  supersedesRuleId: null,
+};
+
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function isValidIsoCalendarDate(value: string): boolean {
+  if (!ISO_DATE_RE.test(value)) return false;
+  const [y, m, d] = value.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+
+export function resolveLegalRulesetStrict(
+  isoDate?: string | null
+):
+  | { status: 'resolved'; ruleset: TemporalLegalRule }
+  | { status: 'inconclusive'; ruleset: TemporalLegalRule; reason: string } {
+  const cleanDate = typeof isoDate === 'string' ? isoDate.trim().slice(0, 10) : '';
+  if (!cleanDate || !isValidIsoCalendarDate(cleanDate)) {
+    return {
+      status: 'inconclusive',
+      ruleset: INCONCLUSIVE_LEGAL_RULESET,
+      reason: 'Data determinante ausente ou inválida; o motor recusa selecionar norma por fallback.',
+    };
+  }
+  // Catalog covers 2024-01-01 through 2026-12-31 explicitly
+  if (cleanDate < '2024-01-01' || cleanDate > '2026-12-31') {
+    return {
+      status: 'inconclusive',
+      ruleset: INCONCLUSIVE_LEGAL_RULESET,
+      reason: `Data (${cleanDate}) fora da cobertura normativa verificada do catálogo (2024-01-01 a 2026-12-31); nenhum decreto aplicado por adivinhação.`,
+    };
+  }
   for (const rule of TEMPORAL_LEGAL_RULESETS) {
     const afterStart = cleanDate >= rule.effectiveFrom;
     const beforeEnd = rule.effectiveUntil === null || cleanDate <= rule.effectiveUntil;
     if (afterStart && beforeEnd) {
-      return rule;
+      return { status: 'resolved', ruleset: rule };
     }
   }
-  // If contract precedes 2024, default to earliest available Lei 14.133 decree in catalog
-  return TEMPORAL_LEGAL_RULESETS[TEMPORAL_LEGAL_RULESETS.length - 1];
+  return {
+    status: 'inconclusive',
+    ruleset: INCONCLUSIVE_LEGAL_RULESET,
+    reason: `Nenhuma regra vigente encontrada para ${cleanDate}.`,
+  };
+}
+
+export function resolveLegalRulesetForDate(isoDate?: string | null): TemporalLegalRule {
+  return resolveLegalRulesetStrict(isoDate).ruleset;
 }
 
 export function getDispensationLimitForContract(
   ruleset: TemporalLegalRule,
   article: 'art75_I' | 'art75_II' | 'art75_p7' | 'art95_p2' = 'art75_II'
-): number {
-  const t = ruleset.thresholds!;
+): number | null {
+  if (!ruleset.thresholds) return null;
+  const t = ruleset.thresholds;
   switch (article) {
     case 'art75_I':
       return t.dispensaObrasArt75I;
@@ -103,22 +153,32 @@ export function isRiskMatrixMandatory(params: {
   updatedValue: number;
   executionRegime?: string;
   ruleset: TemporalLegalRule;
-}): { mandatory: boolean; reason: string } {
-  const grandeVultoThreshold = params.ruleset.thresholds?.grandeVulto ?? 261968421.04;
+}): { mandatory: boolean; verifiable: boolean; reason: string } {
   if (params.executionRegime === 'Integrado' || params.executionRegime === 'Semi-integrado') {
     return {
       mandatory: true,
+      verifiable: true,
       reason: `Regime de contratação ${params.executionRegime} exige matriz de riscos obrigatória (Lei 14.133/2021, art. 22, § 3º).`,
     };
   }
+  if (!params.ruleset.thresholds) {
+    return {
+      mandatory: false,
+      verifiable: false,
+      reason: 'Norma temporal inconclusiva; não é possível verificar teto de grande vulto sem data/regime válidos.',
+    };
+  }
+  const grandeVultoThreshold = params.ruleset.thresholds.grandeVulto;
   if (params.updatedValue >= grandeVultoThreshold) {
     return {
       mandatory: true,
+      verifiable: true,
       reason: `Contratação de grande vulto (>= R$ ${grandeVultoThreshold.toLocaleString('pt-BR', { minimumFractionDigits: 2 })} em ${params.ruleset.effectiveFrom.slice(0, 4)}) exige matriz de riscos obrigatória (art. 22, § 3º).`,
     };
   }
   return {
     mandatory: false,
+    verifiable: true,
     reason: 'Contratação ordinária abaixo do limite de grande vulto e fora dos regimes integrado/semi-integrado: matriz de riscos é facultativa (art. 22, caput).',
   };
 }
