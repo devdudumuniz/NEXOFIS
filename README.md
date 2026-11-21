@@ -45,20 +45,27 @@ npm run lint
 npm run build
 ```
 
-### Backup e Restauração do Banco Local (SQLite)
+### Backup, Produção (Docker + PostgreSQL + Docling/PaddleOCR) e Publicação no GitHub
 
-O banco persistente fica em `data/nexofis.db`. Para backup seguro (com o servidor parado ou via cópia dos arquivos `.db`, `.db-wal`, `.db-shm`):
+O banco local persistente fica em `data/nexofis.db`. Para operar a pilha completa de produção (**PostgreSQL 16**, **Docling Serve**, **Worker PaddleOCR Python**, **RBAC opt-in**, **conectores CGU/SICONFI**, backup/restauração e scripts de push para o GitHub), consulte [`docs/ARQUITETURA_E_OPERACAO.md`](./docs/ARQUITETURA_E_OPERACAO.md):
 
 ```bash
-mkdir -p backups
-cp data/nexofis.db* backups/
+# Pilha completa via Docker Compose (Postgres + Docling + PaddleOCR + App)
+docker compose up --build -d
+
+# Backup / restauração (SQLite ou PostgreSQL)
+bash scripts/backup-restore.sh backup-sqlite
+bash scripts/backup-restore.sh backup-postgres
+
+# Publicação segura no GitHub (testes + lint + build + checagem de segredos)
+bash scripts/publish-github.sh "feat: atualiza NEXOFIS"
 ```
 
 ## Cobertura e Limitações Conhecidas
 
 - **PNCP**: A busca nacional por CNPJ captura contratos **publicados no PNCP**. Contratos municipais publicados apenas em Diários Oficiais locais ou portais próprios (ex.: parte das inexigibilidades do FMS de Barra do Choça/BA) não aparecem na API pública do PNCP e constam no NEXOFIS apenas quando importados via PDF/extrato ou indexados localmente.
 - **Cadastro CNPJ**: `publica.cnpj.ws` e `BrasilAPI` são **provedores intermediários** da base pública da Receita Federal; o NEXOFIS identifica explicitamente essa proveniência.
-- **OCR Externo (Docling Serve / PaddleOCR)**: Não é executado daemon local de Docling/PaddleOCR neste pacote por padrão. PDFs com camada textual nativa são extraídos localmente via `zlib-flate`; scans/imagens requerem `GEMINI_API_KEY` configurada no `.env` ou integração futura com Docling Serve.
+- **Serviços Externos de Produção**: `docker-compose.yml`, `db/migrations/001_initial_schema.sql`, `src/server/postgresStore.ts`, `src/server/doclingClient.ts`, `worker/ocr_worker.py` e `src/server/connectors/portalTransparenciaClient.ts` estão integrados no repositório para execução no ambiente do usuário (quando offline ou sem chaves no `.env`, o sistema opera honestamente sobre SQLite + extrator nativo de PDF sem simular respostas).
 
 ## Licença e Governança
 

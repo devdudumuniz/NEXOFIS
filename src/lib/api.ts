@@ -123,6 +123,7 @@ export async function searchContracts(params: {
   q?: string;
   ibge?: string;
   year?: string;
+  status?: string;
   startDate?: string;
   endDate?: string;
   minRisk?: number;
@@ -152,6 +153,7 @@ export async function searchContracts(params: {
   if (params.q) qs.set('q', params.q);
   if (params.ibge) qs.set('ibge', params.ibge);
   if (params.year) qs.set('year', params.year);
+  if (params.status) qs.set('status', params.status);
   if (params.startDate) qs.set('startDate', params.startDate);
   if (params.endDate) qs.set('endDate', params.endDate);
   if (params.minRisk) qs.set('minRisk', String(params.minRisk));

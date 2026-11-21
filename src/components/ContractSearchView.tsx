@@ -3,6 +3,12 @@ import { ArrowRight, FileUp, Info, Search, X } from 'lucide-react';
 import type { EvaluatedContract, Municipality } from '../types/audit';
 import { searchContracts, searchMunicipalities, type CnpjCoverageInfo } from '../lib/api';
 import type { ParsedContractCode } from '../lib/pncpQueryParser';
+import {
+  CONTRACT_LIFECYCLE_LABELS,
+  CONTRACT_LIFECYCLE_OPTIONS,
+  resolveContractLifecycleStatus,
+  type ContractLifecycleFilter,
+} from '../lib/contractStatus';
 import { formatCnpj, formatCurrencyBRL } from '../lib/formatters';
 import { validateDatePeriod } from '../lib/datePeriod';
 import { DatePeriodControls } from './DatePeriodControls';
@@ -13,6 +19,7 @@ export interface ContractSearchFilterState {
   ibgeFilter: string;
   municipalityInput: string;
   yearFilter: string;
+  statusFilter: ContractLifecycleFilter;
   startDate: string;
   endDate: string;
   minRisk: number;
@@ -37,6 +44,9 @@ export function ContractSearchView({
   const [municipalitySuggestions, setMunicipalitySuggestions] = useState<Municipality[]>([]);
   const [showMunicipalityMenu, setShowMunicipalityMenu] = useState(false);
   const [yearFilter, setYearFilter] = useState(filterState?.yearFilter ?? '');
+  const [statusFilter, setStatusFilter] = useState<ContractLifecycleFilter>(
+    filterState?.statusFilter ?? ''
+  );
   const [startDate, setStartDate] = useState(filterState?.startDate ?? '');
   const [endDate, setEndDate] = useState(filterState?.endDate ?? '');
   const [minRisk, setMinRisk] = useState<number>(filterState?.minRisk ?? 0);
@@ -68,11 +78,12 @@ export function ContractSearchView({
       ibgeFilter,
       municipalityInput,
       yearFilter,
+      statusFilter,
       startDate,
       endDate,
       minRisk,
     });
-  }, [query, ibgeFilter, municipalityInput, yearFilter, startDate, endDate, minRisk]);
+  }, [query, ibgeFilter, municipalityInput, yearFilter, statusFilter, startDate, endDate, minRisk]);
 
   // Live IBGE autocomplete for all 5,571 Brazilian municipalities
   useEffect(() => {
@@ -94,12 +105,14 @@ export function ContractSearchView({
     q?: string;
     ibge?: string;
     year?: string;
+    status?: ContractLifecycleFilter;
     startDate?: string;
     endDate?: string;
     minRisk?: number;
   }) => {
     const nextStart = override?.startDate !== undefined ? override.startDate : startDate;
     const nextEnd = override?.endDate !== undefined ? override.endDate : endDate;
+    const nextStatus = override?.status !== undefined ? override.status : statusFilter;
     const periodCheck = validateDatePeriod(nextStart, nextEnd);
     if (!periodCheck.valid) {
       setError(periodCheck.error ?? 'Período de datas inválido.');
@@ -113,6 +126,7 @@ export function ContractSearchView({
         q: override?.q ?? query,
         ibge: override?.ibge ?? ibgeFilter,
         year: override?.year ?? yearFilter,
+        status: nextStatus || undefined,
         startDate: nextStart || undefined,
         endDate: nextEnd || undefined,
         minRisk: override?.minRisk ?? minRisk,
@@ -133,7 +147,7 @@ export function ContractSearchView({
 
   useEffect(() => {
     runSearch();
-  }, [ibgeFilter, yearFilter, startDate, endDate, minRisk]);
+  }, [ibgeFilter, yearFilter, statusFilter, startDate, endDate, minRisk]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -154,6 +168,14 @@ export function ContractSearchView({
 
   const renderContractRow = (contract: EvaluatedContract) => {
     const valueOmitted = contract.originalValue === 0 && contract.updatedValue === 0;
+    const lifecycleBucket = resolveContractLifecycleStatus(contract);
+    const lifecycleLabel = CONTRACT_LIFECYCLE_LABELS[lifecycleBucket];
+    const lifecycleColorClass =
+      lifecycleBucket === 'suspenso'
+        ? 'text-red-700 font-semibold'
+        : lifecycleBucket === 'concluido'
+          ? 'text-slate-600 font-medium'
+          : 'text-emerald-700 font-medium';
     const roleLabel =
       contract.cnpjRole === 'fornecedor'
         ? 'Papel: Fornecedor'
@@ -172,6 +194,8 @@ export function ContractSearchView({
             <span className="font-mono font-semibold text-slate-900 text-sm">
               Contrato {contract.contractNumber}
             </span>
+            <span className="text-slate-400" aria-hidden="true">·</span>
+            <span className={lifecycleColorClass}>{lifecycleLabel}</span>
             <span className="text-slate-400" aria-hidden="true">·</span>
             <span className="font-medium text-slate-700">
               {contract.municipalityName}/{contract.uf}
@@ -365,8 +389,8 @@ export function ContractSearchView({
             </button>
           </div>
 
-          <div className="md:col-span-12 pt-2 border-t border-slate-100">
-            <div className="max-w-xl">
+          <div className="md:col-span-12 pt-3 border-t border-slate-100 grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+            <div className="lg:col-span-7">
               <DatePeriodControls
                 idPrefix="contract-search"
                 startDate={startDate}
@@ -375,6 +399,53 @@ export function ContractSearchView({
                 onEndDateChange={setEndDate}
                 showPresets
               />
+            </div>
+            <div className="lg:col-span-5 space-y-2">
+              <div>
+                <label
+                  htmlFor="contract-status"
+                  className="block text-xs font-medium text-slate-600 mb-1"
+                >
+                  Status do contrato (ciclo de vida)
+                </label>
+                <select
+                  id="contract-status"
+                  value={statusFilter}
+                  onChange={(e) => setStatusFilter(e.target.value as ContractLifecycleFilter)}
+                  className="w-full h-10 px-3 text-sm bg-white border border-slate-300 rounded-md text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                >
+                  {CONTRACT_LIFECYCLE_OPTIONS.map((opt) => (
+                    <option key={opt.value || 'all'} value={opt.value}>
+                      {opt.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div
+                role="group"
+                aria-label="Filtro rápido de status do contrato"
+                className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500"
+              >
+                <span>Status rápido:</span>
+                {CONTRACT_LIFECYCLE_OPTIONS.map((opt) => {
+                  const active = statusFilter === opt.value;
+                  return (
+                    <button
+                      key={opt.value || 'all-btn'}
+                      type="button"
+                      onClick={() => setStatusFilter(opt.value)}
+                      aria-pressed={active}
+                      className={`transition-colors whitespace-nowrap underline-offset-4 ${
+                        active
+                          ? 'text-blue-700 font-semibold underline'
+                          : 'text-slate-700 hover:text-blue-700 hover:underline'
+                      }`}
+                    >
+                      {opt.value === '' ? 'Todos' : opt.label}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           </div>
         </form>
@@ -387,9 +458,17 @@ export function ContractSearchView({
               setQuery('10.562.589/0002-56');
               handleClearMunicipality();
               setYearFilter('');
+              setStatusFilter('');
               setStartDate('');
               setEndDate('');
-              runSearch({ q: '10.562.589/0002-56', ibge: '', year: '', startDate: '', endDate: '' });
+              runSearch({
+                q: '10.562.589/0002-56',
+                ibge: '',
+                year: '',
+                status: '',
+                startDate: '',
+                endDate: '',
+              });
             }}
             className="text-blue-700 font-semibold hover:text-blue-800 underline underline-offset-4"
           >
@@ -470,10 +549,19 @@ export function ContractSearchView({
               setQuery('');
               handleClearMunicipality();
               setYearFilter('');
+              setStatusFilter('');
               setStartDate('');
               setEndDate('');
               setMinRisk(0);
-              runSearch({ q: '', ibge: '', year: '', startDate: '', endDate: '', minRisk: 0 });
+              runSearch({
+                q: '',
+                ibge: '',
+                year: '',
+                status: '',
+                startDate: '',
+                endDate: '',
+                minRisk: 0,
+              });
             }}
             className="text-slate-700 hover:text-blue-700 underline underline-offset-4"
           >

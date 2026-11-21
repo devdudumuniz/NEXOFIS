@@ -18,6 +18,10 @@ import {
   type TabularContractRow,
 } from './src/lib/documentParser';
 import { normalizeSearchText } from './src/lib/formatters';
+import {
+  matchesContractLifecycleFilter,
+  normalizeLifecycleFilterParam,
+} from './src/lib/contractStatus';
 import { aggregateRiskDashboard } from './src/lib/dashboardAggregator';
 import {
   matchesDatePeriod,
@@ -32,6 +36,8 @@ import {
   type ParsedContractCode,
 } from './src/lib/pncpQueryParser';
 import { evaluateContractRisk } from './src/lib/riskEngine';
+import { createAuthMiddleware, isAuthEnforced } from './src/server/authMiddleware';
+import { checkExternalOcrHealth } from './src/server/doclingClient';
 import { extractNativePdfText } from './src/server/pdfExtractor';
 import {
   deriveMatrizCnpj,
@@ -92,6 +98,12 @@ if (missingSeeds.length > 0) {
   for (const seed of missingSeeds) {
     dynamicContracts.set(seed.id, seed);
   }
+}
+
+// Keep stalled seed contract FSA-2026-204 aligned to 'Suspenso' if persisted from an earlier seed version
+const existingFsa204 = dynamicContracts.get('FSA-2026-204');
+if (existingFsa204 && existingFsa204.status === 'Em Execução') {
+  persistContract({ ...existingFsa204, status: 'Suspenso' });
 }
 
 interface LivePncpDiagnostic {
@@ -812,6 +824,9 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
 
+  const requireAnalystAuth = createAuthMiddleware({ allowedRoles: ['admin', 'analyst'] });
+  const requireAdminAuth = createAuthMiddleware({ allowedRoles: ['admin'] });
+
   // 0. System Metadata & AGPL-3.0-only Governance Endpoint
   app.get('/api/system/meta', (_req, res) => {
     res.json({
@@ -825,6 +840,25 @@ async function startServer() {
       schemaVersion: store.getSchemaVersion(),
       dataLicenseNotice:
         'A licença AGPL-3.0-only aplica-se exclusivamente ao código-fonte do NEXOFIS. Dados públicos coletados seguem a Lei de Acesso à Informação (Lei nº 12.527/2011) e a LGPD (Lei nº 13.709/2018).',
+    });
+  });
+
+  // 0b. External Integrations Readiness Endpoint (never exposes secrets)
+  app.get('/api/system/integrations', async (_req, res) => {
+    const ocrHealth = await checkExternalOcrHealth();
+    res.json({
+      dbDriver: (process.env.NEXOFIS_DB_DRIVER ?? 'sqlite').trim().toLowerCase() === 'postgres'
+        ? 'postgres'
+        : 'sqlite',
+      postgresConfigured: Boolean(process.env.DATABASE_URL?.trim()),
+      authEnabled: isAuthEnforced(),
+      doclingServe: ocrHealth.doclingServe,
+      paddleOcr: ocrHealth.paddleOcr,
+      portalTransparenciaConfigured: Boolean(process.env.PORTAL_TRANSPARENCIA_API_KEY?.trim()),
+      geminiConfigured: Boolean(
+        process.env.GEMINI_API_KEY?.trim() &&
+          process.env.GEMINI_API_KEY.trim() !== 'MY_GEMINI_API_KEY'
+      ),
     });
   });
 
@@ -1049,6 +1083,7 @@ async function startServer() {
     const explicitIbge = String(req.query.ibge ?? '').trim();
     const yearStr = String(req.query.year ?? '').trim();
     const minRisk = Number(req.query.minRisk ?? 0);
+    const statusFilter = normalizeLifecycleFilterParam(String(req.query.status ?? ''));
     const periodCheck = validateDatePeriod(
       String(req.query.startDate ?? ''),
       String(req.query.endDate ?? '')
@@ -1075,6 +1110,9 @@ async function startServer() {
             endDate: periodCheck.endDate,
           })
         ) {
+          return false;
+        }
+        if (statusFilter && !matchesContractLifecycleFilter(c, statusFilter)) {
           return false;
         }
         if (Number.isFinite(minRisk) && minRisk > 0 && c.assessment.score < minRisk) {
@@ -1216,6 +1254,7 @@ async function startServer() {
       ) {
         return false;
       }
+      if (statusFilter && !matchesContractLifecycleFilter(c, statusFilter)) return false;
       if (Number.isFinite(minRisk) && minRisk > 0 && c.assessment.score < minRisk) return false;
       if (!q) return true;
 
@@ -1304,17 +1343,26 @@ async function startServer() {
     }
 
     const roleFilter = String(req.query.role ?? '').trim();
+    const statusFilter = normalizeLifecycleFilterParam(String(req.query.status ?? ''));
     const national = await queryNationalContractsByCnpj(cnpj);
     const roleFiltered =
       roleFilter === 'fornecedor' || roleFilter === 'orgao_contratante' || roleFilter === 'subcontratado'
         ? national.contracts.filter((c) => c.cnpjRole === roleFilter)
         : national.contracts;
-    const contracts = roleFiltered.filter((c) =>
-      matchesDatePeriod(c.signatureDate || c.startDate, {
-        startDate: periodCheck.startDate,
-        endDate: periodCheck.endDate,
-      })
-    );
+    const contracts = roleFiltered.filter((c) => {
+      if (
+        !matchesDatePeriod(c.signatureDate || c.startDate, {
+          startDate: periodCheck.startDate,
+          endDate: periodCheck.endDate,
+        })
+      ) {
+        return false;
+      }
+      if (statusFilter && !matchesContractLifecycleFilter(c, statusFilter)) {
+        return false;
+      }
+      return true;
+    });
 
     res.json({
       cnpj,
@@ -1390,7 +1438,7 @@ async function startServer() {
     res.json({ contractId: id, reviews });
   });
 
-  app.post('/api/contracts/:id/findings/:findingId/review', (req, res) => {
+  app.post('/api/contracts/:id/findings/:findingId/review', requireAnalystAuth, (req, res) => {
     const contractId = String(req.params.id ?? '').trim().slice(0, 96);
     const findingId = String(req.params.findingId ?? '').trim().slice(0, 64);
     const action = req.body?.action === 'restore' ? 'restore' : req.body?.action === 'dismiss' ? 'dismiss' : null;
@@ -1453,7 +1501,7 @@ async function startServer() {
   });
 
   // 6. Document Upload Pipeline: Magic Bytes -> SHA-256 -> Native PDF/Text -> Optional Multimodal -> Strict Multi-Key Match -> SQLite Persistence
-  app.post('/api/documents/upload', upload.single('file'), async (req, res) => {
+  app.post('/api/documents/upload', requireAnalystAuth, upload.single('file'), async (req, res) => {
     const file = req.file;
     if (!file) {
       res.status(400).json({ error: 'Nenhum arquivo enviado. Selecione um contrato em PDF, PNG, JPG ou TXT.' });
@@ -2166,7 +2214,7 @@ async function startServer() {
     res.json({ dossiers: store.listDossiers() });
   });
 
-  app.post('/api/dossiers', (req, res) => {
+  app.post('/api/dossiers', requireAnalystAuth, (req, res) => {
     const contractId = String(req.body?.contractId ?? '').trim();
     const analystNote = String(req.body?.analystNote ?? '').trim().slice(0, 1000);
     const record = getAllContracts().find((c) => c.id === contractId);
@@ -2202,7 +2250,7 @@ async function startServer() {
     res.status(201).json({ dossier: summary, dossiers });
   });
 
-  app.delete('/api/dossiers/:id', (req, res) => {
+  app.delete('/api/dossiers/:id', requireAdminAuth, (req, res) => {
     const deleted = store.deleteDossier(req.params.id);
     if (!deleted) {
       res.status(404).json({ error: 'Dossiê não encontrado.' });

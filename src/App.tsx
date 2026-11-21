@@ -28,6 +28,7 @@ function readInitialUrlState(): {
   entityId: string;
   q: string;
   year: string;
+  status: string;
   startDate: string;
   endDate: string;
 } {
@@ -38,6 +39,7 @@ function readInitialUrlState(): {
       entityId: 'ALL',
       q: '123/2026',
       year: '',
+      status: '',
       startDate: '',
       endDate: '',
     };
@@ -56,9 +58,10 @@ function readInitialUrlState(): {
   const entityId = params.get('ent') || 'ALL';
   const q = params.get('q') ?? '123/2026';
   const year = params.get('year') ?? '';
+  const status = params.get('status') ?? '';
   const startDate = params.get('from') ?? '';
   const endDate = params.get('to') ?? '';
-  return { section, ibge, entityId, q, year, startDate, endDate };
+  return { section, ibge, entityId, q, year, status, startDate, endDate };
 }
 
 export default function App() {
@@ -75,6 +78,12 @@ export default function App() {
     ibgeFilter: '',
     municipalityInput: '',
     yearFilter: initial.year,
+    statusFilter:
+      initial.status === 'em_andamento' ||
+      initial.status === 'concluido' ||
+      initial.status === 'suspenso'
+        ? initial.status
+        : '',
     startDate: initial.startDate,
     endDate: initial.endDate,
     minRisk: 0,
@@ -116,6 +125,7 @@ export default function App() {
     } else if (section === 'contrato') {
       if (searchFilters.query) params.set('q', searchFilters.query);
       if (searchFilters.yearFilter) params.set('year', searchFilters.yearFilter);
+      if (searchFilters.statusFilter) params.set('status', searchFilters.statusFilter);
       if (searchFilters.startDate) params.set('from', searchFilters.startDate);
       if (searchFilters.endDate) params.set('to', searchFilters.endDate);
     }

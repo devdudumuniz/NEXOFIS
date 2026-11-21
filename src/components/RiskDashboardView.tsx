@@ -7,6 +7,8 @@ import {
   inferContractSector,
   type RiskGroupBreakdown,
   type RiskTier,
+  type TopRiskMunicipalityEntry,
+  type TopRiskOrganEntry,
 } from '../lib/dashboardAggregator';
 import { validateDatePeriod } from '../lib/datePeriod';
 import {
@@ -292,6 +294,213 @@ function RiskStackedBarChart({
   );
 }
 
+function TopHighRiskOrgansSection({
+  organs,
+  municipalities,
+  selectedEntityKey,
+  selectedMunicipalityIbge,
+  onSelectOrgan,
+  onSelectMunicipality,
+}: {
+  organs: TopRiskOrganEntry[];
+  municipalities: TopRiskMunicipalityEntry[];
+  selectedEntityKey: string | null;
+  selectedMunicipalityIbge: string | null;
+  onSelectOrgan: (organ: TopRiskOrganEntry) => void;
+  onSelectMunicipality: (municipalityIbge: string) => void;
+}) {
+  const maxOrganHigh = Math.max(1, ...organs.map((o) => o.highRiskCount));
+  const maxMunHigh = Math.max(
+    1,
+    ...municipalities.map((m) => Math.max(m.highRiskCount, m.mediumRiskCount))
+  );
+
+  return (
+    <section
+      data-testid="top-risk-organs"
+      className="bg-white border border-slate-200 rounded-lg p-6 space-y-5"
+    >
+      <div className="flex flex-col sm:flex-row sm:items-baseline justify-between gap-2 pb-4 border-b border-slate-200">
+        <div>
+          <h2 className="text-base font-semibold text-slate-900">
+            Top 5 Órgãos com Maior Risco
+          </h2>
+          <p className="text-xs text-slate-500 mt-0.5">
+            Órgãos e municípios que concentram o maior volume de contratos classificados como Alto
+            Risco (≥ 70/100) na base SQLite. Clique para filtrar a tabela abaixo.
+          </p>
+        </div>
+        <span className="text-xs font-mono tabular-nums text-slate-500 whitespace-nowrap">
+          Ordenado por volume de Alto Risco
+        </span>
+      </div>
+
+      {organs.length === 0 ? (
+        <div className="py-8 text-center text-xs text-slate-500">
+          Nenhum órgão com contratos em faixa de risco elevado no período selecionado.
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+          {/* Left: Top 5 Órgãos */}
+          <div className="lg:col-span-7 space-y-2.5">
+            <div className="text-xs font-semibold text-slate-700">
+              Ranking de Órgãos / Secretarias (Top 5)
+            </div>
+            {organs.map((organ) => {
+              const isSelected = selectedEntityKey === organ.entityKey;
+              const barPct =
+                organ.highRiskCount > 0
+                  ? Math.max(18, Math.round((organ.highRiskCount / maxOrganHigh) * 100))
+                  : Math.max(10, Math.round((organ.maxScore / 100) * 55));
+
+              return (
+                <button
+                  key={organ.entityKey}
+                  type="button"
+                  onClick={() => onSelectOrgan(organ)}
+                  aria-pressed={isSelected}
+                  className={`w-full text-left p-3.5 rounded-md border transition-colors space-y-2 ${
+                    isSelected
+                      ? 'bg-red-50/70 border-red-600'
+                      : 'bg-white border-slate-200 hover:bg-slate-50'
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-start gap-2.5 min-w-0">
+                      <span className="font-mono tabular-nums text-xs font-bold text-slate-500 mt-0.5 shrink-0">
+                        #{organ.rank}
+                      </span>
+                      <div className="min-w-0">
+                        <div className="text-xs font-semibold text-slate-900 truncate">
+                          {organ.entityName}
+                        </div>
+                        <div className="text-[11px] text-slate-500 flex flex-wrap items-center gap-x-2 mt-0.5">
+                          <span className="font-medium text-slate-700">
+                            {organ.municipalityName}/{organ.uf}
+                          </span>
+                          <span aria-hidden="true">·</span>
+                          <span className="font-mono tabular-nums">IBGE {organ.municipalityIbge}</span>
+                          <span aria-hidden="true">·</span>
+                          <span>{organ.sector}</span>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="text-right shrink-0 font-mono tabular-nums">
+                      <div
+                        className={`text-xs font-bold ${
+                          organ.highRiskCount > 0 ? 'text-red-700' : 'text-amber-700'
+                        }`}
+                      >
+                        {organ.highRiskCount} Alto Risco
+                      </div>
+                      <div className="text-[11px] text-slate-500 mt-0.5">
+                        {organ.highRiskValue > 0
+                          ? formatCurrencyCompactBRL(organ.highRiskValue)
+                          : formatCurrencyCompactBRL(organ.totalValue)}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="w-full h-2 bg-slate-100 rounded-xs overflow-hidden">
+                    <div
+                      className={`h-full rounded-xs ${
+                        organ.highRiskCount > 0 ? 'bg-red-600' : 'bg-amber-500'
+                      }`}
+                      style={{ width: `${barPct}%` }}
+                    />
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono tabular-nums text-slate-500">
+                    <span>
+                      {organ.highRiskCount > 0
+                        ? `${organ.highRiskSharePct.toFixed(1)}% dos contratos de Alto Risco`
+                        : `${organ.mediumRiskCount} em Risco Médio · 0 Alto Risco`}
+                    </span>
+                    <span>
+                      Máx {organ.maxScore}/100 · {organ.totalContracts} contrato(s) no órgão
+                    </span>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Right: Concentração de Alto Risco por Município */}
+          <div className="lg:col-span-5 space-y-2.5 lg:border-l lg:border-slate-200 lg:pl-6">
+            <div className="text-xs font-semibold text-slate-700">
+              Municípios com Maior Concentração de Alto Risco
+            </div>
+            {municipalities.map((mun) => {
+              const isSelected = selectedMunicipalityIbge === mun.municipalityIbge;
+              const barPct =
+                mun.highRiskCount > 0
+                  ? Math.max(16, Math.round((mun.highRiskCount / maxMunHigh) * 100))
+                  : Math.max(8, Math.round((mun.mediumRiskCount / maxMunHigh) * 100));
+
+              return (
+                <button
+                  key={mun.municipalityIbge}
+                  type="button"
+                  onClick={() => onSelectMunicipality(mun.municipalityIbge)}
+                  aria-pressed={isSelected}
+                  className={`w-full text-left p-3.5 rounded-md border transition-colors space-y-2 ${
+                    isSelected
+                      ? 'bg-red-50/70 border-red-600'
+                      : 'bg-white border-slate-200 hover:bg-slate-50'
+                  }`}
+                >
+                  <div className="flex items-baseline justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="text-xs font-semibold text-slate-900 truncate">
+                        {mun.rank}. {mun.municipalityName} — {mun.uf}
+                      </div>
+                      <div className="text-[11px] font-mono tabular-nums text-slate-500 mt-0.5">
+                        IBGE {mun.municipalityIbge} · {mun.totalContracts} contrato(s)
+                      </div>
+                    </div>
+                    <div className="text-right shrink-0 font-mono tabular-nums">
+                      <span
+                        className={`text-xs font-bold ${
+                          mun.highRiskCount > 0 ? 'text-red-700' : 'text-amber-700'
+                        }`}
+                      >
+                        {mun.highRiskCount} Alto
+                      </span>
+                      {mun.highRiskCount > 0 && (
+                        <span className="text-[11px] text-slate-500 ml-1">
+                          ({mun.highRiskSharePct.toFixed(0)}%)
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="w-full h-2 bg-slate-100 rounded-xs overflow-hidden">
+                    <div
+                      className={`h-full rounded-xs ${
+                        mun.highRiskCount > 0 ? 'bg-red-600' : 'bg-amber-500'
+                      }`}
+                      style={{ width: `${barPct}%` }}
+                    />
+                  </div>
+
+                  <div className="flex items-center justify-between text-[11px] font-mono tabular-nums text-slate-500">
+                    <span>
+                      Vol. Alto Risco:{' '}
+                      {mun.highRiskValue > 0 ? formatCurrencyCompactBRL(mun.highRiskValue) : 'R$ 0'}
+                    </span>
+                    <span>Máx {mun.maxScore}/100</span>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 export function RiskDashboardView({
   startDate,
   endDate,
@@ -305,6 +514,7 @@ export function RiskDashboardView({
   const [groupMode, setGroupMode] = useState<'entity' | 'sector'>('entity');
   const [selectedTier, setSelectedTier] = useState<RiskTier | 'ALL'>('ALL');
   const [selectedGroupKey, setSelectedGroupKey] = useState<string | null>(null);
+  const [selectedMunicipalityIbge, setSelectedMunicipalityIbge] = useState<string | null>(null);
 
   const periodValidation = validateDatePeriod(startDate, endDate);
 
@@ -343,6 +553,9 @@ export function RiskDashboardView({
     if (selectedTier !== 'ALL' && classifyRiskTier(contract.assessment.score) !== selectedTier) {
       return false;
     }
+    if (selectedMunicipalityIbge && contract.municipalityIbge !== selectedMunicipalityIbge) {
+      return false;
+    }
     if (selectedGroupKey) {
       if (groupMode === 'entity') {
         const key = `${contract.municipalityIbge}::${(
@@ -355,6 +568,25 @@ export function RiskDashboardView({
     }
     return true;
   });
+
+  const handleSelectTopOrgan = (organ: TopRiskOrganEntry) => {
+    setSelectedMunicipalityIbge(null);
+    setGroupMode('entity');
+    if (selectedGroupKey === organ.entityKey) {
+      setSelectedGroupKey(null);
+      setSelectedTier('ALL');
+    } else {
+      setSelectedGroupKey(organ.entityKey);
+      if (organ.highRiskCount > 0) {
+        setSelectedTier('high');
+      }
+    }
+  };
+
+  const handleSelectTopMunicipality = (ibge: string) => {
+    setSelectedGroupKey(null);
+    setSelectedMunicipalityIbge((prev) => (prev === ibge ? null : ibge));
+  };
 
   const dist = data?.summary.distribution;
 
@@ -550,6 +782,16 @@ export function RiskDashboardView({
             </section>
           </div>
 
+          {/* Top 5 Órgãos com Maior Risco + Concentração por Município */}
+          <TopHighRiskOrgansSection
+            organs={data.summary.topHighRiskOrgans ?? []}
+            municipalities={data.summary.topHighRiskMunicipalities ?? []}
+            selectedEntityKey={groupMode === 'entity' ? selectedGroupKey : null}
+            selectedMunicipalityIbge={selectedMunicipalityIbge}
+            onSelectOrgan={handleSelectTopOrgan}
+            onSelectMunicipality={handleSelectTopMunicipality}
+          />
+
           {/* Drilldown Contracts Table */}
           <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
             <div className="px-5 py-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
@@ -558,17 +800,18 @@ export function RiskDashboardView({
                   Contratos Persistidos no SQLite ({filteredContracts.length})
                 </h2>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  {selectedTier !== 'ALL' || selectedGroupKey
+                  {selectedTier !== 'ALL' || selectedGroupKey || selectedMunicipalityIbge
                     ? 'Filtro interativo aplicado pelos gráficos acima.'
                     : 'Exibindo todos os contratos salvos no período selecionado, ordenados por risco.'}
                 </p>
               </div>
-              {(selectedTier !== 'ALL' || selectedGroupKey) && (
+              {(selectedTier !== 'ALL' || selectedGroupKey || selectedMunicipalityIbge) && (
                 <button
                   type="button"
                   onClick={() => {
                     setSelectedTier('ALL');
                     setSelectedGroupKey(null);
+                    setSelectedMunicipalityIbge(null);
                   }}
                   className="text-xs font-semibold text-blue-700 hover:text-blue-800 whitespace-nowrap"
                 >

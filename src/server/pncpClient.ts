@@ -215,6 +215,28 @@ export function mapPncpSearchItemToContract(
         ? 'Órgão contratante'
         : 'Subcontratado';
 
+  const rawSituacao = (item.situacao_nome ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+  const todayIso = retrievedAt.slice(0, 10);
+  let mappedStatus: ContractRecord['status'] = 'Vigente';
+  if (
+    rawSituacao.includes('suspens') ||
+    rawSituacao.includes('rescind') ||
+    rawSituacao.includes('anulad') ||
+    rawSituacao.includes('cancel')
+  ) {
+    mappedStatus = 'Suspenso';
+  } else if (
+    rawSituacao.includes('encerrad') ||
+    rawSituacao.includes('concluid') ||
+    rawSituacao.includes('finaliz') ||
+    (/^\d{4}-\d{2}-\d{2}$/.test(endDate) && endDate < todayIso)
+  ) {
+    mappedStatus = 'Encerrado';
+  }
+
   return {
     id: safeId,
     pncpControlNumber: controlNumber,
@@ -235,7 +257,7 @@ export function mapPncpSearchItemToContract(
     endDate,
     originalValue: safeValue,
     updatedValue: safeValue,
-    status: 'Vigente',
+    status: mappedStatus,
     cnpjRole: role,
     supplier: {
       cnpj: fornecedorCnpj,
