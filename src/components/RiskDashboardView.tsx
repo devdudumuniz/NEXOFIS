@@ -35,22 +35,29 @@ const TIER_META: Record<
     label: 'Alto',
     range: '≥ 70/100',
     colorHex: '#DC2626',
-    textClass: 'text-red-700',
+    textClass: 'text-red-700 dark:text-red-400',
     barClass: 'bg-red-600',
   },
   medium: {
     label: 'Médio',
     range: '40–69/100',
     colorHex: '#D97706',
-    textClass: 'text-amber-700',
+    textClass: 'text-amber-700 dark:text-amber-400',
     barClass: 'bg-amber-500',
   },
   low: {
     label: 'Baixo',
     range: '< 40/100',
     colorHex: '#16A34A',
-    textClass: 'text-emerald-700',
+    textClass: 'text-emerald-700 dark:text-emerald-400',
     barClass: 'bg-emerald-600',
+  },
+  unverifiable: {
+    label: 'Cobertura insuficiente',
+    range: 'Não verificável',
+    colorHex: '#64748B',
+    textClass: 'text-slate-600 dark:text-slate-400',
+    barClass: 'bg-slate-500',
   },
 };
 
@@ -58,16 +65,18 @@ function RiskPieChart({
   low,
   medium,
   high,
+  unverifiable,
   activeTier,
   onSelectTier,
 }: {
   low: number;
   medium: number;
   high: number;
+  unverifiable: number;
   activeTier: RiskTier | 'ALL';
   onSelectTier: (tier: RiskTier | 'ALL') => void;
 }) {
-  const total = low + medium + high;
+  const total = low + medium + high + unverifiable;
   const radius = 64;
   const strokeWidth = 22;
   const circumference = 2 * Math.PI * radius;
@@ -77,6 +86,7 @@ function RiskPieChart({
     { tier: 'high', count: high },
     { tier: 'medium', count: medium },
     { tier: 'low', count: low },
+    { tier: 'unverifiable', count: unverifiable },
   ];
 
   let cumulative = 0;
@@ -100,14 +110,15 @@ function RiskPieChart({
           viewBox="0 0 180 180"
           className="w-full h-full -rotate-90"
           role="img"
-          aria-label={`Distribuição de risco: ${high} alto, ${medium} médio, ${low} baixo`}
+          aria-label={`Distribuição de risco: ${high} alto, ${medium} médio, ${low} baixo, ${unverifiable} cobertura insuficiente`}
         >
           <circle
             cx="90"
             cy="90"
             r={radius}
             fill="none"
-            stroke="#E2E8F0"
+            stroke="#334155"
+            strokeOpacity="0.2"
             strokeWidth={strokeWidth}
           />
           {segments.map((seg) => {
@@ -136,14 +147,14 @@ function RiskPieChart({
           })}
         </svg>
         <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none text-center">
-          <span className="font-mono tabular-nums text-2xl font-bold text-slate-900">
+          <span className="font-mono tabular-nums text-2xl font-bold text-[#0B2540] dark:text-[#FAF9F5]">
             {total}
           </span>
-          <span className="text-[11px] text-slate-500">contrato(s)</span>
+          <span className="text-[11px] text-slate-500 dark:text-slate-400">contrato(s)</span>
         </div>
       </div>
 
-      <div className="flex-1 w-full space-y-2.5">
+      <div className="flex-1 w-full space-y-2">
         {segments.map((seg) => {
           const meta = TIER_META[seg.tier];
           const isSelected = activeTier === seg.tier;
@@ -155,8 +166,8 @@ function RiskPieChart({
               aria-pressed={isSelected}
               className={`w-full text-left px-3 py-2 rounded-md border transition-colors flex items-center justify-between gap-3 ${
                 isSelected
-                  ? 'bg-slate-100 border-slate-400'
-                  : 'bg-white border-slate-200 hover:bg-slate-50'
+                  ? 'bg-[#E8F1F6] dark:bg-[#102843] border-[#D95B35]'
+                  : 'bg-white dark:bg-[#061321] border-slate-200 dark:border-[#1D3A57] hover:bg-slate-50 dark:hover:bg-[#102843]/60'
               }`}
             >
               <div className="flex items-center gap-2.5 min-w-0">
@@ -166,15 +177,21 @@ function RiskPieChart({
                   aria-hidden="true"
                 />
                 <div className="min-w-0">
-                  <div className="text-xs font-semibold text-slate-900">
-                    Risco {meta.label}{' '}
-                    <span className="font-mono font-normal text-slate-500">({meta.range})</span>
+                  <div className="text-xs font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
+                    {seg.tier === 'unverifiable' ? meta.label : `Risco ${meta.label}`}{' '}
+                    <span className="font-mono font-normal text-slate-500 dark:text-slate-400">
+                      ({meta.range})
+                    </span>
                   </div>
                 </div>
               </div>
               <div className="text-right shrink-0 font-mono tabular-nums text-xs">
-                <span className="font-semibold text-slate-900">{seg.count}</span>
-                <span className="text-slate-500 ml-1.5">({seg.pct.toFixed(1)}%)</span>
+                <span className="font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
+                  {seg.count}
+                </span>
+                <span className="text-slate-500 dark:text-slate-400 ml-1.5">
+                  ({seg.pct.toFixed(1)}%)
+                </span>
               </div>
             </button>
           );
@@ -195,7 +212,7 @@ function RiskStackedBarChart({
 }) {
   if (groups.length === 0) {
     return (
-      <div className="py-10 text-center text-xs text-slate-500">
+      <div className="py-10 text-center text-xs text-slate-500 dark:text-slate-400">
         Nenhum grupo de entidade ou setor encontrado no período selecionado.
       </div>
     );
@@ -211,6 +228,7 @@ function RiskStackedBarChart({
         const highPct = (group.high / group.total) * 100;
         const medPct = (group.medium / group.total) * 100;
         const lowPct = (group.low / group.total) * 100;
+        const unvPct = (group.unverifiable / group.total) * 100;
 
         return (
           <button
@@ -220,16 +238,16 @@ function RiskStackedBarChart({
             aria-pressed={isSelected}
             className={`w-full text-left p-3 rounded-md border transition-colors space-y-2 ${
               isSelected
-                ? 'bg-blue-50/70 border-blue-600'
-                : 'bg-white border-slate-200 hover:bg-slate-50'
+                ? 'bg-[#E8F1F6] dark:bg-[#102843] border-[#D95B35]'
+                : 'bg-white dark:bg-[#061321] border-slate-200 dark:border-[#1D3A57] hover:bg-slate-50 dark:hover:bg-[#102843]/60'
             }`}
           >
             <div className="flex items-baseline justify-between gap-3">
               <div className="min-w-0">
-                <div className="text-xs font-semibold text-slate-900 truncate">
+                <div className="text-xs font-semibold text-[#0B2540] dark:text-[#FAF9F5] truncate">
                   {group.label}
                 </div>
-                <div className="text-[11px] text-slate-500 flex flex-wrap items-center gap-x-2 mt-0.5">
+                <div className="text-[11px] text-slate-500 dark:text-slate-400 flex flex-wrap items-center gap-x-2 mt-0.5">
                   {group.municipalityLabel && <span>{group.municipalityLabel}</span>}
                   {group.municipalityLabel && <span aria-hidden="true">·</span>}
                   <span>Setor: {group.sector}</span>
@@ -242,13 +260,14 @@ function RiskStackedBarChart({
                 </div>
               </div>
               <div className="shrink-0 text-right font-mono tabular-nums text-xs">
-                <span className="font-semibold text-slate-900">{group.total}</span>
-                <span className="text-slate-500 ml-1">contrato(s)</span>
+                <span className="font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
+                  {group.total}
+                </span>
+                <span className="text-slate-500 dark:text-slate-400 ml-1">contrato(s)</span>
               </div>
             </div>
 
-            {/* Proportional stacked bar */}
-            <div className="w-full h-3 bg-slate-100 rounded-xs overflow-hidden">
+            <div className="w-full h-3 bg-slate-100 dark:bg-[#102843] rounded-xs overflow-hidden">
               <div
                 className="h-full flex overflow-hidden rounded-xs"
                 style={{ width: `${barWidthPct}%` }}
@@ -274,16 +293,26 @@ function RiskStackedBarChart({
                     title={`Baixo: ${group.low}`}
                   />
                 )}
+                {group.unverifiable > 0 && (
+                  <div
+                    className="h-full bg-slate-500"
+                    style={{ width: `${unvPct}%` }}
+                    title={`Cobertura insuficiente: ${group.unverifiable}`}
+                  />
+                )}
               </div>
             </div>
 
             <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono tabular-nums">
-              <div className="flex items-center gap-3">
-                <span className="text-red-700">Alto: {group.high}</span>
-                <span className="text-amber-700">Médio: {group.medium}</span>
-                <span className="text-emerald-700">Baixo: {group.low}</span>
+              <div className="flex flex-wrap items-center gap-3">
+                <span className="text-red-700 dark:text-red-400">Alto: {group.high}</span>
+                <span className="text-amber-700 dark:text-amber-400">Médio: {group.medium}</span>
+                <span className="text-emerald-700 dark:text-emerald-400">Baixo: {group.low}</span>
+                <span className="text-slate-500 dark:text-slate-400">
+                  Insuf.: {group.unverifiable}
+                </span>
               </div>
-              <span className="text-slate-500">
+              <span className="text-slate-500 dark:text-slate-400">
                 Média {group.avgScore}/100 · Máx {group.maxScore}/100
               </span>
             </div>
@@ -318,32 +347,31 @@ function TopHighRiskOrgansSection({
   return (
     <section
       data-testid="top-risk-organs"
-      className="bg-white border border-slate-200 rounded-lg p-6 space-y-5"
+      className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg p-6 space-y-5"
     >
-      <div className="flex flex-col sm:flex-row sm:items-baseline justify-between gap-2 pb-4 border-b border-slate-200">
+      <div className="flex flex-col sm:flex-row sm:items-baseline justify-between gap-2 pb-4 border-b border-slate-200 dark:border-[#1D3A57]">
         <div>
-          <h2 className="text-base font-semibold text-slate-900">
+          <h2 className="text-base font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
             Top 5 Órgãos com Maior Risco
           </h2>
-          <p className="text-xs text-slate-500 mt-0.5">
-            Órgãos e municípios que concentram o maior volume de contratos classificados como Alto
-            Risco (≥ 70/100) na base SQLite. Clique para filtrar a tabela abaixo.
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+            Órgãos e municípios que concentram contratos classificados como Alto Risco (≥ 70/100)
+            na base SQLite.
           </p>
         </div>
-        <span className="text-xs font-mono tabular-nums text-slate-500 whitespace-nowrap">
+        <span className="text-xs font-mono tabular-nums text-slate-500 dark:text-slate-400 whitespace-nowrap">
           Ordenado por volume de Alto Risco
         </span>
       </div>
 
       {organs.length === 0 ? (
-        <div className="py-8 text-center text-xs text-slate-500">
+        <div className="py-8 text-center text-xs text-slate-500 dark:text-slate-400">
           Nenhum órgão com contratos em faixa de risco elevado no período selecionado.
         </div>
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-          {/* Left: Top 5 Órgãos */}
           <div className="lg:col-span-7 space-y-2.5">
-            <div className="text-xs font-semibold text-slate-700">
+            <div className="text-xs font-semibold text-slate-700 dark:text-slate-300">
               Ranking de Órgãos / Secretarias (Top 5)
             </div>
             {organs.map((organ) => {
@@ -361,25 +389,32 @@ function TopHighRiskOrgansSection({
                   aria-pressed={isSelected}
                   className={`w-full text-left p-3.5 rounded-md border transition-colors space-y-2 ${
                     isSelected
-                      ? 'bg-red-50/70 border-red-600'
-                      : 'bg-white border-slate-200 hover:bg-slate-50'
+                      ? 'bg-red-50/70 dark:bg-red-950/30 border-red-600'
+                      : 'bg-white dark:bg-[#061321] border-slate-200 dark:border-[#1D3A57] hover:bg-slate-50 dark:hover:bg-[#102843]/60'
                   }`}
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div className="flex items-start gap-2.5 min-w-0">
-                      <span className="font-mono tabular-nums text-xs font-bold text-slate-500 mt-0.5 shrink-0">
+                      <span className="font-mono tabular-nums text-xs font-bold text-slate-500 dark:text-slate-400 mt-0.5 shrink-0">
                         #{organ.rank}
                       </span>
                       <div className="min-w-0">
-                        <div className="text-xs font-semibold text-slate-900 truncate">
+                        <div className="text-xs font-semibold text-[#0B2540] dark:text-[#FAF9F5] truncate">
                           {organ.entityName}
                         </div>
-                        <div className="text-[11px] text-slate-500 flex flex-wrap items-center gap-x-2 mt-0.5">
-                          <span className="font-medium text-slate-700">
-                            {organ.municipalityName}/{organ.uf}
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400 flex flex-wrap items-center gap-x-2 mt-0.5">
+                          <span className="font-medium text-slate-700 dark:text-slate-300">
+                            {organ.municipalityName}
+                            {organ.uf ? `/${organ.uf}` : ''}
                           </span>
-                          <span aria-hidden="true">·</span>
-                          <span className="font-mono tabular-nums">IBGE {organ.municipalityIbge}</span>
+                          {organ.municipalityIbge && (
+                            <>
+                              <span aria-hidden="true">·</span>
+                              <span className="font-mono tabular-nums">
+                                IBGE {organ.municipalityIbge}
+                              </span>
+                            </>
+                          )}
                           <span aria-hidden="true">·</span>
                           <span>{organ.sector}</span>
                         </div>
@@ -389,12 +424,14 @@ function TopHighRiskOrgansSection({
                     <div className="text-right shrink-0 font-mono tabular-nums">
                       <div
                         className={`text-xs font-bold ${
-                          organ.highRiskCount > 0 ? 'text-red-700' : 'text-amber-700'
+                          organ.highRiskCount > 0
+                            ? 'text-red-700 dark:text-red-400'
+                            : 'text-amber-700 dark:text-amber-400'
                         }`}
                       >
                         {organ.highRiskCount} Alto Risco
                       </div>
-                      <div className="text-[11px] text-slate-500 mt-0.5">
+                      <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
                         {organ.highRiskValue > 0
                           ? formatCurrencyCompactBRL(organ.highRiskValue)
                           : formatCurrencyCompactBRL(organ.totalValue)}
@@ -402,7 +439,7 @@ function TopHighRiskOrgansSection({
                     </div>
                   </div>
 
-                  <div className="w-full h-2 bg-slate-100 rounded-xs overflow-hidden">
+                  <div className="w-full h-2 bg-slate-100 dark:bg-[#102843] rounded-xs overflow-hidden">
                     <div
                       className={`h-full rounded-xs ${
                         organ.highRiskCount > 0 ? 'bg-red-600' : 'bg-amber-500'
@@ -410,25 +447,13 @@ function TopHighRiskOrgansSection({
                       style={{ width: `${barPct}%` }}
                     />
                   </div>
-
-                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] font-mono tabular-nums text-slate-500">
-                    <span>
-                      {organ.highRiskCount > 0
-                        ? `${organ.highRiskSharePct.toFixed(1)}% dos contratos de Alto Risco`
-                        : `${organ.mediumRiskCount} em Risco Médio · 0 Alto Risco`}
-                    </span>
-                    <span>
-                      Máx {organ.maxScore}/100 · {organ.totalContracts} contrato(s) no órgão
-                    </span>
-                  </div>
                 </button>
               );
             })}
           </div>
 
-          {/* Right: Concentração de Alto Risco por Município */}
-          <div className="lg:col-span-5 space-y-2.5 lg:border-l lg:border-slate-200 lg:pl-6">
-            <div className="text-xs font-semibold text-slate-700">
+          <div className="lg:col-span-5 space-y-2.5 lg:border-l lg:border-slate-200 dark:lg:border-[#1D3A57] lg:pl-6">
+            <div className="text-xs font-semibold text-slate-700 dark:text-slate-300">
               Municípios com Maior Concentração de Alto Risco
             </div>
             {municipalities.map((mun) => {
@@ -440,56 +465,46 @@ function TopHighRiskOrgansSection({
 
               return (
                 <button
-                  key={mun.municipalityIbge}
+                  key={mun.municipalityIbge || mun.municipalityName}
                   type="button"
                   onClick={() => onSelectMunicipality(mun.municipalityIbge)}
                   aria-pressed={isSelected}
                   className={`w-full text-left p-3.5 rounded-md border transition-colors space-y-2 ${
                     isSelected
-                      ? 'bg-red-50/70 border-red-600'
-                      : 'bg-white border-slate-200 hover:bg-slate-50'
+                      ? 'bg-red-50/70 dark:bg-red-950/30 border-red-600'
+                      : 'bg-white dark:bg-[#061321] border-slate-200 dark:border-[#1D3A57] hover:bg-slate-50 dark:hover:bg-[#102843]/60'
                   }`}
                 >
                   <div className="flex items-baseline justify-between gap-2">
                     <div className="min-w-0">
-                      <div className="text-xs font-semibold text-slate-900 truncate">
-                        {mun.rank}. {mun.municipalityName} — {mun.uf}
+                      <div className="text-xs font-semibold text-[#0B2540] dark:text-[#FAF9F5] truncate">
+                        {mun.rank}. {mun.municipalityName}
+                        {mun.uf ? ` — ${mun.uf}` : ''}
                       </div>
-                      <div className="text-[11px] font-mono tabular-nums text-slate-500 mt-0.5">
-                        IBGE {mun.municipalityIbge} · {mun.totalContracts} contrato(s)
+                      <div className="text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400 mt-0.5">
+                        {mun.municipalityIbge ? `IBGE ${mun.municipalityIbge} · ` : ''}
+                        {mun.totalContracts} contrato(s)
                       </div>
                     </div>
                     <div className="text-right shrink-0 font-mono tabular-nums">
                       <span
                         className={`text-xs font-bold ${
-                          mun.highRiskCount > 0 ? 'text-red-700' : 'text-amber-700'
+                          mun.highRiskCount > 0
+                            ? 'text-red-700 dark:text-red-400'
+                            : 'text-amber-700 dark:text-amber-400'
                         }`}
                       >
                         {mun.highRiskCount} Alto
                       </span>
-                      {mun.highRiskCount > 0 && (
-                        <span className="text-[11px] text-slate-500 ml-1">
-                          ({mun.highRiskSharePct.toFixed(0)}%)
-                        </span>
-                      )}
                     </div>
                   </div>
-
-                  <div className="w-full h-2 bg-slate-100 rounded-xs overflow-hidden">
+                  <div className="w-full h-2 bg-slate-100 dark:bg-[#102843] rounded-xs overflow-hidden">
                     <div
                       className={`h-full rounded-xs ${
                         mun.highRiskCount > 0 ? 'bg-red-600' : 'bg-amber-500'
                       }`}
                       style={{ width: `${barPct}%` }}
                     />
-                  </div>
-
-                  <div className="flex items-center justify-between text-[11px] font-mono tabular-nums text-slate-500">
-                    <span>
-                      Vol. Alto Risco:{' '}
-                      {mun.highRiskValue > 0 ? formatCurrencyCompactBRL(mun.highRiskValue) : 'R$ 0'}
-                    </span>
-                    <span>Máx {mun.maxScore}/100</span>
                   </div>
                 </button>
               );
@@ -550,7 +565,11 @@ export function RiskDashboardView({
     : [];
 
   const filteredContracts = (data?.contracts ?? []).filter((contract) => {
-    if (selectedTier !== 'ALL' && classifyRiskTier(contract.assessment.score) !== selectedTier) {
+    const tier = classifyRiskTier(
+      contract.assessment.score,
+      contract.assessment.coverageStatus
+    );
+    if (selectedTier !== 'ALL' && tier !== selectedTier) {
       return false;
     }
     if (selectedMunicipalityIbge && contract.municipalityIbge !== selectedMunicipalityIbge) {
@@ -592,31 +611,30 @@ export function RiskDashboardView({
 
   return (
     <div className="space-y-6">
-      {/* Header + Always-Visible Period Filter */}
-      <section className="bg-white border border-slate-200 rounded-lg p-6 space-y-5">
+      <section className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg p-6 space-y-5">
         <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-4">
           <div>
-            <h1 className="text-2xl font-bold tracking-tight text-slate-900">
+            <h1 className="text-2xl font-bold tracking-tight text-[#0B2540] dark:text-[#FAF9F5]">
               Dashboard de Riscos dos Contratos (SQLite)
             </h1>
-            <p className="text-sm text-slate-600 mt-1 max-w-3xl">
-              Visão agregada em tempo real de todos os contratos persistidos na base local SQLite
-              (espelho municipal, consultas PNCP e documentos enviados), distribuídos por faixa de
-              risco (Baixo, Médio e Alto) por entidade contratante ou setor.
+            <p className="text-sm text-slate-600 dark:text-slate-300 mt-1 max-w-3xl">
+              Visão agregada dos contratos auditados e persistidos no SQLite local, separando
+              explicitamente contratos com <strong>Cobertura insuficiente</strong> das faixas
+              verificáveis (Baixo, Médio e Alto risco).
             </p>
           </div>
           <button
             type="button"
             onClick={loadDashboard}
             disabled={loading || !periodValidation.valid}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-md transition-colors whitespace-nowrap shrink-0 disabled:opacity-50"
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-[#0B2540] dark:text-[#FAF9F5] bg-white dark:bg-[#061321] border border-slate-300 dark:border-[#1D3A57] hover:bg-[#E8F1F6] dark:hover:bg-[#102843] rounded-md transition-colors whitespace-nowrap shrink-0 disabled:opacity-50"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} aria-hidden="true" />
             Atualizar Painel
           </button>
         </div>
 
-        <div className="pt-4 border-t border-slate-200">
+        <div className="pt-4 border-t border-slate-200 dark:border-[#1D3A57]">
           <div className="max-w-xl">
             <DatePeriodControls
               idPrefix="dashboard"
@@ -631,77 +649,97 @@ export function RiskDashboardView({
       </section>
 
       {error && (
-        <div role="alert" className="bg-red-50 border border-red-200 rounded-lg p-4 text-sm text-red-800">
+        <div
+          role="alert"
+          className="bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg p-4 text-sm text-red-800 dark:text-red-300"
+        >
           {error}
         </div>
       )}
 
       {loading && !data ? (
-        <div className="bg-white border border-slate-200 rounded-lg p-8 animate-pulse space-y-4">
-          <div className="h-5 w-56 bg-slate-200 rounded" />
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-6">
-            {[1, 2, 3, 4].map((n) => (
+        <div className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg p-8 animate-pulse space-y-4">
+          <div className="h-5 w-56 bg-slate-200 dark:bg-[#102843] rounded" />
+          <div className="grid grid-cols-2 lg:grid-cols-5 gap-6">
+            {[1, 2, 3, 4, 5].map((n) => (
               <div key={n} className="space-y-2">
-                <div className="h-3 w-24 bg-slate-100 rounded" />
-                <div className="h-7 w-20 bg-slate-200 rounded" />
+                <div className="h-3 w-24 bg-slate-100 dark:bg-[#102843] rounded" />
+                <div className="h-7 w-20 bg-slate-200 dark:bg-[#102843] rounded" />
               </div>
             ))}
           </div>
         </div>
       ) : data && dist ? (
         <>
-          {/* 4-column KPI Strip */}
-          <section className="bg-white border border-slate-200 rounded-lg p-6">
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-6">
+          {/* 5-column KPI Strip separating Cobertura Insuficiente from Baixo Risco */}
+          <section className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg p-6">
+            <div className="grid grid-cols-2 lg:grid-cols-5 gap-6">
               <div>
-                <div className="text-xs font-medium text-slate-500">Contratos no Período</div>
-                <div className="mt-1 text-2xl font-semibold font-mono tabular-nums text-slate-900">
+                <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                  Contratos no Período
+                </div>
+                <div className="mt-1 text-2xl font-semibold font-mono tabular-nums text-[#0B2540] dark:text-[#FAF9F5]">
                   {data.summary.totalContracts}
                 </div>
-                <div className="mt-0.5 text-xs text-slate-500 font-mono tabular-nums">
-                  Base SQLite: {data.totalStoredInSqlite} contrato(s) ·{' '}
-                  {formatCurrencyCompactBRL(data.summary.totalValue)}
+                <div className="mt-0.5 text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums">
+                  SQLite: {data.totalStoredInSqlite} · {formatCurrencyCompactBRL(data.summary.totalValue)}
                 </div>
               </div>
               <div>
-                <div className="text-xs font-medium text-slate-500">Risco Alto (≥ 70)</div>
-                <div className="mt-1 text-2xl font-semibold font-mono tabular-nums text-red-700">
+                <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                  Risco Alto (≥ 70)
+                </div>
+                <div className="mt-1 text-2xl font-semibold font-mono tabular-nums text-red-700 dark:text-red-400">
                   {dist.high}
                 </div>
-                <div className="mt-0.5 text-xs text-slate-500">
-                  Revisão prioritária recomendada
+                <div className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                  Revisão prioritária
                 </div>
               </div>
               <div>
-                <div className="text-xs font-medium text-slate-500">Risco Médio (40–69)</div>
-                <div className="mt-1 text-2xl font-semibold font-mono tabular-nums text-amber-700">
+                <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                  Risco Médio (40–69)
+                </div>
+                <div className="mt-1 text-2xl font-semibold font-mono tabular-nums text-amber-700 dark:text-amber-400">
                   {dist.medium}
                 </div>
-                <div className="mt-0.5 text-xs text-slate-500">
-                  Pontos de atenção documentais
+                <div className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                  Pontos de atenção
                 </div>
               </div>
               <div>
-                <div className="text-xs font-medium text-slate-500">Risco Baixo (&lt; 40)</div>
-                <div className="mt-1 text-2xl font-semibold font-mono tabular-nums text-emerald-700">
+                <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                  Risco Baixo (&lt; 40)
+                </div>
+                <div className="mt-1 text-2xl font-semibold font-mono tabular-nums text-emerald-700 dark:text-emerald-400">
                   {dist.low}
                 </div>
-                <div className="mt-0.5 text-xs text-slate-500 font-mono tabular-nums">
-                  Escore médio geral: {data.summary.avgScore}/100
+                <div className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                  Com cobertura verificável
+                </div>
+              </div>
+              <div>
+                <div className="text-xs font-medium text-slate-500 dark:text-slate-400">
+                  Cobertura Insuficiente
+                </div>
+                <div className="mt-1 text-2xl font-semibold font-mono tabular-nums text-slate-600 dark:text-slate-300">
+                  {dist.unverifiable}
+                </div>
+                <div className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                  Sem dados suficientes
                 </div>
               </div>
             </div>
           </section>
 
-          {/* Visual Charts Grid: Pie Chart + Stacked Bar Chart by Entity/Sector */}
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-            <section className="lg:col-span-5 bg-white border border-slate-200 rounded-lg p-6 space-y-5">
+            <section className="lg:col-span-5 bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg p-6 space-y-5">
               <div className="flex items-start justify-between gap-3">
                 <div>
-                  <h2 className="text-base font-semibold text-slate-900">
+                  <h2 className="text-base font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
                     Distribuição Geral de Risco
                   </h2>
-                  <p className="text-xs text-slate-500 mt-0.5">
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                     Clique em uma fatia ou faixa para filtrar a lista de contratos abaixo.
                   </p>
                 </div>
@@ -709,7 +747,7 @@ export function RiskDashboardView({
                   <button
                     type="button"
                     onClick={() => setSelectedTier('ALL')}
-                    className="text-xs font-medium text-blue-700 hover:text-blue-800 whitespace-nowrap"
+                    className="text-xs font-medium text-[#D95B35] hover:underline whitespace-nowrap"
                   >
                     Limpar faixa
                   </button>
@@ -720,42 +758,35 @@ export function RiskDashboardView({
                 low={dist.low}
                 medium={dist.medium}
                 high={dist.high}
+                unverifiable={dist.unverifiable}
                 activeTier={selectedTier}
                 onSelectTier={setSelectedTier}
               />
-
-              {dist.insufficientCoverage > 0 && (
-                <div className="pt-3 border-t border-slate-100 text-xs text-slate-600">
-                  Nota: <strong className="font-mono">{dist.insufficientCoverage}</strong>{' '}
-                  contrato(s) apresentam cobertura documental insuficiente e demandam fontes
-                  adicionais para validação plena.
-                </div>
-              )}
             </section>
 
-            <section className="lg:col-span-7 bg-white border border-slate-200 rounded-lg p-6 space-y-5">
+            <section className="lg:col-span-7 bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg p-6 space-y-5">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                 <div>
-                  <h2 className="text-base font-semibold text-slate-900">
+                  <h2 className="text-base font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
                     Distribuição de Riscos por {groupMode === 'entity' ? 'Entidade' : 'Setor'}
                   </h2>
-                  <p className="text-xs text-slate-500 mt-0.5">
-                    Barras empilhadas (Alto, Médio e Baixo). Clique em uma barra para detalhar.
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                    Barras empilhadas (Alto, Médio, Baixo e Cobertura insuficiente).
                   </p>
                 </div>
 
                 <div
                   role="group"
                   aria-label="Agrupamento do gráfico de barras"
-                  className="inline-flex items-center gap-1 p-1 bg-slate-100 rounded-md self-start"
+                  className="inline-flex items-center gap-1 p-1 bg-slate-100 dark:bg-[#061321] rounded-md self-start"
                 >
                   <button
                     type="button"
                     onClick={() => setGroupMode('entity')}
                     className={`px-3 py-1.5 text-xs font-medium rounded transition-colors whitespace-nowrap shrink-0 ${
                       groupMode === 'entity'
-                        ? 'bg-white text-slate-900 shadow-xs'
-                        : 'text-slate-600 hover:text-slate-900'
+                        ? 'bg-white dark:bg-[#102843] text-[#0B2540] dark:text-[#FAF9F5] shadow-xs'
+                        : 'text-slate-600 dark:text-slate-400 hover:text-[#0B2540] dark:hover:text-white'
                     }`}
                   >
                     Por Entidade
@@ -765,8 +796,8 @@ export function RiskDashboardView({
                     onClick={() => setGroupMode('sector')}
                     className={`px-3 py-1.5 text-xs font-medium rounded transition-colors whitespace-nowrap shrink-0 ${
                       groupMode === 'sector'
-                        ? 'bg-white text-slate-900 shadow-xs'
-                        : 'text-slate-600 hover:text-slate-900'
+                        ? 'bg-white dark:bg-[#102843] text-[#0B2540] dark:text-[#FAF9F5] shadow-xs'
+                        : 'text-slate-600 dark:text-slate-400 hover:text-[#0B2540] dark:hover:text-white'
                     }`}
                   >
                     Por Setor
@@ -782,7 +813,6 @@ export function RiskDashboardView({
             </section>
           </div>
 
-          {/* Top 5 Órgãos com Maior Risco + Concentração por Município */}
           <TopHighRiskOrgansSection
             organs={data.summary.topHighRiskOrgans ?? []}
             municipalities={data.summary.topHighRiskMunicipalities ?? []}
@@ -793,16 +823,16 @@ export function RiskDashboardView({
           />
 
           {/* Drilldown Contracts Table */}
-          <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
-            <div className="px-5 py-4 border-b border-slate-200 flex flex-wrap items-center justify-between gap-3">
+          <section className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg overflow-hidden">
+            <div className="px-5 py-4 border-b border-slate-200 dark:border-[#1D3A57] flex flex-wrap items-center justify-between gap-3">
               <div>
-                <h2 className="text-sm font-semibold text-slate-900">
+                <h2 className="text-sm font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
                   Contratos Persistidos no SQLite ({filteredContracts.length})
                 </h2>
-                <p className="text-xs text-slate-500 mt-0.5">
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                   {selectedTier !== 'ALL' || selectedGroupKey || selectedMunicipalityIbge
                     ? 'Filtro interativo aplicado pelos gráficos acima.'
-                    : 'Exibindo todos os contratos salvos no período selecionado, ordenados por risco.'}
+                    : 'Todos os contratos auditados no período selecionado.'}
                 </p>
               </div>
               {(selectedTier !== 'ALL' || selectedGroupKey || selectedMunicipalityIbge) && (
@@ -813,7 +843,7 @@ export function RiskDashboardView({
                     setSelectedGroupKey(null);
                     setSelectedMunicipalityIbge(null);
                   }}
-                  className="text-xs font-semibold text-blue-700 hover:text-blue-800 whitespace-nowrap"
+                  className="text-xs font-semibold text-[#D95B35] hover:underline whitespace-nowrap"
                 >
                   Limpar filtros dos gráficos
                 </button>
@@ -821,68 +851,82 @@ export function RiskDashboardView({
             </div>
 
             {filteredContracts.length === 0 ? (
-              <div className="p-8 text-center text-xs text-slate-500">
-                Nenhum contrato localizado para os filtros e período aplicados.
+              <div className="p-8 text-center text-xs text-slate-500 dark:text-slate-400">
+                {data.totalStoredInSqlite === 0
+                  ? 'Nenhum contrato salvo no SQLite ainda. Consulte um município, pesquise um CNPJ ou envie um documento PDF para popular o painel.'
+                  : 'Nenhum contrato localizado para os filtros e período aplicados.'}
               </div>
             ) : (
               <div className="overflow-x-auto">
                 <table className="w-full text-left border-collapse">
                   <thead>
-                    <tr className="border-b border-slate-200 bg-slate-50 text-xs font-medium text-slate-500">
+                    <tr className="border-b border-slate-200 dark:border-[#1D3A57] bg-[#FAF9F5] dark:bg-[#061321] text-xs font-medium text-slate-500 dark:text-slate-400">
                       <th className="py-3 px-4 whitespace-nowrap">Contrato / Data</th>
                       <th className="py-3 px-4">Entidade e Setor</th>
                       <th className="py-3 px-4">Fornecedor</th>
                       <th className="py-3 px-4 text-right whitespace-nowrap">Valor Atualizado</th>
-                      <th className="py-3 px-4 whitespace-nowrap">Risco</th>
+                      <th className="py-3 px-4 whitespace-nowrap">Risco / Cobertura</th>
                       <th className="py-3 px-4 text-right whitespace-nowrap">Ação</th>
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-slate-200 text-sm">
+                  <tbody className="divide-y divide-slate-200 dark:divide-[#1D3A57] text-sm">
                     {filteredContracts.map((contract) => {
-                      const tier = classifyRiskTier(contract.assessment.score);
+                      const tier = classifyRiskTier(
+                        contract.assessment.score,
+                        contract.assessment.coverageStatus
+                      );
                       return (
-                        <tr key={contract.id} className="hover:bg-slate-50/80 transition-colors">
+                        <tr
+                          key={contract.id}
+                          className="hover:bg-[#FAF9F5] dark:hover:bg-[#102843]/50 transition-colors"
+                        >
                           <td className="py-3 px-4 align-top whitespace-nowrap">
-                            <div className="font-mono font-semibold text-slate-900 tabular-nums">
+                            <div className="font-mono font-semibold text-[#0B2540] dark:text-[#FAF9F5] tabular-nums">
                               {contract.contractNumber}
                             </div>
-                            <div className="text-xs font-mono tabular-nums text-slate-500 mt-0.5">
+                            <div className="text-xs font-mono tabular-nums text-slate-500 dark:text-slate-400 mt-0.5">
                               {formatDateBR(contract.signatureDate || contract.startDate)}
                             </div>
                           </td>
                           <td className="py-3 px-4 align-top max-w-md">
-                            <div className="text-xs font-semibold text-slate-800">
+                            <div className="text-xs font-semibold text-[#0B2540] dark:text-slate-200">
                               {contract.entityName}
                             </div>
-                            <div className="text-xs text-slate-500 mt-0.5">
-                              {contract.municipalityName}/{contract.uf} · Setor:{' '}
+                            <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                              {contract.municipalityName}
+                              {contract.uf ? `/${contract.uf}` : ''} · Setor:{' '}
                               {inferContractSector(contract)}
                             </div>
                           </td>
                           <td className="py-3 px-4 align-top">
-                            <div className="text-xs font-medium text-slate-900">
+                            <div className="text-xs font-medium text-[#0B2540] dark:text-[#FAF9F5]">
                               {contract.supplier.legalName}
                             </div>
-                            <div className="text-[11px] font-mono tabular-nums text-slate-500 mt-0.5">
-                              {formatCnpj(contract.supplier.cnpj)}
-                            </div>
+                            {contract.supplier.cnpj && contract.supplier.cnpj !== '00000000000000' && (
+                              <div className="text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400 mt-0.5">
+                                {formatCnpj(contract.supplier.cnpj)}
+                              </div>
+                            )}
                           </td>
-                          <td className="py-3 px-4 align-top text-right whitespace-nowrap font-mono tabular-nums text-xs font-semibold text-slate-900">
+                          <td className="py-3 px-4 align-top text-right whitespace-nowrap font-mono tabular-nums text-xs font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
                             {contract.updatedValue > 0
                               ? formatCurrencyBRL(contract.updatedValue)
                               : 'Não divulgado'}
                           </td>
                           <td className="py-3 px-4 align-top whitespace-nowrap">
-                            <RiskScoreInline score={contract.assessment.score} />
+                            <RiskScoreInline
+                              score={contract.assessment.score}
+                              coverageStatus={contract.assessment.coverageStatus}
+                            />
                             <div className={`text-[11px] font-medium mt-0.5 ${TIER_META[tier].textClass}`}>
-                              Faixa {TIER_META[tier].label}
+                              {tier === 'unverifiable' ? TIER_META[tier].label : `Faixa ${TIER_META[tier].label}`}
                             </div>
                           </td>
                           <td className="py-3 px-4 align-top text-right whitespace-nowrap">
                             <button
                               type="button"
                               onClick={() => onSelectContract(contract)}
-                              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-md transition-colors whitespace-nowrap"
+                              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#0B2540] dark:text-[#FAF9F5] bg-[#E8F1F6] dark:bg-[#102843] hover:opacity-90 rounded-md transition-colors whitespace-nowrap"
                             >
                               Abrir Dossiê
                               <ArrowRight className="w-3.5 h-3.5" aria-hidden="true" />

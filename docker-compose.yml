@@ -1,26 +1,48 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: nexofis-postgres
+  # ============================================================================
+  # Perfil padrão (standalone): NEXOFIS com SQLite WAL + extrator nativo de PDF
+  #   docker compose up --build -d
+  #
+  # Perfil completo com OCR distribuído (Docling Serve + PaddleOCR) e Postgres:
+  #   docker compose --profile full-ocr --profile postgres up --build -d
+  # ============================================================================
+
+  nexofis-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nexofis-app
     restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-nexofis}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Defina POSTGRES_PASSWORD no arquivo .env}
-      POSTGRES_DB: ${POSTGRES_DB:-nexofis}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${PORT:-3000}:3000"
     volumes:
-      - nexofis_pgdata:/var/lib/postgresql/data
-      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+      - nexofis_sqlite_data:/app/data
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      NEXOFIS_DB_DRIVER: ${NEXOFIS_DB_DRIVER:-sqlite}
+      NEXOFIS_SQLITE_PATH: /app/data/nexofis.db
+      NEXOFIS_JOBS_DB_PATH: /app/data/nexofis-jobs.db
+      DATABASE_URL: ${DATABASE_URL:-}
+      DOCLING_SERVE_URL: ${DOCLING_SERVE_URL:-}
+      PADDLE_OCR_URL: ${PADDLE_OCR_URL:-}
+      # Em produção a autenticação é fail-closed por padrão.
+      # Defina NEXOFIS_SESSION_SECRET (>= 32 chars) ou NEXOFIS_ALLOW_INSECURE_LOCAL=true apenas em rede isolada.
+      NEXOFIS_AUTH_ENABLED: ${NEXOFIS_AUTH_ENABLED:-true}
+      NEXOFIS_ALLOW_INSECURE_LOCAL: ${NEXOFIS_ALLOW_INSECURE_LOCAL:-false}
+      NEXOFIS_SESSION_SECRET: ${NEXOFIS_SESSION_SECRET:?Defina NEXOFIS_SESSION_SECRET (>= 32 chars) no .env}
+      PORTAL_TRANSPARENCIA_API_KEY: ${PORTAL_TRANSPARENCIA_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nexofis} -d ${POSTGRES_DB:-nexofis}"]
-      interval: 10s
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/api/health').then(r => r.json()).then(d => process.exit(d && d.status === 'ok' ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 15s
       timeout: 5s
       retries: 5
 
   docling-serve:
     image: ghcr.io/docling-project/docling-serve:latest
     container_name: nexofis-docling
+    profiles: ["full-ocr"]
     restart: unless-stopped
     ports:
       - "${DOCLING_PORT:-5001}:5001"
@@ -37,6 +59,7 @@ services:
       context: ./worker
       dockerfile: Dockerfile
     container_name: nexofis-paddleocr
+    profiles: ["full-ocr"]
     restart: unless-stopped
     environment:
       OCR_WORKER_PORT: "8090"
@@ -52,37 +75,23 @@ services:
       timeout: 5s
       retries: 5
 
-  nexofis-app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: nexofis-app
+  postgres:
+    image: postgres:16-alpine
+    container_name: nexofis-postgres
+    profiles: ["postgres"]
     restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-      docling-serve:
-        condition: service_started
-      paddleocr-worker:
-        condition: service_healthy
-    ports:
-      - "${PORT:-3000}:3000"
-    volumes:
-      - nexofis_sqlite_data:/app/data
     environment:
-      NODE_ENV: production
-      PORT: 3000
-      NEXOFIS_DB_DRIVER: ${NEXOFIS_DB_DRIVER:-sqlite}
-      DATABASE_URL: postgresql://${POSTGRES_USER:-nexofis}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-nexofis}
-      DOCLING_SERVE_URL: http://docling-serve:5001
-      PADDLE_OCR_URL: http://paddleocr-worker:8090
-      NEXOFIS_AUTH_ENABLED: ${NEXOFIS_AUTH_ENABLED:-false}
-      NEXOFIS_SESSION_SECRET: ${NEXOFIS_SESSION_SECRET:-}
-      PORTAL_TRANSPARENCIA_API_KEY: ${PORTAL_TRANSPARENCIA_API_KEY:-}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      POSTGRES_USER: ${POSTGRES_USER:-nexofis}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_in_production}
+      POSTGRES_DB: ${POSTGRES_DB:-nexofis}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - nexofis_pgdata:/var/lib/postgresql/data
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\""]
-      interval: 15s
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nexofis} -d ${POSTGRES_DB:-nexofis}"]
+      interval: 10s
       timeout: 5s
       retries: 5
 

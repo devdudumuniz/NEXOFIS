@@ -1,6 +1,6 @@
 export type RiskSeverity = 'CRÍTICA' | 'ALTA' | 'MÉDIA' | 'BAIXA';
 
-export type ExtractionMethod = 'native' | 'docling' | 'paddleocr';
+export type ExtractionMethod = 'native' | 'docling' | 'paddleocr' | 'multimodal';
 
 export type FindingState =
   | 'CONFIRMED_DATA'
@@ -70,6 +70,8 @@ export interface Shareholder {
   localNepotismRuleVerified?: boolean;
 }
 
+export type SanctionEffect = 'impediment' | 'fine_only' | 'unknown';
+
 export interface SanctionRecord {
   id: string;
   registry: 'CEIS' | 'CNEP' | 'CEPIM' | 'CEAF' | 'TCU-Inidôneos';
@@ -77,6 +79,8 @@ export interface SanctionRecord {
   status: 'Ativa' | 'Encerrada';
   scope: 'Nacional' | 'Estadual' | 'Órgão Sancionador';
   scopeUf?: string;
+  /** Distinguishes contracting impediments from pecuniary fines (e.g. CNEP art. 6º I) */
+  sanctionEffect?: SanctionEffect;
   reason: string;
   sanctioningOrgan: string;
   startDate: string;
@@ -89,7 +93,7 @@ export interface Supplier {
   legalName: string;
   tradeName?: string;
   openingDate: string;
-  registrationStatus: 'ATIVA' | 'INAPTA' | 'SUSPENSA' | 'BAIXADA';
+  registrationStatus: 'ATIVA' | 'INAPTA' | 'SUSPENSA' | 'BAIXADA' | 'DESCONHECIDA';
   primaryCnaeCode: string;
   primaryCnaeDescription: string;
   secondaryCnaes: Array<{ code: string; description: string }>;
@@ -140,6 +144,12 @@ export interface PaymentRecord {
   paidOutOfOrder?: boolean;
   outOfOrderJustification?: string;
   justificationPublished?: boolean;
+  /** Optional explicit reconciliation link when another portal mirrors the same event */
+  mirrorOfEventId?: string;
+  /** Explicit flag for accounting reversals / estornos */
+  isReversal?: boolean;
+  /** True only when the full payment queue for that funding source was inspected */
+  queueCoverageVerified?: boolean;
 }
 
 export interface SourceRecord {
@@ -192,11 +202,18 @@ export interface DocumentRecord {
   sha256: string;
   mimeType: string;
   sizeBytes: number;
+  originalObjectStored?: boolean;
+  originalDownloadUrl?: string;
   extractionSummary: {
     totalPages: number;
+    originalPageCount?: number;
+    processedPageCount?: number;
+    truncated?: boolean;
+    budgetExceeded?: boolean;
     nativePages: number;
     doclingPages: number;
     ocrPages: number;
+    multimodalPages?: number;
     extractorVersion: string;
   };
   pages: DocumentPage[];
@@ -286,6 +303,8 @@ export interface EvidenceItem {
 
 export interface RiskIndicator {
   findingId: string;
+  semanticKey?: string;
+  inputsDigest?: string;
   code: string;
   ruleVersion: string;
   legalRulesetVersion: string;
@@ -325,6 +344,8 @@ export interface ExecutionChainSummary {
   committedTotal: number;
   liquidatedTotal: number;
   paidTotal: number;
+  reversalsTotal?: number;
+  netPaidTotal?: number;
   billedTotal: number;
   deliveredVerifiedTotal: number;
   provenExecutionAvailable: boolean;
@@ -337,8 +358,11 @@ export interface FindingReviewRecord {
   findingId: string;
   action: 'dismiss' | 'restore';
   author: string;
+  actorId?: string;
+  actorRole?: string;
   rationale: string;
   ruleVersion: string;
+  findingInputsDigest?: string;
   createdAt: string;
 }
 
@@ -349,12 +373,20 @@ export interface RiskAssessment {
     | 'Revisão humana recomendada'
     | 'Atenção moderada'
     | 'Conformidade preliminar'
+    | 'Cobertura parcial — sem indícios nos itens verificados'
     | 'Cobertura insuficiente';
   coverageStatus?: 'ADEQUATE' | 'PARTIAL' | 'INSUFFICIENT';
   headline: string;
   variationPct: number;
   amendmentTotalPct: number;
   weightedPriceDeviationPct: number;
+  priceReferenceCoverage?: {
+    comparableItemCount: number;
+    totalItemCount: number;
+    comparableContractedTotal: number;
+    unreferencedContractedTotal: number;
+    comparableValueSharePct: number;
+  };
   appliedLegalRuleset: TemporalLegalRule;
   executionChain: ExecutionChainSummary;
   horizontalBenchmark?: HorizontalBenchmarkResult;
@@ -371,6 +403,14 @@ export interface RiskAssessment {
   engineVersion: string;
 }
 
+export interface PncpVerificationRecord {
+  queried: boolean;
+  status: 'completed_match' | 'completed_no_match' | 'not_queried' | 'source_unavailable';
+  queriedAt?: string;
+  querySummary?: string;
+  coverageNote?: string;
+}
+
 export interface ContractRecord {
   id: string;
   pncpControlNumber: string;
@@ -381,14 +421,15 @@ export interface ContractRecord {
   uf: string;
   entityId: string;
   entityName: string;
-  modality: 'Pregão Eletrônico' | 'Dispensa de Licitação' | 'Inexigibilidade' | 'Concorrência';
+  modality: 'Pregão Eletrônico' | 'Dispensa de Licitação' | 'Inexigibilidade' | 'Concorrência' | 'Não informada';
   executionRegime?: 'Empreitada por Preço Unitário' | 'Empreitada Global' | 'Integrado' | 'Semi-integrado' | 'Fornecimento Contínuo';
   dispensationArticle?: 'art75_I' | 'art75_II' | 'art75_p7' | 'art95_p2';
   branchClassificationRule?: string;
   branchClassificationUncertain?: boolean;
   riskMatrixPresent?: boolean;
   performanceBondPresent?: boolean;
-  biddersCount: number;
+  /** null means unknown / not provided by upstream source (never silently treated as 1 or 3) */
+  biddersCount: number | null;
   object: string;
   objectCategory: string;
   expectedCnaePrefixes: string[];
@@ -415,8 +456,11 @@ export interface ContractRecord {
     unitLabel: string;
     subjectNominalPrice: number;
     inflationIndexLabel: string;
+    mode?: 'same_supplier' | 'market';
     peers: BenchmarkPeer[];
   };
+  pncpVerification?: PncpVerificationRecord;
+  fieldProvenance?: Record<string, string>;
   cnpjRole?: 'fornecedor' | 'orgao_contratante' | 'subcontratado';
   dataSourceOrigin: 'PNCP API Oficial' | 'Espelho Municipal Licitarium' | 'Upload Documental';
 }
@@ -493,4 +537,10 @@ export interface SavedDossierSummary {
   savedAt: string;
   analystNote: string;
   sha256Digest: string;
+  hasSnapshot?: boolean;
+}
+
+export interface SavedDossierSnapshot extends SavedDossierSummary {
+  snapshotContract: EvaluatedContract | null;
+  snapshotReviews: FindingReviewRecord[];
 }

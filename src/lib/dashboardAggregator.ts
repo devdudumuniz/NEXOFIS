@@ -1,11 +1,12 @@
 import type { EvaluatedContract } from '../types/audit';
 
-export type RiskTier = 'low' | 'medium' | 'high';
+export type RiskTier = 'low' | 'medium' | 'high' | 'unverifiable';
 
 export interface RiskDistributionCounts {
   low: number;
   medium: number;
   high: number;
+  unverifiable: number;
   total: number;
   insufficientCoverage: number;
 }
@@ -18,6 +19,7 @@ export interface RiskGroupBreakdown {
   low: number;
   medium: number;
   high: number;
+  unverifiable: number;
   total: number;
   totalValue: number;
   avgScore: number;
@@ -77,9 +79,13 @@ export interface RiskDashboardSummary {
  * - Médio: 40 <= score < 70
  * - Baixo: score < 40
  */
-export function classifyRiskTier(score: number): RiskTier {
+export function classifyRiskTier(
+  score: number,
+  coverageStatus?: 'ADEQUATE' | 'PARTIAL' | 'INSUFFICIENT'
+): RiskTier {
   if (score >= 70) return 'high';
   if (score >= 40) return 'medium';
+  if (coverageStatus === 'INSUFFICIENT') return 'unverifiable';
   return 'low';
 }
 
@@ -138,6 +144,7 @@ interface InternalGroupAccumulator {
   low: number;
   medium: number;
   high: number;
+  unverifiable: number;
   total: number;
   totalValue: number;
   highRiskValue: number;
@@ -155,6 +162,7 @@ function finalizeGroups(map: Map<string, InternalGroupAccumulator>): RiskGroupBr
       low: g.low,
       medium: g.medium,
       high: g.high,
+      unverifiable: g.unverifiable,
       total: g.total,
       totalValue: Number(g.totalValue.toFixed(2)),
       avgScore: g.total > 0 ? Math.round(g.scoreSum / g.total) : 0,
@@ -176,6 +184,7 @@ export function aggregateRiskDashboard(
     low: 0,
     medium: 0,
     high: 0,
+    unverifiable: 0,
     total: contracts.length,
     insufficientCoverage: 0,
   };
@@ -201,7 +210,7 @@ export function aggregateRiskDashboard(
 
   for (const contract of contracts) {
     const score = contract.assessment.score;
-    const tier = classifyRiskTier(score);
+    const tier = classifyRiskTier(score, contract.assessment.coverageStatus);
     distribution[tier] += 1;
     if (contract.assessment.coverageStatus === 'INSUFFICIENT') {
       distribution.insufficientCoverage += 1;
@@ -228,6 +237,7 @@ export function aggregateRiskDashboard(
       low: 0,
       medium: 0,
       high: 0,
+      unverifiable: 0,
       total: 0,
       totalValue: 0,
       highRiskValue: 0,
@@ -250,6 +260,7 @@ export function aggregateRiskDashboard(
       low: 0,
       medium: 0,
       high: 0,
+      unverifiable: 0,
       total: 0,
       totalValue: 0,
       highRiskValue: 0,

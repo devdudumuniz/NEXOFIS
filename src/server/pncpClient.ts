@@ -1,4 +1,9 @@
 import crypto from 'node:crypto';
+import {
+  deriveMatrizCnpj as deriveMatrizCnpjShared,
+  isCnpjFormat,
+  normalizeCnpj,
+} from '../lib/cnpj';
 import type { ContractRecord } from '../types/audit';
 
 export interface PncpSearchItem {
@@ -49,48 +54,33 @@ export interface PncpCnpjSearchResult {
   retrievedAt: string;
 }
 
-function onlyDigits(val?: string | null): string {
-  return (val ?? '').replace(/\D/g, '');
-}
-
 /**
- * Given a 14-digit branch (filial) CNPJ (branch digits != '0001'),
- * deterministically computes the corresponding Matriz ('0001') CNPJ with valid Modulo-11 check digits.
+ * Derives the Matriz ('0001') CNPJ with valid Modulo-11 check digits for a branch (filial) CNPJ.
+ * Supports both legacy numeric and RFB 2026 alphanumeric CNPJs.
  * Returns null if the input is invalid or is already a Matriz ('0001').
  */
 export function deriveMatrizCnpj(rawCnpj?: string | null): string | null {
-  const digits = onlyDigits(rawCnpj);
-  if (!/^\d{14}$/.test(digits)) return null;
-  if (digits.slice(8, 12) === '0001') return null;
-
-  const base12 = `${digits.slice(0, 8)}0001`;
-  const w1 = [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2];
-  const sum1 = w1.reduce((acc, w, idx) => acc + Number(base12[idx]) * w, 0);
-  const rem1 = sum1 % 11;
-  const d1 = rem1 < 2 ? 0 : 11 - rem1;
-
-  const base13 = `${base12}${d1}`;
-  const w2 = [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2];
-  const sum2 = w2.reduce((acc, w, idx) => acc + Number(base13[idx]) * w, 0);
-  const rem2 = sum2 % 11;
-  const d2 = rem2 < 2 ? 0 : 11 - rem2;
-
-  return `${base13}${d2}`;
+  const clean = normalizeCnpj(rawCnpj);
+  if (!isCnpjFormat(clean)) return null;
+  if (clean.slice(8, 12) === '0001') return null;
+  return deriveMatrizCnpjShared(clean);
 }
 
-function mapModalityFromText(raw?: string): ContractRecord['modality'] {
-  const txt = (raw ?? '').toLowerCase();
-  if (txt.includes('dispensa')) return 'Dispensa de Licitação';
-  if (txt.includes('inexig') || txt.includes('credenc')) return 'Inexigibilidade';
-  if (txt.includes('concorr')) return 'Concorrência';
-  return 'Pregão Eletrônico';
+function mapModalityFromText(raw?: string): { modality: ContractRecord['modality']; inferred: boolean } {
+  const txt = (raw ?? '').trim().toLowerCase();
+  if (!txt) return { modality: 'Não informada', inferred: false };
+  if (txt.includes('dispensa')) return { modality: 'Dispensa de Licitação', inferred: true };
+  if (txt.includes('inexig') || txt.includes('credenc')) return { modality: 'Inexigibilidade', inferred: true };
+  if (txt.includes('concorr')) return { modality: 'Concorrência', inferred: true };
+  if (txt.includes('preg')) return { modality: 'Pregão Eletrônico', inferred: true };
+  return { modality: 'Não informada', inferred: false };
 }
 
-function parseIsoDate(raw?: string, fallback?: string): string {
+function parseIsoDateStrict(raw?: string): string {
   if (raw && /^\d{4}-\d{2}-\d{2}/.test(raw)) {
     return raw.slice(0, 10);
   }
-  return fallback ?? '';
+  return '';
 }
 
 function sleep(ms: number): Promise<void> {
@@ -143,27 +133,47 @@ export function classifyCnpjRoleInPncpItem(
   cnpj: string,
   item: PncpSearchItem
 ): 'fornecedor' | 'orgao_contratante' | 'subcontratado' | null {
-  const fornecedorDigits = onlyDigits(item.fornecedor_ni);
-  const orgaoDigits = onlyDigits(item.orgao_cnpj);
-  const subDigits = onlyDigits(item.fornecedor_subcontratado_ni);
+  const target = normalizeCnpj(cnpj);
+  if (!target) return null;
+  const fornecedorClean = normalizeCnpj(item.fornecedor_ni);
+  const orgaoClean = normalizeCnpj(item.orgao_cnpj);
+  const subClean = normalizeCnpj(item.fornecedor_subcontratado_ni);
 
-  if (fornecedorDigits === cnpj) return 'fornecedor';
-  if (orgaoDigits === cnpj) return 'orgao_contratante';
-  if (subDigits === cnpj) return 'subcontratado';
+  if (fornecedorClean === target) return 'fornecedor';
+  if (orgaoClean === target) return 'orgao_contratante';
+  if (subClean === target) return 'subcontratado';
   return null;
 }
 
+/**
+ * Maps a PNCP /api/search item to ContractRecord WITHOUT fabricating unknown fields (A02/A13):
+ * - Missing dates stay '' (never invented as YYYY-01-01 / YYYY-12-31)
+ * - Missing modality stays 'Não informada' (never defaulted to 'Pregão Eletrônico')
+ * - Missing biddersCount stays null (never guessed as 1 or 3)
+ * - Missing supplier openingDate/status/CNAE stay '' / 'DESCONHECIDA' (never '2020-01-01' / 'ATIVA')
+ */
 export function mapPncpSearchItemToContract(
   item: PncpSearchItem,
   role: 'fornecedor' | 'orgao_contratante' | 'subcontratado',
   retrievedAt: string
 ): ContractRecord {
-  const orgaoCnpj = onlyDigits(item.orgao_cnpj) || '00000000000000';
-  const fornecedorCnpj = onlyDigits(item.fornecedor_ni) || '00000000000000';
-  const year = Number(item.ano) || Number((item.data_assinatura ?? item.data_publicacao_pncp ?? '2026').slice(0, 4)) || 2026;
+  const orgaoCnpj = normalizeCnpj(item.orgao_cnpj) || '';
+  const fornecedorCnpj = normalizeCnpj(item.fornecedor_ni) || '';
+
+  const parsedYearFromField = Number(item.ano);
+  const parsedYearFromDate = Number(
+    (item.data_assinatura ?? item.data_inicio_vigencia ?? item.data_publicacao_pncp ?? '').slice(0, 4)
+  );
+  const year =
+    Number.isInteger(parsedYearFromField) && parsedYearFromField >= 2000 && parsedYearFromField <= 2100
+      ? parsedYearFromField
+      : Number.isInteger(parsedYearFromDate) && parsedYearFromDate >= 2000 && parsedYearFromDate <= 2100
+        ? parsedYearFromDate
+        : Number(retrievedAt.slice(0, 4)) || new Date().getUTCFullYear();
+
   const controlNumber =
     item.numero_controle_pncp?.trim() ||
-    `${orgaoCnpj}-2-${String(item.numero_sequencial ?? item.numero ?? '000001').padStart(6, '0')}/${year}`;
+    `${orgaoCnpj || 'SEM-CNPJ'}-2-${String(item.numero_sequencial ?? item.numero ?? '000001').padStart(6, '0')}/${year}`;
   const rawNum = String(item.numero ?? item.numero_sequencial ?? '').trim();
   const contractNumber = rawNum
     ? rawNum.includes('/')
@@ -171,32 +181,33 @@ export function mapPncpSearchItemToContract(
       : `${rawNum}/${year}`
     : item.title?.trim() || controlNumber;
 
-  const valorGlobal = Number(item.valor_global ?? 0);
-  const safeValue = Number.isFinite(valorGlobal) && valorGlobal >= 0 ? valorGlobal : 0;
+  const valorGlobal = Number(item.valor_global);
+  const hasValorGlobal = item.valor_global !== undefined && item.valor_global !== null && Number.isFinite(valorGlobal) && valorGlobal >= 0;
+  const safeValue = hasValorGlobal ? valorGlobal : 0;
 
-  const signatureDate = parseIsoDate(
-    item.data_assinatura ?? item.data_inicio_vigencia ?? item.data_publicacao_pncp,
-    `${year}-01-01`
-  );
-  const startDate = parseIsoDate(item.data_inicio_vigencia, signatureDate);
-  const endDate = parseIsoDate(item.data_fim_vigencia, `${year}-12-31`);
+  // Preserve exact upstream dates — NEVER invent YYYY-01-01 or YYYY-12-31
+  const signatureDate = parseIsoDateStrict(item.data_assinatura);
+  const startDate = parseIsoDateStrict(item.data_inicio_vigencia) || signatureDate;
+  const endDate = parseIsoDateStrict(item.data_fim_vigencia);
 
   const amparo = Array.isArray(item.amparo_legal_nome)
     ? item.amparo_legal_nome.filter(Boolean).join('; ')
     : item.amparo_legal_nome ?? '';
 
-  const modality = mapModalityFromText(
-    item.modalidade_licitacao_nome || amparo || item.title
+  const modalityMapped = mapModalityFromText(
+    item.modalidade_licitacao_nome || amparo
   );
 
   const ibgeCode =
     item.codigo_ibge && /^\d{7}$/.test(String(item.codigo_ibge))
       ? String(item.codigo_ibge)
-      : '0000000';
+      : '';
   const municipalityName = item.municipio_nome?.trim() || 'Município não informado no PNCP';
-  const uf = item.uf?.trim().toUpperCase() || 'BR';
+  const uf = item.uf?.trim().toUpperCase() || '';
   const entityName =
-    item.unidade_nome?.trim() || item.orgao_nome?.trim() || `Órgão CNPJ ${orgaoCnpj}`;
+    item.unidade_nome?.trim() ||
+    item.orgao_nome?.trim() ||
+    (orgaoCnpj ? `Órgão CNPJ ${orgaoCnpj}` : 'Órgão não informado no PNCP');
 
   const rawPayloadHash = crypto
     .createHash('sha256')
@@ -232,10 +243,21 @@ export function mapPncpSearchItemToContract(
     rawSituacao.includes('encerrad') ||
     rawSituacao.includes('concluid') ||
     rawSituacao.includes('finaliz') ||
-    (/^\d{4}-\d{2}-\d{2}$/.test(endDate) && endDate < todayIso)
+    (Boolean(endDate) && /^\d{4}-\d{2}-\d{2}$/.test(endDate) && endDate < todayIso)
   ) {
     mappedStatus = 'Encerrado';
   }
+
+  const fieldProvenance: Record<string, string> = {
+    signatureDate: signatureDate ? 'pncp:data_assinatura' : 'unknown',
+    startDate: item.data_inicio_vigencia ? 'pncp:data_inicio_vigencia' : signatureDate ? 'pncp:data_assinatura' : 'unknown',
+    endDate: endDate ? 'pncp:data_fim_vigencia' : 'unknown',
+    modality: modalityMapped.inferred ? 'pncp:modalidade_ou_amparo' : 'unknown',
+    biddersCount: 'unknown',
+    supplierRegistrationStatus: 'unknown',
+    supplierOpeningDate: 'unknown',
+    originalValue: hasValorGlobal ? 'pncp:valor_global' : 'unknown',
+  };
 
   return {
     id: safeId,
@@ -245,12 +267,12 @@ export function mapPncpSearchItemToContract(
     municipalityIbge: ibgeCode,
     municipalityName,
     uf,
-    entityId: `pncp-org-${orgaoCnpj}-${item.unidade_codigo ?? '01'}`,
+    entityId: `pncp-org-${orgaoCnpj || 'sem-cnpj'}-${item.unidade_codigo ?? '01'}`,
     entityName,
-    modality,
-    biddersCount: modality === 'Dispensa de Licitação' || modality === 'Inexigibilidade' ? 1 : 3,
+    modality: modalityMapped.modality,
+    biddersCount: null,
     object: item.description?.trim() || item.title?.trim() || 'Contrato público registrado no PNCP',
-    objectCategory: amparo ? `${modality} (${amparo})` : `${modality} · PNCP`,
+    objectCategory: amparo ? `${modalityMapped.modality} (${amparo})` : `${modalityMapped.modality} · PNCP`,
     expectedCnaePrefixes: [],
     signatureDate,
     startDate,
@@ -259,22 +281,31 @@ export function mapPncpSearchItemToContract(
     updatedValue: safeValue,
     status: mappedStatus,
     cnpjRole: role,
+    fieldProvenance,
+    pncpVerification: {
+      queried: true,
+      status: 'completed_match',
+      queriedAt: retrievedAt,
+      querySummary: `PNCP /api/search (${controlNumber})`,
+    },
     supplier: {
       cnpj: fornecedorCnpj,
-      legalName: item.fornecedor_nome?.trim() || `Fornecedor CNPJ ${fornecedorCnpj}`,
-      openingDate: '2020-01-01',
-      registrationStatus: 'ATIVA',
-      primaryCnaeCode: '0000-0/00',
-      primaryCnaeDescription: 'Dados contratuais PNCP (consulte enriquecimento CNPJ no dossiê)',
+      legalName:
+        item.fornecedor_nome?.trim() ||
+        (fornecedorCnpj ? `Fornecedor CNPJ ${fornecedorCnpj}` : 'Fornecedor não informado no PNCP'),
+      openingDate: '',
+      registrationStatus: 'DESCONHECIDA',
+      primaryCnaeCode: '',
+      primaryCnaeDescription: 'Não informado pelo endpoint de busca do PNCP',
       secondaryCnaes: [],
       shareCapital: 0,
-      municipality: municipalityName,
-      uf,
+      municipality: '',
+      uf: '',
       shareholders: [],
       sanctions: [],
       priorMunicipalContracts: 0,
-      simultaneousActiveContracts: 1,
-      dataProvenance: 'PNCP API Oficial de Busca (/api/search)',
+      simultaneousActiveContracts: 0,
+      dataProvenance: 'PNCP API Oficial de Busca (/api/search — dados cadastrais RFB não consultados)',
     },
     items: [],
     amendments: [],
@@ -285,16 +316,16 @@ export function mapPncpSearchItemToContract(
         sourceSystem: 'PNCP',
         externalId: controlNumber,
         retrievedAt,
-        effectiveAt: item.data_publicacao_pncp ?? signatureDate,
+        effectiveAt: parseIsoDateStrict(item.data_publicacao_pncp) || signatureDate || undefined,
         rawPayloadHash,
-        parserVersion: 'pncp-search-client-1.0',
+        parserVersion: 'pncp-search-client-2.0',
         reportedOriginalValue: safeValue,
         reportedUpdatedValue: safeValue,
         reportedSupplierCnpj: fornecedorCnpj,
         reportedStatus: item.situacao_nome?.trim() || 'Publicado no PNCP',
         reportedEndDate: endDate,
         sourceUrl,
-        notes: `Papel do CNPJ pesquisado: ${roleLabel} · Órgão CNPJ ${orgaoCnpj}${amparo ? ` · Amparo: ${amparo}` : ''}`,
+        notes: `Papel do CNPJ pesquisado: ${roleLabel} · Órgão CNPJ ${orgaoCnpj || 'não informado'}${amparo ? ` · Amparo: ${amparo}` : ''}`,
       },
     ],
     documents: [],
@@ -303,7 +334,7 @@ export function mapPncpSearchItemToContract(
 }
 
 /**
- * Queries PNCP national search API for ALL public contracts referencing a 14-digit CNPJ
+ * Queries PNCP national search API for ALL public contracts referencing a 14-char numeric or RFB 2026 alphanumeric CNPJ
  * across Brazil, paginating cleanly and strictly classifying role (fornecedor vs orgao_contratante vs subcontratado).
  * Never converts rate limits (429) or network errors into "0 contracts exist".
  */
@@ -311,12 +342,12 @@ export async function fetchPncpContractsByCnpj(
   rawCnpj: string,
   options?: { maxPages?: number; pageSize?: number }
 ): Promise<PncpCnpjSearchResult> {
-  const cnpj = onlyDigits(rawCnpj);
+  const cnpj = normalizeCnpj(rawCnpj);
   const retrievedAt = new Date().toISOString();
   const maxPages = Math.min(Math.max(options?.maxPages ?? 5, 1), 10);
   const pageSize = Math.min(Math.max(options?.pageSize ?? 50, 10), 100);
 
-  if (!/^\d{14}$/.test(cnpj)) {
+  if (!isCnpjFormat(cnpj)) {
     return {
       cnpj,
       status: 'unavailable',
@@ -326,7 +357,7 @@ export async function fetchPncpContractsByCnpj(
       partialCoverage: true,
       byRole: { fornecedor: 0, orgao_contratante: 0, subcontratado: 0 },
       records: [],
-      message: 'CNPJ inválido para consulta no PNCP.',
+      message: 'CNPJ inválido para consulta no PNCP (aceita 14 dígitos numéricos ou CNPJ alfanumérico RFB 2026).',
       retrievedAt,
     };
   }
@@ -372,7 +403,7 @@ export async function fetchPncpContractsByCnpj(
 
     for (const item of items) {
       const role = classifyCnpjRoleInPncpItem(cnpj, item);
-      if (!role) continue; // Ignore loose full-text mentions that are neither fornecedor, orgao nor subcontratado
+      if (!role) continue;
 
       const record = mapPncpSearchItemToContract(item, role, retrievedAt);
       if (seenControls.has(record.pncpControlNumber)) continue;

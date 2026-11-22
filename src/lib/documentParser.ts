@@ -1,4 +1,5 @@
 import type { ExtractionMethod } from '../types/audit';
+import { extractFormattedCnpjsFromText, isCnpjFormat, normalizeCnpj } from './cnpj';
 
 export interface ExtractedDocumentFields {
   contractNumber: string | null;
@@ -56,11 +57,11 @@ export function extractTabularContractRows(text: string): TabularContractRow[] {
     const contractNumber = codeMatch[0].replace(/\s+/g, '').toUpperCase();
     if (seen.has(contractNumber)) continue;
 
-    // Extract 11–14 digit CNPJ (raw or formatted)
-    const cnpjFormatted = line.match(/\b(\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2})\b/);
+    // Extract 14-char numeric or RFB 2026 alphanumeric CNPJ (formatted or raw)
+    const cnpjFormatted = extractFormattedCnpjsFromText(line)[0];
     const cnpjRaw = line.match(/\b(\d{13,14})\b/);
     const cnpj = cnpjFormatted
-      ? cnpjFormatted[1].replace(/\D/g, '')
+      ? cnpjFormatted.normalized
       : cnpjRaw
         ? cnpjRaw[1].padStart(14, '0')
         : undefined;
@@ -134,14 +135,14 @@ export function extractFieldsFromNativeText(
     });
   }
 
-  // CNPJ e.g. 27.841.920/0001-63
-  const cnpjMatch = text.match(/\b(\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2})\b/);
-  const cnpj = cnpjMatch ? cnpjMatch[1].replace(/\D/g, '') : null;
-  if (cnpjMatch && cnpj) {
+  // CNPJ (numeric legacy or RFB 2026 alphanumeric e.g. 00.000.000/E08G-12)
+  const extractedCnpj = extractFormattedCnpjsFromText(text)[0] ?? null;
+  const cnpj = extractedCnpj ? extractedCnpj.normalized : null;
+  if (extractedCnpj && cnpj) {
     excerpts.push({
       field: 'cnpj',
       pageNumber: 1,
-      excerpt: `CNPJ ${cnpjMatch[1]}`,
+      excerpt: `CNPJ ${extractedCnpj.raw}`,
       normalizedValue: cnpj,
     });
   }
@@ -286,6 +287,25 @@ export function validateUploadedFileMagic(
       : { valid: false, reason: 'Cabeçalho binário inválido para imagem JPEG.' };
   }
 
+  if (mimeType === 'image/webp') {
+    const riff = String.fromCharCode(...bytes.slice(0, 4));
+    const webp = String.fromCharCode(...bytes.slice(8, 12));
+    const ok = bytes.length >= 12 && riff === 'RIFF' && webp === 'WEBP';
+    return ok
+      ? { valid: true }
+      : { valid: false, reason: 'Cabeçalho binário inválido para imagem WEBP.' };
+  }
+
+  if (mimeType === 'image/tiff') {
+    const ok =
+      bytes.length >= 4 &&
+      ((bytes[0] === 0x49 && bytes[1] === 0x49 && bytes[2] === 0x2a && bytes[3] === 0x00) ||
+        (bytes[0] === 0x4d && bytes[1] === 0x4d && bytes[2] === 0x00 && bytes[3] === 0x2a));
+    return ok
+      ? { valid: true }
+      : { valid: false, reason: 'Cabeçalho binário inválido para imagem TIFF.' };
+  }
+
   if (mimeType === 'text/plain') {
     // Reject obvious binary files (NUL bytes in first 1024 bytes)
     const sample = bytes.slice(0, Math.min(bytes.length, 1024));
@@ -404,7 +424,8 @@ export function resolveDocumentContractMatch<
   }
 
   const numKey = normalizeKey(extracted.contractNumber);
-  const cnpjDigits = extracted.cnpj ? extracted.cnpj.replace(/\D/g, '') : '';
+  const cnpjClean = normalizeCnpj(extracted.cnpj);
+  const hasCnpj = isCnpjFormat(cnpjClean);
   const ibgeDigits = extracted.ibgeCode && /^\d{7}$/.test(extracted.ibgeCode) ? extracted.ibgeCode : '';
   const muniKey = normalizeKey(extracted.municipalityName);
 
@@ -421,8 +442,8 @@ export function resolveDocumentContractMatch<
         if (strong.length === 1) {
           return { status: 'matched', contract: strong[0], matchRule: 'contract_number+ibge' };
         }
-        if (strong.length > 1 && cnpjDigits) {
-          const stronger = strong.filter((c) => c.supplier.cnpj === cnpjDigits);
+        if (strong.length > 1 && hasCnpj) {
+          const stronger = strong.filter((c) => normalizeCnpj(c.supplier.cnpj) === cnpjClean);
           if (stronger.length === 1) {
             return {
               status: 'matched',
@@ -434,8 +455,8 @@ export function resolveDocumentContractMatch<
       }
 
       // 2b. contractNumber + supplier CNPJ
-      if (cnpjDigits.length === 14) {
-        const strong = byNumber.filter((c) => c.supplier.cnpj === cnpjDigits);
+      if (hasCnpj) {
+        const strong = byNumber.filter((c) => normalizeCnpj(c.supplier.cnpj) === cnpjClean);
         if (strong.length === 1) {
           return { status: 'matched', contract: strong[0], matchRule: 'contract_number+cnpj' };
         }
@@ -468,13 +489,13 @@ export function resolveDocumentContractMatch<
   }
 
   // 3. Supplier CNPJ alone NEVER auto-attaches (a supplier may hold many contracts)
-  if (cnpjDigits.length === 14) {
-    const byCnpj = existingContracts.filter((c) => c.supplier.cnpj === cnpjDigits);
+  if (hasCnpj) {
+    const byCnpj = existingContracts.filter((c) => normalizeCnpj(c.supplier.cnpj) === cnpjClean);
     if (byCnpj.length > 0) {
       return {
         status: 'ambiguous',
         candidates: byCnpj.slice(0, 10).map(toCandidate),
-        reason: `Apenas o CNPJ ${cnpjDigits} coincidiu com ${byCnpj.length} contrato(s) no repositório sem número de contrato compatível; vinculação automática bloqueada.`,
+        reason: `Apenas o CNPJ ${cnpjClean} coincidiu com ${byCnpj.length} contrato(s) no repositório sem número de contrato compatível; vinculação automática bloqueada.`,
       };
     }
   }

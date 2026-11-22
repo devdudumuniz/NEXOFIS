@@ -1,3 +1,5 @@
+import { formatCnpjValue } from './cnpj';
+
 export function formatCurrencyBRL(value: number): string {
   return new Intl.NumberFormat('pt-BR', {
     style: 'currency',
@@ -39,9 +41,7 @@ export function formatDateBR(isoDate: string): string {
 }
 
 export function formatCnpj(raw: string): string {
-  const digits = raw.replace(/\D/g, '');
-  if (digits.length !== 14) return raw;
-  return `${digits.slice(0, 2)}.${digits.slice(2, 5)}.${digits.slice(5, 8)}/${digits.slice(8, 12)}-${digits.slice(12, 14)}`;
+  return formatCnpjValue(raw);
 }
 
 export function normalizeSearchText(input: string): string {

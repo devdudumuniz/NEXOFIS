@@ -2,21 +2,30 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 @theme {
-  --font-display: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
-  --font-sans: "Public Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Manrope", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Manrope", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --color-nexofis-navy: #0B2540;
+  --color-nexofis-orange: #D95B35;
+  --color-nexofis-paper: #FAF9F5;
+  --color-nexofis-frost: #E8F1F6;
+  --color-nexofis-ink-dark: #061321;
+  --color-nexofis-surface-dark: #0B1D31;
+  --color-nexofis-elevated-dark: #102843;
+  --color-nexofis-border-dark: #1D3A57;
 }
 
 @layer base {
   html {
     font-family: var(--font-sans);
-    color: #0f172a;
-    background-color: #f8fafc;
+    color: #0B2540;
+    background-color: #FAF9F5;
   }
 
   html.dark {
-    color: #f1f5f9;
-    background-color: #0b1120;
+    color: #FAF9F5;
+    background-color: #061321;
     letter-spacing: 0.005em;
   }
 

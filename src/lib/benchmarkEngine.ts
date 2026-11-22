@@ -125,7 +125,11 @@ export function evaluateHorizontalBenchmark(params: {
   const seenKeys = new Set<string>();
   let duplicateExclusions = 0;
 
-  const normalizedPeers: BenchmarkPeer[] = params.peers.map((p) => {
+  const stagedPeers: Array<{
+    peer: BenchmarkPeer;
+    comparableNominal: number;
+    adjustedPrice: number;
+  }> = params.peers.map((p) => {
     const key = peerIdentityKey(p);
     let included = p.included;
     let exclusionReason = p.exclusionReason;
@@ -177,10 +181,30 @@ export function evaluateHorizontalBenchmark(params: {
     }
 
     return {
-      ...p,
-      inflationAdjustedPrice: included && Number.isFinite(adj.value) ? adj.value : p.inflationAdjustedPrice,
-      included,
-      exclusionReason,
+      peer: {
+        ...p,
+        included,
+        exclusionReason,
+      },
+      comparableNominal: Number(comparableNominal.toFixed(2)),
+      adjustedPrice: adj.value,
+    };
+  });
+
+  // CRITICAL (A04/R5): If ANY included observation or the subject lacks an IPCA factor,
+  // compare strictly in NOMINAL terms across BOTH subject and ALL peers (never mix adjusted + nominal).
+  const effectiveSubjectPrice = allInflationResolved
+    ? subjectAdj.value
+    : Number(params.subjectNominalPrice.toFixed(2));
+
+  const normalizedPeers: BenchmarkPeer[] = stagedPeers.map((entry) => {
+    const effectivePrice = allInflationResolved ? entry.adjustedPrice : entry.comparableNominal;
+    return {
+      ...entry.peer,
+      inflationAdjustedPrice:
+        entry.peer.included && Number.isFinite(effectivePrice)
+          ? effectivePrice
+          : entry.peer.inflationAdjustedPrice,
     };
   });
 
@@ -188,7 +212,7 @@ export function evaluateHorizontalBenchmark(params: {
   const excludedCount = normalizedPeers.length - eligible.length;
   const inflationSummary = allInflationResolved
     ? `série versionada (${params.inflationIndexLabel})`
-    : 'comparação nominal (série IPCA indisponível para parte dos anos)';
+    : 'comparação nominal pura (série IPCA indisponível para parte dos anos; nenhuma deflação aplicada)';
   const supplierModeSummary =
     mode === 'same_supplier'
       ? 'mesmo fornecedor (identidade exigida)'
@@ -204,7 +228,7 @@ export function evaluateHorizontalBenchmark(params: {
       serviceClass: params.serviceClass,
       unitLabel: params.unitLabel,
       subjectNominalPrice: params.subjectNominalPrice,
-      subjectAdjustedPrice: subjectAdj.value,
+      subjectAdjustedPrice: effectiveSubjectPrice,
       inflationIndexApplied: allInflationResolved ? params.inflationIndexLabel : 'Nominal (sem deflação)',
       inflationApplied: allInflationResolved,
       peerCount: eligible.length,
@@ -235,13 +259,13 @@ export function evaluateHorizontalBenchmark(params: {
   const peerMedian = Number(computeMedian(peerPrices).toFixed(2));
   const rawMad = computeMAD(peerPrices, peerMedian);
   const madZero = rawMad === 0;
-  const peerRatio = peerMedian > 0 ? Number((subjectAdj.value / peerMedian).toFixed(2)) : null;
+  const peerRatio = peerMedian > 0 ? Number((effectiveSubjectPrice / peerMedian).toFixed(2)) : null;
 
   // When MAD === 0 (all comparable peers share the exact median), robust z-score is undefined (null)
   // rather than artificially inflated via an arbitrary epsilon floor.
   const robustZ = madZero
     ? null
-    : Number(((0.6745 * (subjectAdj.value - peerMedian)) / rawMad).toFixed(2));
+    : Number(((0.6745 * (effectiveSubjectPrice - peerMedian)) / rawMad).toFixed(2));
 
   const isRobustSample = eligible.length >= 8;
   const isHighOutlier =
@@ -260,18 +284,18 @@ export function evaluateHorizontalBenchmark(params: {
     state = 'OBSERVATION';
     evidenceLevel = 'B';
     statement = madZero
-      ? `Preço normalizado (${peerRatio?.toFixed(2)}× a mediana; MAD = 0 — todos os ${eligible.length} comparáveis idênticos) acima do grupo comparável (regra de triagem, não prova de sobrepreço).`
-      : `Preço normalizado (${peerRatio?.toFixed(2)}× a mediana dos peers, z robusto = ${robustZ?.toFixed(2)}) acima do grupo comparável (n = ${eligible.length} observações independentes).`;
+      ? `Preço ${allInflationResolved ? 'normalizado' : 'nominal'} (${peerRatio?.toFixed(2)}× a mediana; MAD = 0 — todos os ${eligible.length} comparáveis idênticos) acima do grupo comparável (regra de triagem, não prova de sobrepreço).`
+      : `Preço ${allInflationResolved ? 'normalizado' : 'nominal'} (${peerRatio?.toFixed(2)}× a mediana dos peers, z robusto = ${robustZ?.toFixed(2)}) acima do grupo comparável (n = ${eligible.length} observações independentes).`;
   } else if (isMediumOutlier) {
     state = 'OBSERVATION';
     evidenceLevel = isRobustSample ? 'B' : 'C';
     statement = isRobustSample
-      ? `Preço normalizado ${peerRatio?.toFixed(2)}× acima da mediana comparável (${madZero ? 'MAD = 0' : `z robusto = ${robustZ?.toFixed(2)}`}, n = ${eligible.length}).`
+      ? `Preço ${allInflationResolved ? 'normalizado' : 'nominal'} ${peerRatio?.toFixed(2)}× acima da mediana comparável (${madZero ? 'MAD = 0' : `z robusto = ${robustZ?.toFixed(2)}`}, n = ${eligible.length}).`
       : `Sinal preliminar com amostra reduzida (4 ≤ n = ${eligible.length} < 8): preço ${peerRatio?.toFixed(2)}× acima da mediana comparável.`;
   } else {
     state = 'CONFIRMED_DATA';
     evidenceLevel = isRobustSample ? 'B' : 'C';
-    statement = `Preço normalizado dentro da faixa estatística observada frente à mediana comparável (razão ${peerRatio?.toFixed(2)}×, ${madZero ? 'MAD = 0' : `z robusto = ${robustZ?.toFixed(2)}`}, n = ${eligible.length}).`;
+    statement = `Preço ${allInflationResolved ? 'normalizado' : 'nominal'} dentro da faixa estatística observada frente à mediana comparável (razão ${peerRatio?.toFixed(2)}×, ${madZero ? 'MAD = 0' : `z robusto = ${robustZ?.toFixed(2)}`}, n = ${eligible.length}).`;
   }
 
   return {
@@ -283,7 +307,7 @@ export function evaluateHorizontalBenchmark(params: {
     serviceClass: params.serviceClass,
     unitLabel: params.unitLabel,
     subjectNominalPrice: params.subjectNominalPrice,
-    subjectAdjustedPrice: subjectAdj.value,
+    subjectAdjustedPrice: effectiveSubjectPrice,
     inflationIndexApplied: allInflationResolved ? params.inflationIndexLabel : 'Nominal (sem deflação)',
     inflationApplied: allInflationResolved,
     peerCount: eligible.length,

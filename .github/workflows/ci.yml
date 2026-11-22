@@ -17,16 +17,23 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
 
-      - name: Run unit and regression tests
-        run: node --import tsx --test src/lib/*.test.ts
+      - name: Install dependencies (frozen lockfile)
+        run: bun install --frozen-lockfile
 
       - name: Typecheck (lint)
         run: npm run lint
 
+      - name: Run unit and audit regression tests
+        run: npm test
+
       - name: Production build
         run: npm run build
+
+      - name: Real HTTP API smoke test (production fail-closed auth + persistence)
+        run: npx tsx scripts/smoke-api.ts

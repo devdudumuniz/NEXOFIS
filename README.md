@@ -1,71 +1,95 @@
+<p align="left">
+  <img src="./public/brand/nexofis-logo-horizontal.svg" alt="NEXOFIS — Auditoria Forense de Contratos Públicos" height="44" />
+</p>
+
 # NEXOFIS
 
 Plataforma brasileira de auditoria forense e análise reprodutível de contratos públicos municipais e nacionais, desenvolvida por **Eduardo Muniz — DM Technology**.
 
+## Princípios de Integridade Forense
+
+- **Zero dados fictícios em produção**: o servidor inicia sobre banco SQLite limpo, sem municípios pré-selecionados, sem consultas rápidas embutidas e sem documentos de demonstração injetados.
+- **Não fabricação de campos ausentes**: datas de assinatura/vigência, número de participantes, situação cadastral, cobertura no PNCP e execução financeira nunca são preenchidos com valores inventados.
+- **Separação estrita entre obrigação contratada e execução comprovada**: ausência de notas de empenho ou pagamentos é exibida explicitamente como `Não verificado (sem execução financeira coletada)`, nunca como `R$ 0,00`.
+- **Cobertura evidenciária declarada**: contratos sem fontes ou documentos suficientes são classificados como `Cobertura insuficiente` e nunca entram no balde de `Baixo Risco` ou conformidade regular.
+- **Identidade de achado estável e snapshots imutáveis**: cada achado possui `findingId` semântico + `inputsDigest` SHA-256; dossiês arquivados preservam o snapshot completo do contrato e das revisões no momento do arquivamento.
+
 ## Principais Recursos
 
-- **Busca Nacional por CNPJ (`GET /api/cnpj/:cnpj/contracts` e aba Contrato)**: consulta paginada em tempo real na API oficial de busca do PNCP (`/api/search/?q={cnpj}&tipos_documento=contrato`), separando explicitamente o papel do CNPJ (**Fornecedor**, **Órgão Contratante** ou **Subcontratado**), combinada com o índice local persistido em SQLite e enriquecimento cadastral via provedores intermediários (`publica.cnpj.ws` / `BrasilAPI`).
-- **Resolução Territorial IBGE (5.571 municípios)**: mapeamento por município, código IBGE de 7 dígitos, secretarias e fundos municipais.
-- **Persistência Durável em SQLite (`data/nexofis.db`)**: usa `node:sqlite` em modo WAL com migrações versionadas (`schema_migrations`) para contratos sincronizados, dossiês salvos, checkpoints de sincronização, artefatos documentais por SHA-256 e revisões humanas *append-only* (`finding_reviews`).
-- **Motor Forense Determinístico**:
-  - **Viagem Temporal Normativa**: aplica estritamente os tetos vigentes na data da assinatura (Decretos nº 11.871/2024, 12.343/2025 e 12.807/2026) e recusa fallback silencioso em datas ausentes, inválidas ou fora da cobertura (`BR-LEGAL-INCONCLUSIVE`).
-  - **Benchmarking Horizontal (Mediana/MAD)**: suporta modos `same_supplier` e `market`, deduplicação de contratos repetidos, verificação de compatibilidade de unidade e tratamento explícito de `MAD = 0` e inflação nominal.
-  - **Execução Financeira e OCDS 1.1**: separa obrigação contratada de execução comprovada (empenho, liquidação, pagamento), deduplica lançamentos entre portais e exporta `contracts[].implementation.transactions` contendo apenas pagamentos efetivos.
-  - **Cobertura Evidenciária Declarada**: recusa classificar contratos sem fontes e sem documentos como regulares (`Cobertura insuficiente`).
-- **Pipeline Documental Auditável**: validação real de assinatura binária (magic bytes), deduplicação por SHA-256, extração nativa de PDF (`FlateDecode` via `node:zlib` com contagem real de páginas), vinculação estrita por chave composta (nunca anexa automaticamente apenas por CNPJ ou número ambíguo) e fallback multimodal opcional.
+- **Busca Nacional por CNPJ (`GET /api/cnpj/:cnpj/contracts` e aba Contrato)**: suporta CNPJ numérico tradicional e **CNPJ alfanumérico (RFB 2026)**, consultando a API oficial do PNCP e o índice local persistido em SQLite, com enriquecimento cadastral via provedores intermediários (`publica.cnpj.ws` / `BrasilAPI`).
+- **Resolução Territorial IBGE (5.571 municípios)**: mapeamento por município, código IBGE de 7 dígitos, secretarias, fundos municipais e indicadores SICONFI.
+- **Persistência Durável em SQLite WAL (`data/nexofis.db`)**: usa `node:sqlite` em modo WAL com migrações aditivas (`schema_migrations`), armazenamento content-addressed dos arquivos originais enviados (`data/objects/<sha256>`), revisões *append-only* (`finding_reviews`) com autor derivado do servidor, e fila de jobs durável.
+- **Motor Forense Determinístico (`forensic-engine-2026.13`)**:
+  - **Viagem Temporal Normativa**: aplica os tetos vigentes na data da assinatura (Decretos nº 11.871/2024, 12.343/2025 e 12.807/2026) e recusa fallback silencioso em datas ausentes ou inválidas (`BR-LEGAL-INCONCLUSIVE`).
+  - **Benchmarking Horizontal (Mediana/MAD)**: modos `same_supplier` e `market`, proteção contra mistura de valores nominais e corrigidos por inflação, e suporte explícito a `MAD = 0` (`robustZ: null`, `peerRatio`).
+  - **Sanções (CEIS/CNEP/CEPIM)**: diferencia multa pecuniária (`fine_only`) de impedimento de contratar (`impediment`), vigência na data da assinatura e abrangência federativa.
+  - **Execução Financeira e OCDS 1.1**: preservação de pagamentos sem número de documento, contabilização de estornos (`isReversal`) e validação de fila cronológica (art. 141 da Lei nº 14.133/2021).
+- **Pipeline Documental & OCR Auditável**: validação real de magic bytes (PDF, PNG, JPEG, WebP, TIFF), defesa contra PDF zip-bomb com limites explícitos (`maxOutputLength`, tempo e páginas), deduplicação por SHA-256, preservação do binário original (`GET /api/documents/:sha256/original`), suporte a **Docling Serve** e **PaddleOCR Worker** (com fallback nativo e multimodal devidamente rotulados).
+- **Interface Operacional com Brandkit v1.0**: menu lateral retrátil, tema Claro e Escuro (`Manrope` + `IBM Plex Mono`), URLs compartilháveis com hidratação de estado e exportação em **PDF**, **Markdown** e **OCDS 1.1 JSON**.
+- **Autenticação Fail-Closed em Produção (RBAC)**: tokens Bearer HMAC-SHA256 mantidos apenas em memória no navegador (nunca em `localStorage`), com papéis `admin`, `auditor` e `viewer`, bootstrap do primeiro administrador (`/api/auth/bootstrap-admin`) e ator de revisão sempre derivado da sessão autenticada.
 
-## Execução Local (Linux e Windows)
+## Execução Local (Linux, macOS e Windows)
 
 ### Pré-requisitos
-- Node.js `>= 22.14` (recomendado `22.23+` com `node:sqlite` nativo) ou Bun.
+- Node.js `>= 22.14` (recomendado `22.23+` com `node:sqlite` nativo) ou Bun `>= 1.2`.
 
 ### Instalação e Execução
 
 ```bash
 cp .env.example .env
-npm install
+bun install --frozen-lockfile   # ou: npm install
 npm run dev
 ```
 
-No **Windows (PowerShell)**:
+A aplicação ficará disponível em `http://localhost:3000`.
 
-```powershell
-Copy-Item .env.example .env
-npm install
-npm run dev
-```
-
-A aplicação fica disponível em `http://localhost:3000`.
-
-### Testes, Lint e Build
+### Testes, Lint, Build e Smoke Test HTTP
 
 ```bash
-node --import tsx --test src/lib/*.test.ts
 npm run lint
+npm test
 npm run build
+npx tsx scripts/smoke-api.ts
 ```
 
-### Backup, Produção (Docker + PostgreSQL + Docling/PaddleOCR) e Publicação no GitHub
+## Execução em Container (Docker)
 
-O banco local persistente fica em `data/nexofis.db`. Para operar a pilha completa de produção (**PostgreSQL 16**, **Docling Serve**, **Worker PaddleOCR Python**, **RBAC opt-in**, **conectores CGU/SICONFI**, backup/restauração e scripts de push para o GitHub), consulte [`docs/ARQUITETURA_E_OPERACAO.md`](./docs/ARQUITETURA_E_OPERACAO.md):
+### Modo Standalone (SQLite WAL + Extrator Nativo)
+
+Defina `NEXOFIS_SESSION_SECRET` (mínimo 32 caracteres) no `.env` e execute:
 
 ```bash
-# Pilha completa via Docker Compose (Postgres + Docling + PaddleOCR + App)
 docker compose up --build -d
-
-# Backup / restauração (SQLite ou PostgreSQL)
-bash scripts/backup-restore.sh backup-sqlite
-bash scripts/backup-restore.sh backup-postgres
-
-# Publicação segura no GitHub (testes + lint + build + checagem de segredos)
-bash scripts/publish-github.sh "feat: atualiza NEXOFIS"
 ```
 
-## Cobertura e Limitações Conhecidas
+### Modo Completo com OCR Distribuído (Docling Serve + PaddleOCR) e/ou PostgreSQL
 
-- **PNCP**: A busca nacional por CNPJ captura contratos **publicados no PNCP**. Contratos municipais publicados apenas em Diários Oficiais locais ou portais próprios (ex.: parte das inexigibilidades do FMS de Barra do Choça/BA) não aparecem na API pública do PNCP e constam no NEXOFIS apenas quando importados via PDF/extrato ou indexados localmente.
-- **Cadastro CNPJ**: `publica.cnpj.ws` e `BrasilAPI` são **provedores intermediários** da base pública da Receita Federal; o NEXOFIS identifica explicitamente essa proveniência.
-- **Serviços Externos de Produção**: `docker-compose.yml`, `db/migrations/001_initial_schema.sql`, `src/server/postgresStore.ts`, `src/server/doclingClient.ts`, `worker/ocr_worker.py` e `src/server/connectors/portalTransparenciaClient.ts` estão integrados no repositório para execução no ambiente do usuário (quando offline ou sem chaves no `.env`, o sistema opera honestamente sobre SQLite + extrator nativo de PDF sem simular respostas).
+```bash
+docker compose --profile full-ocr up --build -d
+# ou com PostgreSQL:
+docker compose --profile full-ocr --profile postgres up --build -d
+```
+
+### Backup e Restauração Consistente (SQLite WAL + Objetos Originais)
+
+O script `scripts/backup-restore.sh` usa `VACUUM INTO` + `PRAGMA integrity_check` para garantir consistência mesmo com escrita ativa em modo WAL, preservando também os arquivos originais em `data/objects/`:
+
+```bash
+bash scripts/backup-restore.sh backup-sqlite
+bash scripts/backup-restore.sh restore-sqlite backups/<arquivo>.db
+```
+
+## Arquitetura, Contribuição e Matriz de Rastreabilidade
+
+- Guia operacional e arquitetura: [`docs/ARQUITETURA_E_OPERACAO.md`](./docs/ARQUITETURA_E_OPERACAO.md)
+- Guia de contribuição: [`CONTRIBUTING.md`](./CONTRIBUTING.md)
+- Matriz de rastreabilidade da auditoria (A01–A15 / UI-01–UI-08): [`docs/MATRIZ_RASTREABILIDADE.md`](./docs/MATRIZ_RASTREABILIDADE.md)
+
+## Limitações e Escopo dos Conectores Externos
+
+- **PNCP**: a busca nacional captura contratos publicados no PNCP. Contratos publicados apenas em Diários Oficiais locais constam no NEXOFIS mediante importação documental.
+- **Cadastro CNPJ**: `publica.cnpj.ws` e `BrasilAPI` atuam como provedores intermediários da base pública da Receita Federal.
+- **Serviços Externos Opcionais**: **Docling Serve**, **PaddleOCR Worker**, **Portal da Transparência (CGU)** e **PostgreSQL** dependem de execução/configuração no ambiente do operador; quando ausentes, o NEXOFIS declara o estado real de indisponibilidade sem simular resultados.
 
 ## Licença e Governança
 

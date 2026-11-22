@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SEED_CONTRACTS } from '../data/brazilianSeedData';
+import { FIXTURE_COMPLIANT } from './__fixtures__/testContracts';
 import type { BenchmarkPeer, ContractRecord } from '../types/audit';
 import { evaluateHorizontalBenchmark } from './benchmarkEngine';
 import {
@@ -11,8 +11,7 @@ import {
 import { evaluateContractRisk } from './riskEngine';
 
 function cloneBaseContract(): ContractRecord {
-  const base = SEED_CONTRACTS.find((c) => c.id === 'FSA-2026-041')!;
-  return JSON.parse(JSON.stringify(base)) as ContractRecord;
+  return JSON.parse(JSON.stringify(FIXTURE_COMPLIANT)) as ContractRecord;
 }
 
 // 1. BENCHMARK REGRESSION SUITE (true_outlier, scope_mismatch, sample_too_small)

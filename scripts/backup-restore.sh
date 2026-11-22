@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# NEXOFIS — Backup e Restauração (SQLite local ou PostgreSQL)
+# NEXOFIS — Backup e Restauração Consistentes (SQLite WAL-safe ou PostgreSQL)
+# Licença: GNU AGPL-3.0-only (Eduardo Muniz — DM Technology)
+#
 # Uso:
 #   ./scripts/backup-restore.sh backup-sqlite
 #   ./scripts/backup-restore.sh restore-sqlite backups/nexofis-YYYYMMDD-HHMMSS.db
@@ -14,6 +16,75 @@ TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="${NEXOFIS_BACKUP_DIR:-backups}"
 mkdir -p "$BACKUP_DIR"
 
+run_node_sqlite_backup() {
+  local src="$1"
+  local dest="$2"
+  node --input-type=module - "$src" "$dest" <<'EOF'
+import fs from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+
+const [src, dest] = process.argv.slice(2);
+if (fs.existsSync(dest)) fs.unlinkSync(dest);
+
+const srcDb = new DatabaseSync(src);
+try {
+  // VACUUM INTO creates a single self-contained, transactionally consistent SQLite snapshot
+  // capturing all committed WAL transactions without locking readers or copying raw -wal/-shm files.
+  const escapedDest = dest.replace(/'/g, "''");
+  srcDb.exec(`VACUUM INTO '${escapedDest}';`);
+} finally {
+  srcDb.close();
+}
+
+// Verify integrity of the snapshot immediately
+const checkDb = new DatabaseSync(dest, { readOnly: true });
+try {
+  const res = checkDb.prepare('PRAGMA integrity_check;').get();
+  if (!res || res.integrity_check !== 'ok') {
+    throw new Error(`Integrity check falhou no backup: ${JSON.stringify(res)}`);
+  }
+  const tables = checkDb
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+    .all();
+  const counts = {};
+  for (const t of tables) {
+    const row = checkDb.prepare(`SELECT COUNT(*) AS cnt FROM "${t.name}"`).get();
+    counts[t.name] = Number(row.cnt);
+  }
+  console.log(`Snapshot SQLite verificado (PRAGMA integrity_check=ok): ${JSON.stringify(counts)}`);
+} finally {
+  checkDb.close();
+}
+EOF
+}
+
+run_node_sqlite_verify() {
+  local dbfile="$1"
+  node --input-type=module - "$dbfile" <<'EOF'
+import { DatabaseSync } from 'node:sqlite';
+
+const [dbfile] = process.argv.slice(2);
+const db = new DatabaseSync(dbfile, { readOnly: true });
+try {
+  const res = db.prepare('PRAGMA integrity_check;').get();
+  if (!res || res.integrity_check !== 'ok') {
+    throw new Error(`Arquivo SQLite corrompido ou inválido: ${JSON.stringify(res)}`);
+  }
+  const tables = db
+    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+    .all();
+  const counts = {};
+  for (const t of tables) {
+    const row = db.prepare(`SELECT COUNT(*) AS cnt FROM "${t.name}"`).get();
+    counts[t.name] = Number(row.cnt);
+  }
+  console.log(`Integridade verificada (ok): ${JSON.stringify(counts)}`);
+} finally {
+  db.close();
+}
+EOF
+}
+
 case "$ACTION" in
   backup-sqlite)
     SRC="${NEXOFIS_SQLITE_PATH:-data/nexofis.db}"
@@ -22,10 +93,15 @@ case "$ACTION" in
       exit 1
     fi
     DEST="$BACKUP_DIR/nexofis-$TIMESTAMP.db"
-    cp "$SRC" "$DEST"
-    [ -f "${SRC}-wal" ] && cp "${SRC}-wal" "${DEST}-wal"
-    [ -f "${SRC}-shm" ] && cp "${SRC}-shm" "${DEST}-shm"
-    echo "Backup SQLite salvo em: $DEST"
+    run_node_sqlite_backup "$SRC" "$DEST"
+
+    # Also archive durable original objects store if present alongside SQLite
+    OBJ_DIR="$(dirname "$SRC")/objects"
+    if [ -d "$OBJ_DIR" ] && [ -n "$(ls -A "$OBJ_DIR" 2>/dev/null || true)" ]; then
+      tar -czf "${DEST}.objects.tar.gz" -C "$(dirname "$SRC")" objects
+      echo "Arquivos originais (objects/) empacotados em: ${DEST}.objects.tar.gz"
+    fi
+    echo "Backup SQLite consistente salvo em: $DEST"
     ;;
 
   restore-sqlite)
@@ -34,10 +110,32 @@ case "$ACTION" in
       exit 1
     fi
     DEST="${NEXOFIS_SQLITE_PATH:-data/nexofis.db}"
-    mkdir -p "$(dirname "$DEST")"
-    cp "$TARGET" "$DEST"
+    DEST_DIR="$(dirname "$DEST")"
+    mkdir -p "$DEST_DIR"
+
+    echo "Verificando integridade do backup antes da restauração..."
+    run_node_sqlite_verify "$TARGET"
+
+    # Stage restore atomically and preserve a pre-restore copy of the current DB
+    STAGED="${DEST}.restore-staged.$$"
+    cp "$TARGET" "$STAGED"
+    if [ -f "$DEST" ]; then
+      cp "$DEST" "${DEST}.pre-restore-${TIMESTAMP}.bak"
+    fi
+
+    # Remove old WAL/SHM sidecars ONLY together with replacing the database with the verified self-contained snapshot
     rm -f "${DEST}-wal" "${DEST}-shm"
-    echo "Banco SQLite restaurado em: $DEST (reinicie o servidor NEXOFIS)."
+    mv -f "$STAGED" "$DEST"
+
+    echo "Verificando banco restaurado..."
+    run_node_sqlite_verify "$DEST"
+
+    # Restore objects/ archive if present next to backup
+    if [ -f "${TARGET}.objects.tar.gz" ]; then
+      tar -xzf "${TARGET}.objects.tar.gz" -C "$DEST_DIR"
+      echo "Objetos originais (objects/) restaurados em: $DEST_DIR/objects"
+    fi
+    echo "Banco SQLite restaurado com sucesso em: $DEST (reinicie o servidor NEXOFIS se estiver em execução)."
     ;;
 
   backup-postgres)

@@ -4,7 +4,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
-import { SEED_CONTRACTS } from '../data/brazilianSeedData';
+import {
+  FIXTURE_COMPLIANT,
+  FIXTURE_HIGH_RISK,
+  TEST_FIXTURE_CONTRACTS,
+} from './__fixtures__/testContracts';
 import type { BenchmarkPeer, ContractRecord } from '../types/audit';
 import { evaluateHorizontalBenchmark } from './benchmarkEngine';
 import {
@@ -125,7 +129,7 @@ test('Legal ruleset returns inconclusive (never silent fallback) for missing, in
 });
 
 test('Risk engine refuses Conformidade preliminar when contract has zero sources and zero documents', () => {
-  const base = SEED_CONTRACTS.find((c) => c.id === 'FSA-2026-041')!;
+  const base = FIXTURE_COMPLIANT;
   const emptyContract: ContractRecord = {
     ...base,
     id: 'EMPTY-TEST-01',
@@ -141,11 +145,11 @@ test('Risk engine refuses Conformidade preliminar when contract has zero sources
 
   assert.equal(assessment.coverageStatus, 'INSUFFICIENT');
   assert.equal(assessment.classification, 'Cobertura insuficiente');
-  assert.ok(assessment.headline.includes('cobertura insuficiente'));
+  assert.ok(assessment.headline.toLowerCase().includes('cobertura insuficiente'));
 });
 
 test('Risk engine marks mandatory risk matrix with undefined presence as NOT_VERIFIABLE (not NOT_APPLICABLE)', () => {
-  const base = SEED_CONTRACTS.find((c) => c.id === 'FSA-2026-041')!;
+  const base = FIXTURE_COMPLIANT;
   const integratedUnknown: ContractRecord = {
     ...base,
     executionRegime: 'Integrado',
@@ -159,7 +163,7 @@ test('Risk engine marks mandatory risk matrix with undefined presence as NOT_VER
 });
 
 test('Risk engine deduplicates duplicate payments and keeps Empenho+Liquidação+Pagamento separate without summing to 300', () => {
-  const base = SEED_CONTRACTS.find((c) => c.id === 'FSA-2026-041')!;
+  const base = FIXTURE_COMPLIANT;
   const contract: ContractRecord = {
     ...base,
     payments: [
@@ -179,7 +183,7 @@ test('Risk engine deduplicates duplicate payments and keeps Empenho+Liquidação
 });
 
 test('Risk engine treats active Estadual sanction without scopeUf as NOT_VERIFIABLE instead of confirmed impediment', () => {
-  const base = SEED_CONTRACTS.find((c) => c.id === 'FSA-2026-041')!;
+  const base = FIXTURE_COMPLIANT;
   const contract: ContractRecord = {
     ...base,
     supplier: {
@@ -212,7 +216,7 @@ test('Risk engine treats active Estadual sanction without scopeUf as NOT_VERIFIA
 });
 
 test('Risk engine refuses productivity calculation when deliveredOutput or benchmarkUnitCost is 0', () => {
-  const base = SEED_CONTRACTS.find((c) => c.id === 'FSA-2026-041')!;
+  const base = FIXTURE_COMPLIANT;
   const contract: ContractRecord = {
     ...base,
     productivity: {
@@ -252,14 +256,14 @@ test('Strict document matching blocks CNPJ-only and ambiguous number-only auto-a
   // CNPJ alone must NEVER auto-attach
   const cnpjOnly = resolveDocumentContractMatch(
     { contractNumber: null, cnpj: '27841920000163', ibgeCode: null, municipalityName: null },
-    SEED_CONTRACTS
+    TEST_FIXTURE_CONTRACTS
   );
   assert.equal(cnpjOnly.status, 'ambiguous');
 
   // Contract number 123/2026 exists in multiple municipalities -> ambiguous without IBGE/CNPJ
   const numberOnly = resolveDocumentContractMatch(
     { contractNumber: '123/2026', cnpj: null, ibgeCode: null, municipalityName: null },
-    SEED_CONTRACTS
+    TEST_FIXTURE_CONTRACTS
   );
   assert.equal(numberOnly.status, 'ambiguous');
   if (numberOnly.status === 'ambiguous') {
@@ -269,11 +273,11 @@ test('Strict document matching blocks CNPJ-only and ambiguous number-only auto-a
   // Composite key (contractNumber + ibgeCode) resolves deterministically
   const composite = resolveDocumentContractMatch(
     { contractNumber: '123/2026', cnpj: null, ibgeCode: '2910800', municipalityName: null },
-    SEED_CONTRACTS
+    TEST_FIXTURE_CONTRACTS
   );
   assert.equal(composite.status, 'matched');
   if (composite.status === 'matched') {
-    assert.equal(composite.contract.id, 'FSA-2026-123');
+    assert.equal(composite.contract.id, FIXTURE_HIGH_RISK.id);
   }
 });
 
@@ -334,9 +338,9 @@ test('SQLite store persists contracts, dossiers, and append-only finding reviews
 
   try {
     const store1 = createNexofisStore(dbPath);
-    assert.equal(store1.getSchemaVersion(), 1);
+    assert.equal(store1.getSchemaVersion(), 2);
 
-    const sample = SEED_CONTRACTS[0];
+    const sample = FIXTURE_HIGH_RISK;
     store1.upsertContract(sample);
     store1.saveDossier({
       id: 'DOS-TEST-1',

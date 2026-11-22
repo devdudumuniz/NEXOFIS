@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 336 288" width="336" height="288" role="img" aria-labelledby="title desc">
+  <title id="title">NEXOFIS</title>
+  <desc id="desc">Símbolo oficial NEXOFIS</desc>
+  <g transform="translate(16 16)">
+    <path fill="#0B2540" d="M14 0H78Q92 0 92 14V242Q92 256 78 256H14Q0 256 0 242V14Q0 0 14 0Z"/>
+    <path fill="#D95B35" d="M92 0L196 96Q204 103 204 112V132Q204 144 192 144H168Q156 144 156 132Q156 120 144 120H104Q92 120 92 108Z"/>
+    <path fill="#0B2540" d="M232 0H290Q304 0 304 14V242Q304 256 290 256H226Q220 256 215 251L116 164Q112 160 112 154V144Q112 136 120 136H136Q144 136 144 144V148Q144 160 156 160H204Q216 160 216 148V16Q216 0 232 0Z"/>
+  </g>
+</svg>

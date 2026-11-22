@@ -102,11 +102,12 @@ def run_paddle_on_image(img: Image.Image) -> tuple[str, float | None]:
     return postprocess_ptbr_text("\n".join(lines)), mean_score
 
 
-def extract_pdf_hybrid(pdf_bytes: bytes, force_ocr: bool = False) -> list[dict[str, Any]]:
+def extract_pdf_hybrid(pdf_bytes: bytes, force_ocr: bool = False) -> tuple[list[dict[str, Any]], int]:
     import pypdfium2 as pdfium  # type: ignore
 
     doc = pdfium.PdfDocument(pdf_bytes)
-    total = min(len(doc), MAX_PAGES)
+    original_page_count = len(doc)
+    total = min(original_page_count, MAX_PAGES)
 
     native_results: dict[int, dict[str, Any]] = {}
     ocr_targets: list[tuple[int, Image.Image, float]] = []
@@ -174,7 +175,7 @@ def extract_pdf_hybrid(pdf_bytes: bytes, force_ocr: bool = False) -> list[dict[s
             ordered.append(native_results[page_num])
         elif page_num in ocr_results:
             ordered.append(ocr_results[page_num])
-    return ordered
+    return ordered, original_page_count
 
 
 def cache_get(key: str) -> dict[str, Any] | None:
@@ -221,9 +222,10 @@ def _process_single_payload(raw: bytes, content_type: str, force_ocr: bool) -> d
     if hit is not None:
         return {**hit, "from_cache": True, "duration_ms": max(1, int((time.perf_counter() - started) * 1000))}
 
+    original_page_count = 1
     try:
         if content_type == "application/pdf" or raw[:4] == b"%PDF":
-            extracted_pages = extract_pdf_hybrid(raw, force_ocr=force_ocr)
+            extracted_pages, original_page_count = extract_pdf_hybrid(raw, force_ocr=force_ocr)
         else:
             img = Image.open(io.BytesIO(raw)).convert("RGB")
             txt, score = run_paddle_on_image(img)
@@ -236,19 +238,27 @@ def _process_single_payload(raw: bytes, content_type: str, force_ocr: bool) -> d
                     "dpi": None,
                 }
             ]
+            original_page_count = 1
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Falha ao decodificar documento: {exc}") from exc
 
+    processed_page_count = len(extracted_pages)
+    skipped_pages = max(0, original_page_count - processed_page_count)
+    truncated = original_page_count > processed_page_count
     native_count = sum(1 for p in extracted_pages if p["method"] == "native")
-    ocr_count = len(extracted_pages) - native_count
+    ocr_count = processed_page_count - native_count
     duration_ms = max(1, int((time.perf_counter() - started) * 1000))
 
     response = {
         "sha256": sha256,
-        "extractor_version": f"nexofis-paddleocr-{OCR_LANG}-0.2.0",
-        "page_count": len(extracted_pages),
+        "extractor_version": f"nexofis-paddleocr-{OCR_LANG}-0.2.1",
+        "page_count": processed_page_count,
+        "original_page_count": original_page_count,
+        "processed_page_count": processed_page_count,
+        "truncated": truncated,
+        "skipped_pages_due_to_limit": skipped_pages,
         "native_pages": native_count,
         "ocr_pages": ocr_count,
         "duration_ms": duration_ms,

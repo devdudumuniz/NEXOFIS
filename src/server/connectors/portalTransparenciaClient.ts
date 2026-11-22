@@ -1,3 +1,5 @@
+import { isCnpjFormat, normalizeCnpj } from '../../lib/cnpj';
+
 export interface CguSanctionItem {
   registry: 'CEIS' | 'CNEP' | 'CEPIM';
   cnpj: string;
@@ -36,10 +38,6 @@ export interface SiconfiRreoSummary {
 
 const PORTAL_TRANSPARENCIA_BASE = 'https://api.portaldatransparencia.gov.br/api-de-dados';
 const SICONFI_BASE = 'https://apidatalake.tesouro.gov.br/ords/siconfi/tt/rreo';
-
-function cleanDigits(value: string): string {
-  return value.replace(/\D/g, '');
-}
 
 async function fetchPortalRegistry(
   registry: 'CEIS' | 'CNEP' | 'CEPIM',
@@ -109,15 +107,15 @@ export async function queryCguSanctionsByCnpj(
   options?: { apiKey?: string; timeoutMs?: number }
 ): Promise<CguSanctionsQueryResult> {
   const retrievedAt = new Date().toISOString();
-  const cnpj = cleanDigits(rawCnpj);
-  if (!/^\d{14}$/.test(cnpj)) {
+  const cnpj = normalizeCnpj(rawCnpj);
+  if (!isCnpjFormat(cnpj)) {
     return {
       cnpj,
       status: 'invalid_cnpj',
       sanctions: [],
       checkedRegistries: [],
       retrievedAt,
-      message: 'CNPJ inválido. Informe exatamente 14 dígitos numéricos.',
+      message: 'CNPJ inválido. Informe 14 caracteres válidos (numérico ou alfanumérico RFB 2026).',
     };
   }
 

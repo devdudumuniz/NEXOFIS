@@ -4,7 +4,10 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import type { NextFunction, Response } from 'express';
-import { SEED_CONTRACTS } from '../data/brazilianSeedData';
+import {
+  FIXTURE_SUSPENDED_PAVING,
+  TEST_FIXTURE_CONTRACTS,
+} from './__fixtures__/testContracts';
 import {
   matchesContractLifecycleFilter,
   normalizeLifecycleFilterParam,
@@ -32,8 +35,8 @@ import {
 } from '../server/connectors/portalTransparenciaClient';
 import type { EvaluatedContract } from '../types/audit';
 
-function evaluateSeeds(): EvaluatedContract[] {
-  return SEED_CONTRACTS.map((contract) => ({
+function evaluateFixtures(): EvaluatedContract[] {
+  return TEST_FIXTURE_CONTRACTS.map((contract) => ({
     ...contract,
     assessment: evaluateContractRisk(contract),
     reviews: [],
@@ -86,20 +89,26 @@ test('contractStatus maps active, completed (by status or expired endDate), and 
   );
 });
 
-test('SEED_CONTRACTS provides real records across all three lifecycle statuses (Em Andamento, Concluído, Suspenso)', () => {
+test('TEST_FIXTURE_CONTRACTS covers all three lifecycle statuses (Em Andamento, Concluído, Suspenso)', () => {
   const ref = '2026-11-21';
-  const emAndamento = SEED_CONTRACTS.filter((c) => matchesContractLifecycleFilter(c, 'em_andamento', ref));
-  const concluido = SEED_CONTRACTS.filter((c) => matchesContractLifecycleFilter(c, 'concluido', ref));
-  const suspenso = SEED_CONTRACTS.filter((c) => matchesContractLifecycleFilter(c, 'suspenso', ref));
+  const emAndamento = TEST_FIXTURE_CONTRACTS.filter((c) =>
+    matchesContractLifecycleFilter(c, 'em_andamento', ref)
+  );
+  const concluido = TEST_FIXTURE_CONTRACTS.filter((c) =>
+    matchesContractLifecycleFilter(c, 'concluido', ref)
+  );
+  const suspenso = TEST_FIXTURE_CONTRACTS.filter((c) =>
+    matchesContractLifecycleFilter(c, 'suspenso', ref)
+  );
 
   assert.ok(emAndamento.length >= 1, 'Expected at least one Em Andamento contract');
   assert.ok(concluido.length >= 1, 'Expected at least one Concluído contract');
-  assert.ok(suspenso.length >= 1, 'Expected at least one Suspenso contract (FSA-2026-204)');
-  assert.ok(suspenso.some((c) => c.id === 'FSA-2026-204'));
+  assert.ok(suspenso.length >= 1, 'Expected at least one Suspenso contract');
+  assert.ok(suspenso.some((c) => c.id === FIXTURE_SUSPENDED_PAVING.id));
 });
 
 test('dashboardAggregator computes Top 5 high-risk organs and municipalities concentration accurately', () => {
-  const evaluated = evaluateSeeds();
+  const evaluated = evaluateFixtures();
   const summary = aggregateRiskDashboard(evaluated);
 
   assert.ok(summary.topHighRiskOrgans.length > 0 && summary.topHighRiskOrgans.length <= 5);

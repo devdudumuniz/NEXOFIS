@@ -1,9 +1,13 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type {
   ContractRecord,
+  DocumentPage,
+  EvaluatedContract,
   FindingReviewRecord,
+  SavedDossierSnapshot,
   SavedDossierSummary,
 } from '../types/audit';
 
@@ -25,11 +29,26 @@ export interface DocumentArtifactRecord {
   contractId: string | null;
   extractorVersion: string;
   pageCount: number;
+  originalPageCount?: number;
+  truncated?: boolean;
+  objectKey?: string | null;
+  fullText?: string | null;
+  pages?: DocumentPage[];
+  createdAt: string;
+}
+
+export interface NexofisUserRecord {
+  id: string;
+  email: string;
+  displayName: string;
+  role: 'admin' | 'analyst' | 'viewer';
+  passwordHash: string;
   createdAt: string;
 }
 
 export interface NexofisStore {
   dbPath: string;
+  objectsDir: string;
   close(): void;
   getSchemaVersion(): number;
   upsertContract(contract: ContractRecord): void;
@@ -37,7 +56,11 @@ export interface NexofisStore {
   getAllStoredContracts(): ContractRecord[];
   getStoredContractById(id: string): ContractRecord | null;
   listDossiers(): SavedDossierSummary[];
-  saveDossier(dossier: SavedDossierSummary): SavedDossierSummary[];
+  getDossierById(id: string): SavedDossierSnapshot | null;
+  saveDossier(
+    dossier: SavedDossierSummary,
+    snapshot?: { contract: EvaluatedContract; reviews: FindingReviewRecord[] }
+  ): SavedDossierSummary[];
   deleteDossier(id: string): boolean;
   addFindingReview(review: FindingReviewRecord): FindingReviewRecord;
   listFindingReviews(contractId: string): FindingReviewRecord[];
@@ -47,17 +70,37 @@ export interface NexofisStore {
   recordDocumentArtifact(artifact: DocumentArtifactRecord): { alreadyExisted: boolean };
   getDocumentArtifactBySha256(sha256: string): DocumentArtifactRecord | null;
   listDocumentArtifactsForContract(contractId: string): DocumentArtifactRecord[];
+  saveOriginalDocumentBytes(sha256: string, bytes: Buffer): { objectKey: string; verified: boolean };
+  readOriginalDocumentBytes(sha256: string): { bytes: Buffer; verified: boolean } | null;
+  countUsers(): number;
+  createUser(user: NexofisUserRecord): NexofisUserRecord;
+  getUserByEmail(email: string): NexofisUserRecord | null;
+  listUsers(): Array<Omit<NexofisUserRecord, 'passwordHash'>>;
 }
 
 const DEFAULT_DB_PATH = path.resolve(process.cwd(), 'data', 'nexofis.db');
+const SHA256_RE = /^[a-f0-9]{64}$/i;
+
+function safeAddColumn(db: DatabaseSync, table: string, columnDef: string): void {
+  const colName = columnDef.trim().split(/\s+/)[0];
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  if (!cols.some((c) => c.name === colName)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDef};`);
+  }
+}
 
 export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisStore {
-  const dir = path.dirname(dbPath);
+  const resolvedDbPath = path.resolve(dbPath);
+  const dir = path.dirname(resolvedDbPath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
+  const objectsDir = path.resolve(dir, 'objects');
+  if (!fs.existsSync(objectsDir)) {
+    fs.mkdirSync(objectsDir, { recursive: true });
+  }
 
-  const db = new DatabaseSync(dbPath);
+  const db = new DatabaseSync(resolvedDbPath);
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA foreign_keys = ON;');
 
@@ -147,6 +190,38 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
     ).run(1, 'initial_nexofis_forensic_schema', new Date().toISOString());
   }
 
+  // Additive migration v2 (A06/A07/A09): preserves all existing rows!
+  const currentVersionRow = db
+    .prepare('SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations')
+    .get() as { version: number };
+
+  if (currentVersionRow.version < 2) {
+    safeAddColumn(db, 'saved_dossiers', 'snapshot_json TEXT');
+    safeAddColumn(db, 'finding_reviews', 'actor_id TEXT');
+    safeAddColumn(db, 'finding_reviews', 'actor_role TEXT');
+    safeAddColumn(db, 'finding_reviews', 'finding_inputs_digest TEXT');
+    safeAddColumn(db, 'document_artifacts', 'object_key TEXT');
+    safeAddColumn(db, 'document_artifacts', 'full_text TEXT');
+    safeAddColumn(db, 'document_artifacts', 'pages_json TEXT');
+    safeAddColumn(db, 'document_artifacts', 'original_page_count INTEGER');
+    safeAddColumn(db, 'document_artifacts', 'truncated INTEGER DEFAULT 0');
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        email TEXT NOT NULL UNIQUE,
+        display_name TEXT NOT NULL,
+        role TEXT NOT NULL CHECK(role IN ('admin', 'analyst', 'viewer')),
+        password_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+    `);
+
+    db.prepare(
+      'INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)'
+    ).run(2, 'durable_originals_dossier_snapshots_rbac_users', new Date().toISOString());
+  }
+
   const stmtUpsertContract = db.prepare(`
     INSERT INTO contracts (
       id, pncp_control_number, contract_number, municipality_ibge, supplier_cnpj,
@@ -173,16 +248,24 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
 
   const stmtListDossiers = db.prepare(`
     SELECT id, contract_id, contract_number, municipality_name, municipality_ibge,
-           entity_name, supplier_name, risk_score, saved_at, analyst_note, sha256_digest
+           entity_name, supplier_name, risk_score, saved_at, analyst_note, sha256_digest,
+           CASE WHEN snapshot_json IS NOT NULL AND length(snapshot_json) > 2 THEN 1 ELSE 0 END AS has_snapshot
     FROM saved_dossiers
     ORDER BY saved_at DESC
+  `);
+
+  const stmtGetDossierById = db.prepare(`
+    SELECT id, contract_id, contract_number, municipality_name, municipality_ibge,
+           entity_name, supplier_name, risk_score, saved_at, analyst_note, sha256_digest, snapshot_json
+    FROM saved_dossiers
+    WHERE id = ?
   `);
 
   const stmtUpsertDossier = db.prepare(`
     INSERT INTO saved_dossiers (
       id, contract_id, contract_number, municipality_name, municipality_ibge,
-      entity_name, supplier_name, risk_score, saved_at, analyst_note, sha256_digest
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      entity_name, supplier_name, risk_score, saved_at, analyst_note, sha256_digest, snapshot_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(contract_id) DO UPDATE SET
       id = excluded.id,
       contract_number = excluded.contract_number,
@@ -193,26 +276,27 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
       risk_score = excluded.risk_score,
       saved_at = excluded.saved_at,
       analyst_note = excluded.analyst_note,
-      sha256_digest = excluded.sha256_digest
+      sha256_digest = excluded.sha256_digest,
+      snapshot_json = excluded.snapshot_json
   `);
 
   const stmtDeleteDossier = db.prepare('DELETE FROM saved_dossiers WHERE id = ?');
 
   const stmtInsertReview = db.prepare(`
     INSERT INTO finding_reviews (
-      id, contract_id, finding_id, action, author, rationale, rule_version, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      id, contract_id, finding_id, action, author, actor_id, actor_role, rationale, rule_version, finding_inputs_digest, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const stmtListReviewsForContract = db.prepare(`
-    SELECT id, contract_id, finding_id, action, author, rationale, rule_version, created_at
+    SELECT id, contract_id, finding_id, action, author, actor_id, actor_role, rationale, rule_version, finding_inputs_digest, created_at
     FROM finding_reviews
     WHERE contract_id = ?
     ORDER BY created_at ASC
   `);
 
   const stmtListAllReviews = db.prepare(`
-    SELECT id, contract_id, finding_id, action, author, rationale, rule_version, created_at
+    SELECT id, contract_id, finding_id, action, author, actor_id, actor_role, rationale, rule_version, finding_inputs_digest, created_at
     FROM finding_reviews
     ORDER BY created_at ASC
   `);
@@ -237,23 +321,63 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
   `);
 
   const stmtGetArtifact = db.prepare(`
-    SELECT sha256, filename, mime_type, size_bytes, contract_id, extractor_version, page_count, created_at
+    SELECT sha256, filename, mime_type, size_bytes, contract_id, extractor_version,
+           page_count, original_page_count, truncated, object_key, full_text, pages_json, created_at
     FROM document_artifacts
     WHERE sha256 = ?
   `);
 
   const stmtInsertArtifact = db.prepare(`
-    INSERT OR IGNORE INTO document_artifacts (
-      sha256, filename, mime_type, size_bytes, contract_id, extractor_version, page_count, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO document_artifacts (
+      sha256, filename, mime_type, size_bytes, contract_id, extractor_version,
+      page_count, original_page_count, truncated, object_key, full_text, pages_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(sha256) DO UPDATE SET
+      contract_id = COALESCE(excluded.contract_id, document_artifacts.contract_id),
+      object_key = COALESCE(excluded.object_key, document_artifacts.object_key),
+      full_text = COALESCE(excluded.full_text, document_artifacts.full_text),
+      pages_json = COALESCE(excluded.pages_json, document_artifacts.pages_json),
+      original_page_count = COALESCE(excluded.original_page_count, document_artifacts.original_page_count),
+      truncated = COALESCE(excluded.truncated, document_artifacts.truncated)
   `);
 
   const stmtListArtifactsForContract = db.prepare(`
-    SELECT sha256, filename, mime_type, size_bytes, contract_id, extractor_version, page_count, created_at
+    SELECT sha256, filename, mime_type, size_bytes, contract_id, extractor_version,
+           page_count, original_page_count, truncated, object_key, full_text, pages_json, created_at
     FROM document_artifacts
     WHERE contract_id = ?
     ORDER BY created_at DESC
   `);
+
+  const stmtCountUsers = db.prepare('SELECT COUNT(*) AS cnt FROM users');
+  const stmtInsertUser = db.prepare(`
+    INSERT INTO users (id, email, display_name, role, password_hash, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const stmtGetUserByEmail = db.prepare(`
+    SELECT id, email, display_name, role, password_hash, created_at
+    FROM users
+    WHERE lower(email) = lower(?)
+  `);
+  const stmtListUsers = db.prepare(`
+    SELECT id, email, display_name, role, created_at
+    FROM users
+    ORDER BY created_at ASC
+  `);
+
+  function resolveSafeObjectPath(sha256: string): { objectKey: string; absPath: string } {
+    const cleanSha = sha256.trim().toLowerCase();
+    if (!SHA256_RE.test(cleanSha)) {
+      throw new Error('SHA-256 inválido para armazenamento de documento.');
+    }
+    const prefix = cleanSha.slice(0, 2);
+    const objectKey = `${prefix}/${cleanSha}`;
+    const absPath = path.resolve(objectsDir, prefix, cleanSha);
+    if (!absPath.startsWith(objectsDir + path.sep)) {
+      throw new Error('Caminho de objeto fora do diretório confinado.');
+    }
+    return { objectKey, absPath };
+  }
 
   function mapDossierRow(r: Record<string, unknown>): SavedDossierSummary {
     return {
@@ -268,6 +392,7 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
       savedAt: String(r.saved_at),
       analystNote: String(r.analyst_note),
       sha256Digest: String(r.sha256_digest),
+      hasSnapshot: Boolean(r.has_snapshot ?? r.snapshot_json),
     };
   }
 
@@ -278,13 +403,24 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
       findingId: String(r.finding_id),
       action: r.action === 'restore' ? 'restore' : 'dismiss',
       author: String(r.author),
+      actorId: r.actor_id ? String(r.actor_id) : undefined,
+      actorRole: r.actor_role ? String(r.actor_role) : undefined,
       rationale: String(r.rationale),
       ruleVersion: String(r.rule_version),
+      findingInputsDigest: r.finding_inputs_digest ? String(r.finding_inputs_digest) : undefined,
       createdAt: String(r.created_at),
     };
   }
 
   function mapArtifactRow(r: Record<string, unknown>): DocumentArtifactRecord {
+    let parsedPages: DocumentPage[] | undefined;
+    if (typeof r.pages_json === 'string' && r.pages_json.trim()) {
+      try {
+        parsedPages = JSON.parse(r.pages_json) as DocumentPage[];
+      } catch {
+        parsedPages = undefined;
+      }
+    }
     return {
       sha256: String(r.sha256),
       filename: String(r.filename),
@@ -293,12 +429,20 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
       contractId: r.contract_id ? String(r.contract_id) : null,
       extractorVersion: String(r.extractor_version),
       pageCount: Number(r.page_count),
+      originalPageCount: r.original_page_count !== null && r.original_page_count !== undefined
+        ? Number(r.original_page_count)
+        : Number(r.page_count),
+      truncated: Boolean(r.truncated),
+      objectKey: r.object_key ? String(r.object_key) : null,
+      fullText: typeof r.full_text === 'string' ? r.full_text : null,
+      pages: parsedPages,
       createdAt: String(r.created_at),
     };
   }
 
   return {
-    dbPath,
+    dbPath: resolvedDbPath,
+    objectsDir,
     close() {
       db.close();
     },
@@ -311,13 +455,13 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
     upsertContract(contract: ContractRecord) {
       stmtUpsertContract.run(
         contract.id,
-        contract.pncpControlNumber,
-        contract.contractNumber,
-        contract.municipalityIbge,
-        contract.supplier.cnpj,
+        contract.pncpControlNumber ?? '',
+        contract.contractNumber ?? '',
+        contract.municipalityIbge ?? '',
+        contract.supplier?.cnpj ?? '',
         contract.cnpjRole ?? null,
-        contract.year,
-        contract.dataSourceOrigin,
+        contract.year ?? new Date().getUTCFullYear(),
+        contract.dataSourceOrigin ?? 'Índice Local',
         JSON.stringify(contract),
         new Date().toISOString()
       );
@@ -371,7 +515,33 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
       const rows = stmtListDossiers.all() as Array<Record<string, unknown>>;
       return rows.map(mapDossierRow);
     },
-    saveDossier(dossier: SavedDossierSummary) {
+    getDossierById(id: string) {
+      const row = stmtGetDossierById.get(id) as Record<string, unknown> | undefined;
+      if (!row) return null;
+      const summary = mapDossierRow(row);
+      let snapshotContract: EvaluatedContract | null = null;
+      let snapshotReviews: FindingReviewRecord[] = [];
+      if (typeof row.snapshot_json === 'string' && row.snapshot_json.trim()) {
+        try {
+          const parsed = JSON.parse(row.snapshot_json) as {
+            contract?: EvaluatedContract;
+            reviews?: FindingReviewRecord[];
+          };
+          snapshotContract = parsed.contract ?? null;
+          snapshotReviews = Array.isArray(parsed.reviews) ? parsed.reviews : [];
+        } catch {
+          snapshotContract = null;
+          snapshotReviews = [];
+        }
+      }
+      return {
+        ...summary,
+        snapshotContract,
+        snapshotReviews,
+      };
+    },
+    saveDossier(dossier: SavedDossierSummary, snapshot?: { contract: EvaluatedContract; reviews: FindingReviewRecord[] }) {
+      const snapshotJson = snapshot ? JSON.stringify(snapshot) : null;
       stmtUpsertDossier.run(
         dossier.id,
         dossier.contractId,
@@ -383,7 +553,8 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
         dossier.riskScore,
         dossier.savedAt,
         dossier.analystNote,
-        dossier.sha256Digest
+        dossier.sha256Digest,
+        snapshotJson
       );
       return this.listDossiers();
     },
@@ -398,8 +569,11 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
         review.findingId,
         review.action,
         review.author,
+        review.actorId ?? null,
+        review.actorRole ?? null,
         review.rationale,
         review.ruleVersion,
+        review.findingInputsDigest ?? null,
         review.createdAt
       );
       return review;
@@ -438,9 +612,6 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
     },
     recordDocumentArtifact(artifact: DocumentArtifactRecord) {
       const existing = stmtGetArtifact.get(artifact.sha256);
-      if (existing) {
-        return { alreadyExisted: true };
-      }
       stmtInsertArtifact.run(
         artifact.sha256,
         artifact.filename,
@@ -449,9 +620,14 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
         artifact.contractId,
         artifact.extractorVersion,
         artifact.pageCount,
+        artifact.originalPageCount ?? artifact.pageCount,
+        artifact.truncated ? 1 : 0,
+        artifact.objectKey ?? null,
+        artifact.fullText ?? null,
+        artifact.pages ? JSON.stringify(artifact.pages) : null,
         artifact.createdAt
       );
-      return { alreadyExisted: false };
+      return { alreadyExisted: Boolean(existing) };
     },
     getDocumentArtifactBySha256(sha256: string) {
       const row = stmtGetArtifact.get(sha256) as Record<string, unknown> | undefined;
@@ -460,6 +636,76 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
     listDocumentArtifactsForContract(contractId: string) {
       const rows = stmtListArtifactsForContract.all(contractId) as Array<Record<string, unknown>>;
       return rows.map(mapArtifactRow);
+    },
+    saveOriginalDocumentBytes(sha256: string, bytes: Buffer) {
+      const computed = crypto.createHash('sha256').update(bytes).digest('hex');
+      const expected = sha256.trim().toLowerCase();
+      if (computed !== expected) {
+        throw new Error('Divergência de integridade SHA-256 ao gravar documento original.');
+      }
+      const { objectKey, absPath } = resolveSafeObjectPath(expected);
+      const subDir = path.dirname(absPath);
+      if (!fs.existsSync(subDir)) {
+        fs.mkdirSync(subDir, { recursive: true });
+      }
+      if (!fs.existsSync(absPath)) {
+        const tmpPath = `${absPath}.${process.pid}.${Date.now()}.tmp`;
+        fs.writeFileSync(tmpPath, bytes);
+        fs.renameSync(tmpPath, absPath);
+      }
+      return { objectKey, verified: true };
+    },
+    readOriginalDocumentBytes(sha256: string) {
+      let absPath: string;
+      try {
+        absPath = resolveSafeObjectPath(sha256).absPath;
+      } catch {
+        return null;
+      }
+      if (!fs.existsSync(absPath)) return null;
+      const bytes = fs.readFileSync(absPath);
+      const computed = crypto.createHash('sha256').update(bytes).digest('hex');
+      return {
+        bytes,
+        verified: computed === sha256.trim().toLowerCase(),
+      };
+    },
+    countUsers() {
+      const row = stmtCountUsers.get() as { cnt: number };
+      return Number(row.cnt);
+    },
+    createUser(user: NexofisUserRecord) {
+      stmtInsertUser.run(
+        user.id,
+        user.email.trim().toLowerCase(),
+        user.displayName.trim(),
+        user.role,
+        user.passwordHash,
+        user.createdAt
+      );
+      return user;
+    },
+    getUserByEmail(email: string) {
+      const row = stmtGetUserByEmail.get(email.trim().toLowerCase()) as Record<string, unknown> | undefined;
+      if (!row) return null;
+      return {
+        id: String(row.id),
+        email: String(row.email),
+        displayName: String(row.display_name),
+        role: row.role as NexofisUserRecord['role'],
+        passwordHash: String(row.password_hash),
+        createdAt: String(row.created_at),
+      };
+    },
+    listUsers() {
+      const rows = stmtListUsers.all() as Array<Record<string, unknown>>;
+      return rows.map((row) => ({
+        id: String(row.id),
+        email: String(row.email),
+        displayName: String(row.display_name),
+        role: row.role as NexofisUserRecord['role'],
+        createdAt: String(row.created_at),
+      }));
     },
   };
 }

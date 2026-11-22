@@ -28,12 +28,19 @@ interface FtmEdge {
 
 export function EntityGraphTab({ contract, onSelectContract }: EntityGraphTabProps) {
   const [mirrorContracts, setMirrorContracts] = useState<EvaluatedContract[]>([]);
-  const [indexSource, setIndexSource] = useState<string>(
-    'Espelho Local Indexado Licitarium / PNCP'
-  );
-  const [loadingMirror, setLoadingMirror] = useState(true);
+  const [indexSource, setIndexSource] = useState<string>('SQLite Local + PNCP Search API');
+  const [loadingMirror, setLoadingMirror] = useState(false);
+
+  const hasValidSupplierCnpj =
+    Boolean(contract.supplier.cnpj) && contract.supplier.cnpj !== '00000000000000';
 
   useEffect(() => {
+    if (!hasValidSupplierCnpj) {
+      setMirrorContracts([contract]);
+      setLoadingMirror(false);
+      return;
+    }
+
     let cancelled = false;
     setLoadingMirror(true);
     fetchSupplierMirrorContracts(contract.supplier.cnpj)
@@ -51,30 +58,35 @@ export function EntityGraphTab({ contract, onSelectContract }: EntityGraphTabPro
     return () => {
       cancelled = true;
     };
-  }, [contract.supplier.cnpj, contract.id]);
+  }, [contract.supplier.cnpj, contract.id, hasValidSupplierCnpj]);
 
-  // Construct deterministic FollowTheMoney (FtM) entity graph
   const nodes: FtmEntityNode[] = [
     {
-      id: `ftm:publicbody:${contract.municipalityIbge}:${contract.entityId}`,
+      id: `ftm:publicbody:${contract.municipalityIbge || 'unknown'}:${contract.entityId}`,
       schema: 'PublicBody',
       label: contract.entityName,
-      identifier: `IBGE ${contract.municipalityIbge} · ${contract.municipalityName}/${contract.uf}`,
+      identifier: contract.municipalityIbge
+        ? `IBGE ${contract.municipalityIbge} · ${contract.municipalityName}/${contract.uf}`
+        : contract.municipalityName,
       detail: 'Órgão / unidade gestora contratante',
     },
     {
       id: `ftm:contract:${contract.id}`,
       schema: 'Contract',
       label: `Contrato ${contract.contractNumber}`,
-      identifier: contract.pncpControlNumber,
-      detail: `${contract.modality} · Valor atualizado ${formatCurrencyBRL(contract.updatedValue)}`,
+      identifier: contract.pncpControlNumber || 'Sem nº de controle PNCP',
+      detail: `${contract.modality} · Valor atualizado ${
+        contract.updatedValue > 0 ? formatCurrencyBRL(contract.updatedValue) : 'Não divulgado'
+      }`,
     },
     {
-      id: `ftm:company:${contract.supplier.cnpj}`,
+      id: `ftm:company:${contract.supplier.cnpj || 'unknown'}`,
       schema: 'Company',
       label: contract.supplier.legalName,
-      identifier: `CNPJ ${formatCnpj(contract.supplier.cnpj)}`,
-      detail: `CNAE ${contract.supplier.primaryCnaeCode} · Situação ${contract.supplier.registrationStatus}`,
+      identifier: hasValidSupplierCnpj
+        ? `CNPJ ${formatCnpj(contract.supplier.cnpj)}`
+        : 'CNPJ não identificado',
+      detail: `CNAE ${contract.supplier.primaryCnaeCode || 'Não consultado'} · Situação ${contract.supplier.registrationStatus}`,
     },
   ];
 
@@ -83,13 +95,15 @@ export function EntityGraphTab({ contract, onSelectContract }: EntityGraphTabPro
       from: contract.entityName,
       relation: 'CONTRATOU',
       to: `Contrato ${contract.contractNumber}`,
-      evidence: `PNCP ${contract.pncpControlNumber}`,
+      evidence: contract.pncpControlNumber || contract.dataSourceOrigin,
     },
     {
       from: `Contrato ${contract.contractNumber}`,
       relation: 'ADJUDICADO_A',
       to: contract.supplier.legalName,
-      evidence: `Assinatura ${formatDateBR(contract.signatureDate)}`,
+      evidence: contract.signatureDate
+        ? `Assinatura ${formatDateBR(contract.signatureDate)}`
+        : 'Data de assinatura não informada',
     },
   ];
 
@@ -110,14 +124,6 @@ export function EntityGraphTab({ contract, onSelectContract }: EntityGraphTabPro
       to: contract.supplier.legalName,
       evidence: 'QSA / Receita Federal',
     });
-    if (sh.isPublicServantOverlap) {
-      edges.push({
-        from: sh.name,
-        relation: 'POTENCIAL_CONFLITO_STF_1001',
-        to: contract.entityName,
-        evidence: sh.overlapDetail ?? 'Sobreposição funcional em apuração',
-      });
-    }
   }
 
   for (const sanc of contract.supplier.sanctions) {
@@ -140,11 +146,11 @@ export function EntityGraphTab({ contract, onSelectContract }: EntityGraphTabPro
   const provenPayments = contract.payments.filter(
     (p) => p.type === 'Pagamento' || p.type === 'Liquidação' || p.type === 'Empenho'
   );
-  for (const pay of provenPayments.slice(0, 4)) {
+  for (const pay of provenPayments.slice(0, 6)) {
     nodes.push({
       id: `ftm:payment:${pay.id}`,
       schema: 'Payment',
-      label: `${pay.type} ${pay.documentNumber}`,
+      label: `${pay.type} ${pay.documentNumber || pay.id}`,
       identifier: `${formatDateBR(pay.date)} · ${formatCurrencyBRL(pay.amount)}`,
       detail: pay.sourceSystem,
       flag: pay.paidOutOfOrder
@@ -156,7 +162,7 @@ export function EntityGraphTab({ contract, onSelectContract }: EntityGraphTabPro
     edges.push({
       from: `Contrato ${contract.contractNumber}`,
       relation: `EXECUCAO_${pay.type.toUpperCase()}`,
-      to: `${pay.type} ${pay.documentNumber}`,
+      to: `${pay.type} ${pay.documentNumber || pay.id}`,
       evidence: pay.sourceSystem,
     });
   }
@@ -181,58 +187,53 @@ export function EntityGraphTab({ contract, onSelectContract }: EntityGraphTabPro
 
   return (
     <div className="space-y-6">
-      {/* FollowTheMoney Entity Graph Overview */}
-      <section className="bg-white border border-slate-200 rounded-lg p-6 space-y-5">
-        <div className="flex flex-col md:flex-row md:items-start justify-between gap-4 pb-4 border-b border-slate-200">
+      <section className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg p-6 space-y-5">
+        <div className="flex flex-col md:flex-row md:items-start justify-between gap-4 pb-4 border-b border-slate-200 dark:border-[#1D3A57]">
           <div>
-            <div className="flex items-center gap-2 text-xs font-mono text-slate-500">
-              <GitBranch className="w-3.5 h-3.5 text-slate-700" aria-hidden="true" />
+            <div className="flex items-center gap-2 text-xs font-mono text-slate-500 dark:text-slate-400">
+              <GitBranch className="w-3.5 h-3.5 text-[#D95B35]" aria-hidden="true" />
               <span>Modelo FollowTheMoney (FtM) · Entidades e Relações Investigativas</span>
             </div>
-            <h2 className="text-base font-semibold text-slate-900 mt-1">
+            <h2 className="text-base font-semibold text-[#0B2540] dark:text-[#FAF9F5] mt-1">
               Grafo Probatório de Entidades ({nodes.length} nós · {edges.length} arestas)
             </h2>
-            <p className="text-xs text-slate-600 mt-1 max-w-3xl">
-              Estrutura compatível com OpenAleph / FollowTheMoney (Person, Company, PublicBody,
-              Contract, Payment, Sanction, Document) para rastreamento de vínculos societários,
-              sanções, pagamentos e contratos correlatos.
-            </p>
           </div>
-          <div className="text-xs font-mono text-slate-500 shrink-0">
+          <div className="text-xs font-mono text-slate-500 dark:text-slate-400 shrink-0">
             Entidade raiz: ftm:contract:{contract.id}
           </div>
         </div>
 
-        {/* Typed Entities Table */}
-        <div className="overflow-x-auto border border-slate-200 rounded-md">
+        <div className="overflow-x-auto border border-slate-200 dark:border-[#1D3A57] rounded-md">
           <table className="w-full text-left border-collapse text-sm">
             <thead>
-              <tr className="border-b border-slate-200 bg-slate-50 text-xs font-medium text-slate-500">
+              <tr className="border-b border-slate-200 dark:border-[#1D3A57] bg-[#FAF9F5] dark:bg-[#061321] text-xs font-medium text-slate-500 dark:text-slate-400">
                 <th className="py-2.5 px-4 whitespace-nowrap">Schema FtM</th>
                 <th className="py-2.5 px-4">Entidade</th>
                 <th className="py-2.5 px-4 whitespace-nowrap">Identificador / Chave</th>
                 <th className="py-2.5 px-4">Atributos e Observações</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-200">
+            <tbody className="divide-y divide-slate-200 dark:divide-[#1D3A57]">
               {nodes.map((node) => (
                 <tr key={node.id}>
                   <td className="py-3 px-4 align-top whitespace-nowrap">
-                    <span className="font-mono text-xs font-semibold text-blue-800">
+                    <span className="font-mono text-xs font-semibold text-[#D95B35]">
                       {node.schema}
                     </span>
                   </td>
                   <td className="py-3 px-4 align-top">
-                    <div className="font-medium text-slate-900">{node.label}</div>
+                    <div className="font-medium text-[#0B2540] dark:text-[#FAF9F5]">{node.label}</div>
                     <div className="text-[11px] font-mono text-slate-400 mt-0.5">{node.id}</div>
                   </td>
-                  <td className="py-3 px-4 align-top font-mono text-xs tabular-nums text-slate-700 whitespace-nowrap">
+                  <td className="py-3 px-4 align-top font-mono text-xs tabular-nums text-slate-700 dark:text-slate-300 whitespace-nowrap">
                     {node.identifier}
                   </td>
-                  <td className="py-3 px-4 align-top text-xs text-slate-600">
+                  <td className="py-3 px-4 align-top text-xs text-slate-600 dark:text-slate-300">
                     <div>{node.detail}</div>
                     {node.flag && (
-                      <div className="text-red-700 font-semibold mt-1">{node.flag}</div>
+                      <div className="text-red-700 dark:text-red-400 font-semibold mt-1">
+                        {node.flag}
+                      </div>
                     )}
                   </td>
                 </tr>
@@ -241,25 +242,24 @@ export function EntityGraphTab({ contract, onSelectContract }: EntityGraphTabPro
           </table>
         </div>
 
-        {/* Edges / Relationships */}
         <div>
-          <h3 className="text-sm font-semibold text-slate-900 mb-3">
+          <h3 className="text-sm font-semibold text-[#0B2540] dark:text-[#FAF9F5] mb-3">
             Relações Verificáveis (Arestas do Grafo)
           </h3>
-          <div className="border border-slate-200 rounded-md divide-y divide-slate-200">
+          <div className="border border-slate-200 dark:border-[#1D3A57] rounded-md divide-y divide-slate-200 dark:divide-[#1D3A57]">
             {edges.map((edge, idx) => (
               <div
                 key={`${edge.from}-${edge.relation}-${idx}`}
                 className="px-4 py-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs"
               >
-                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-slate-800">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[#0B2540] dark:text-slate-200">
                   <span className="font-semibold">{edge.from}</span>
-                  <span className="font-mono text-blue-700 font-semibold">
+                  <span className="font-mono text-[#D95B35] font-semibold">
                     —[{edge.relation}]→
                   </span>
                   <span className="font-semibold">{edge.to}</span>
                 </div>
-                <span className="font-mono text-[11px] text-slate-500 shrink-0">
+                <span className="font-mono text-[11px] text-slate-500 dark:text-slate-400 shrink-0">
                   {edge.evidence}
                 </span>
               </div>
@@ -268,67 +268,58 @@ export function EntityGraphTab({ contract, onSelectContract }: EntityGraphTabPro
         </div>
       </section>
 
-      {/* Horizontal Supplier Mirror Lookup (solves PNCP organ-CNPJ limitation) */}
-      <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
-        <div className="px-6 py-4 border-b border-slate-200">
-          <h3 className="text-sm font-semibold text-slate-900">
-            Contratos Horizontais do Mesmo Fornecedor no Espelho PNCP Local
+      <section className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg overflow-hidden">
+        <div className="px-6 py-4 border-b border-slate-200 dark:border-[#1D3A57]">
+          <h3 className="text-sm font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
+            Contratos Horizontais do Mesmo Fornecedor
           </h3>
-          <p className="text-xs text-slate-600 mt-0.5 max-w-3xl">
-            Na API pública do PNCP, o parâmetro <span className="font-mono">cnpj</span> identifica o
-            órgão contratante e não o fornecedor. Esta consulta horizontal utiliza a projeção local
-            indexada (padrão Licitarium) para rastrear o CNPJ{' '}
-            <span className="font-mono font-semibold text-slate-800">
-              {formatCnpj(contract.supplier.cnpj)}
-            </span>{' '}
-            em todos os entes espelhados.
-          </p>
-          <div className="text-[11px] font-mono text-slate-500 mt-1">
+          <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400 mt-1">
             Índice: {indexSource} · {mirrorContracts.length} contrato(s) localizado(s)
           </div>
         </div>
 
         {loadingMirror ? (
-          <div className="p-6 text-xs text-slate-500">
-            Consultando índice horizontal de fornecedores...
+          <div className="p-6 text-xs text-slate-500 dark:text-slate-400">
+            Consultando contratos horizontais do fornecedor...
           </div>
         ) : otherContracts.length === 0 ? (
-          <div className="p-6 text-xs text-slate-600">
-            Este é o único contrato indexado no espelho local para o CNPJ{' '}
-            <span className="font-mono">{formatCnpj(contract.supplier.cnpj)}</span>. O histórico
-            agregado do fornecedor indica {contract.supplier.simultaneousActiveContracts} contrato(s)
-            ativo(s) simultâneo(s) e {contract.supplier.priorMunicipalContracts} contrato(s)
-            anterior(es) no município.
+          <div className="p-6 text-xs text-slate-600 dark:text-slate-300">
+            Nenhum outro contrato localizado para este fornecedor na consulta atual.
           </div>
         ) : (
-          <div className="divide-y divide-slate-200">
+          <div className="divide-y divide-slate-200 dark:divide-[#1D3A57]">
             {otherContracts.map((rel) => (
               <div
                 key={rel.id}
-                className="px-6 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:bg-slate-50"
+                className="px-6 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-4 hover:bg-[#FAF9F5] dark:hover:bg-[#102843]/50"
               >
                 <div className="space-y-1">
-                  <div className="text-xs font-mono text-slate-700">
-                    Contrato {rel.contractNumber} · {rel.municipalityName}/{rel.uf} (IBGE{' '}
-                    {rel.municipalityIbge})
+                  <div className="text-xs font-mono text-slate-700 dark:text-slate-300">
+                    Contrato {rel.contractNumber} · {rel.municipalityName}
+                    {rel.uf ? `/${rel.uf}` : ''}
                   </div>
-                  <div className="text-sm font-medium text-slate-900">{rel.object}</div>
-                  <div className="text-xs text-slate-500">{rel.entityName}</div>
+                  <div className="text-sm font-medium text-[#0B2540] dark:text-[#FAF9F5]">
+                    {rel.object}
+                  </div>
+                  <div className="text-xs text-slate-500 dark:text-slate-400">{rel.entityName}</div>
                 </div>
                 <div className="flex items-center gap-4 shrink-0">
                   <div className="text-right">
-                    <div className="font-mono tabular-nums text-sm font-semibold text-slate-900">
-                      {formatCurrencyBRL(rel.updatedValue)}
+                    <div className="font-mono tabular-nums text-sm font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
+                      {rel.updatedValue > 0 ? formatCurrencyBRL(rel.updatedValue) : 'Não divulgado'}
                     </div>
                     <div className="text-xs mt-0.5">
-                      <RiskScoreInline score={rel.assessment.score} />
+                      <RiskScoreInline
+                        score={rel.assessment.score}
+                        coverageStatus={rel.assessment.coverageStatus}
+                      />
                     </div>
                   </div>
                   {onSelectContract && (
                     <button
                       type="button"
                       onClick={() => onSelectContract(rel)}
-                      className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-md whitespace-nowrap"
+                      className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-[#0B2540] dark:text-[#FAF9F5] bg-[#E8F1F6] dark:bg-[#102843] rounded-md whitespace-nowrap"
                     >
                       Abrir
                       <ArrowRight className="w-3.5 h-3.5" aria-hidden="true" />

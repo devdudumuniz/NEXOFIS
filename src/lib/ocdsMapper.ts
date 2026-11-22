@@ -5,25 +5,33 @@ import { formatCnpj, formatCurrencyBRL, formatDateBR, formatPercentageBR } from 
  * Maps an evaluated contract to an OCDS 1.1-aligned release:
  * - implementation.transactions lives inside contracts[0].implementation (OCDS 1.1 schema)
  * - only verified Pagamento records become implementation transactions (never Empenho/Liquidação)
- * - never fabricates planning/tender/award values when originalValue <= 0
+ * - preserves distinct payments when documentNumber is absent (never collapses independent IDs or emits empty id)
+ * - never fabricates planning/tender/award values, dates, or bidder counts when unknown
  */
 export function mapContractToOCDS(contract: EvaluatedContract): OCDSRelease {
-  const ocid = `ocds-br-pncp-${contract.municipalityIbge}-${contract.id.toLowerCase()}`;
+  const ocid = `ocds-br-pncp-${contract.municipalityIbge || '0000000'}-${contract.id.toLowerCase()}`;
   const hasKnownOriginalValue = contract.originalValue > 0;
   const hasKnownUpdatedValue = contract.updatedValue > 0;
+  const hasVerifiedAwardEvidence = hasKnownOriginalValue && Boolean(contract.signatureDate?.trim());
 
-  // Deduplicate actual payments only (never map Empenho/Liquidação/Medição as OCDS payments)
   const seenPayments = new Set<string>();
   const verifiedPayments = contract.payments.filter((p) => {
-    if (p.type !== 'Pagamento') return false;
-    const key = `${p.documentNumber.trim().toLowerCase()}|${p.date}|${p.amount.toFixed(2)}`;
+    if (p.type !== 'Pagamento' || !Number.isFinite(p.amount) || p.amount <= 0 || p.isReversal) {
+      return false;
+    }
+    const docNum = (p.documentNumber || '').trim().toLowerCase();
+    const dateKey = (p.date || '').slice(0, 10);
+    const amountCents = Math.round(p.amount * 100);
+    const key = docNum
+      ? `doc:${docNum}|${dateKey}|${amountCents}|${(p.fundingSource ?? '').trim().toLowerCase()}`
+      : `src:${(p.sourceSystem || '').trim().toLowerCase()}|id:${(p.id || '').trim().toLowerCase()}|${dateKey}|${amountCents}`;
     if (seenPayments.has(key)) return false;
     seenPayments.add(key);
     return true;
   });
 
   const tags: string[] = ['contract'];
-  if (hasKnownOriginalValue) {
+  if (hasVerifiedAwardEvidence) {
     tags.unshift('tender', 'award');
   }
   if (verifiedPayments.length > 0) {
@@ -37,19 +45,21 @@ export function mapContractToOCDS(contract: EvaluatedContract): OCDSRelease {
     tag: tags,
     initiationType: 'tender',
     buyer: {
-      id: `BR-IBGE-${contract.municipalityIbge}-${contract.entityId}`,
+      id: `BR-IBGE-${contract.municipalityIbge || '0000000'}-${contract.entityId}`,
       name: `${contract.entityName} (${contract.municipalityName}/${contract.uf})`,
     },
     tender: {
       id: `TND-${contract.pncpControlNumber}`,
       title: contract.object,
       procurementMethodDetails: contract.modality,
-      ...(contract.biddersCount > 0 ? { numberOfTenderers: contract.biddersCount } : {}),
+      ...(typeof contract.biddersCount === 'number' && contract.biddersCount > 0
+        ? { numberOfTenderers: contract.biddersCount }
+        : {}),
       ...(hasKnownOriginalValue
         ? { value: { amount: contract.originalValue, currency: 'BRL' as const } }
         : {}),
     },
-    ...(hasKnownOriginalValue
+    ...(hasVerifiedAwardEvidence
       ? {
           awards: [
             {
@@ -73,9 +83,14 @@ export function mapContractToOCDS(contract: EvaluatedContract): OCDSRelease {
     contracts: [
       {
         id: contract.pncpControlNumber,
-        ...(hasKnownOriginalValue ? { awardID: `AWD-${contract.id}` } : {}),
+        ...(hasVerifiedAwardEvidence ? { awardID: `AWD-${contract.id}` } : {}),
         title: `Contrato ${contract.contractNumber} — ${contract.object}`,
-        status: contract.status === 'Encerrado' ? 'terminated' : contract.status === 'Suspenso' ? 'cancelled' : 'active',
+        status:
+          contract.status === 'Encerrado'
+            ? 'terminated'
+            : contract.status === 'Suspenso'
+              ? 'cancelled'
+              : 'active',
         period: {
           startDate: contract.startDate,
           endDate: contract.endDate,
@@ -95,8 +110,8 @@ export function mapContractToOCDS(contract: EvaluatedContract): OCDSRelease {
           description: `${amend.number} (${amend.type}) · Acréscimo: ${formatCurrencyBRL(amend.addedValue)}`,
         })),
         implementation: {
-          transactions: verifiedPayments.map((payment) => ({
-            id: payment.documentNumber,
+          transactions: verifiedPayments.map((payment, idx) => ({
+            id: payment.documentNumber?.trim() || payment.id?.trim() || `TX-${contract.id}-${idx + 1}`,
             date: payment.date,
             value: {
               amount: payment.amount,
@@ -125,11 +140,24 @@ export function buildAuditDossierMarkdown(
   const { assessment } = contract;
   const reviews = reviewsOverride ?? contract.reviews ?? [];
 
-  // Latest human review decision per findingId
   const latestReviewByFinding = new Map<string, FindingReviewRecord>();
   for (const rev of reviews) {
     latestReviewByFinding.set(rev.findingId, rev);
   }
+
+  const biddersDisplay =
+    typeof contract.biddersCount === 'number' && contract.biddersCount > 0
+      ? `${contract.biddersCount} participante(s)`
+      : 'participantes não informados';
+
+  const executionLine =
+    contract.payments.length === 0
+      ? `- **Execução financeira**: Não verificada (sem empenhos, liquidações ou pagamentos coletados)`
+      : `- **Empenhado**: ${formatCurrencyBRL(assessment.executionChain.committedTotal)} · **Liquidado**: ${formatCurrencyBRL(assessment.executionChain.liquidatedTotal)} · **Pago líquido**: ${formatCurrencyBRL(assessment.executionChain.paidTotal)}${
+          (assessment.executionChain.reversalsTotal ?? 0) > 0
+            ? ` (estornos: ${formatCurrencyBRL(assessment.executionChain.reversalsTotal ?? 0)})`
+            : ''
+        }`;
 
   const lines: string[] = [
     `# Dossiê de Auditoria Reproduzível — Contrato ${contract.contractNumber}`,
@@ -140,19 +168,19 @@ export function buildAuditDossierMarkdown(
     `> **Separação de licenças**: Software NEXOFIS licenciado sob GNU AGPL-3.0-only; os dados públicos e documentos exportados neste dossiê permanecem sujeitos à origem oficial e à legislação brasileira aplicável (LAI/LGPD).`,
     ``,
     `## 1. Identificação e Contexto Municipal`,
-    `- **Município**: ${contract.municipalityName}/${contract.uf} (IBGE \`${contract.municipalityIbge}\`)`,
+    `- **Município**: ${contract.municipalityName}/${contract.uf} (IBGE \`${contract.municipalityIbge || 'não informado'}\`)`,
     `- **Órgão / Secretaria**: ${contract.entityName}`,
     `- **Controle PNCP**: \`${contract.pncpControlNumber}\``,
-    `- **Modalidade**: ${contract.modality} (${contract.biddersCount} participante(s))`,
+    `- **Modalidade**: ${contract.modality} (${biddersDisplay})`,
     `- **Objeto**: ${contract.object}`,
     `- **Vigência**: ${formatDateBR(contract.startDate)} a ${formatDateBR(contract.endDate)}`,
     `- **Fornecedor**: ${contract.supplier.legalName} (CNPJ/CPF ${formatCnpj(contract.supplier.cnpj)})`,
     ``,
     `## 2. Obrigação Contratada × Execução Financeira Comprovada`,
-    `- **Valor original (obrigação)**: ${formatCurrencyBRL(contract.originalValue)}`,
-    `- **Valor atualizado (obrigação)**: ${formatCurrencyBRL(contract.updatedValue)} (${formatPercentageBR(assessment.variationPct, true)})`,
-    `- **Estimativa mensal contratual (\`estimated_monthly_contract_value\`)**: ${formatCurrencyBRL(assessment.executionChain.estimatedMonthlyContractValue)}/mês *(não comprova pagamento mensal)*`,
-    `- **Empenhado**: ${formatCurrencyBRL(assessment.executionChain.committedTotal)} · **Liquidado**: ${formatCurrencyBRL(assessment.executionChain.liquidatedTotal)} · **Pago**: ${formatCurrencyBRL(assessment.executionChain.paidTotal)}`,
+    `- **Valor original (obrigação)**: ${contract.originalValue > 0 ? formatCurrencyBRL(contract.originalValue) : 'Não informado'}`,
+    `- **Valor atualizado (obrigação)**: ${contract.updatedValue > 0 ? `${formatCurrencyBRL(contract.updatedValue)} (${formatPercentageBR(assessment.variationPct, true)})` : 'Não informado'}`,
+    `- **Estimativa mensal contratual (\`estimated_monthly_contract_value\`)**: ${assessment.executionChain.estimatedMonthlyContractValue > 0 ? `${formatCurrencyBRL(assessment.executionChain.estimatedMonthlyContractValue)}/mês *(não comprova pagamento mensal)*` : 'Não calculável (valor ou vigência ausente)'}`,
+    executionLine,
     `- **Norma vigente aplicada (Legal Time Travel)**: \`${assessment.appliedLegalRuleset.ruleId}\` — ${assessment.appliedLegalRuleset.legalBasis}${assessment.appliedLegalRuleset.effectiveFrom ? ` (vigência a partir de ${formatDateBR(assessment.appliedLegalRuleset.effectiveFrom)})` : ''}`,
     ``,
     `## 3. Pontos de Observação e Achados (${assessment.indicators.length})`,
@@ -160,9 +188,13 @@ export function buildAuditDossierMarkdown(
     `|---|---|---|---|---|---|---|`,
     ...assessment.indicators.map((ind) => {
       const rev = latestReviewByFinding.get(ind.findingId);
+      const isStale =
+        Boolean(rev?.findingInputsDigest && ind.inputsDigest && rev.findingInputsDigest !== ind.inputsDigest);
       const revLabel =
         rev?.action === 'dismiss'
-          ? `DISMISSED (${rev.author})`
+          ? isStale
+            ? `REVISÃO DESATUALIZADA (${rev.author})`
+            : `DISMISSED (${rev.author})`
           : rev?.action === 'restore'
             ? `RESTAURADO (${rev.author})`
             : 'Pendente';
@@ -188,7 +220,7 @@ export function buildAuditDossierMarkdown(
       `## 6. Trilha de Revisão Humana (Append-Only)`,
       ...reviews.map(
         (r) =>
-          `- [${r.createdAt}] **${r.findingId}** (${r.action === 'dismiss' ? 'Descartado' : 'Restaurado'}) por **${r.author}** (regra \`${r.ruleVersion}\`): ${r.rationale}`
+          `- [${r.createdAt}] **${r.findingId}** (${r.action === 'dismiss' ? 'Descartado' : 'Restaurado'}) por **${r.author}**${r.actorRole ? ` [${r.actorRole}]` : ''} (regra \`${r.ruleVersion}\`): ${r.rationale}`
       )
     );
   }

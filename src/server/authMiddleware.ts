@@ -6,6 +6,7 @@ export type NexofisRole = 'admin' | 'analyst' | 'viewer';
 export interface NexofisPrincipal {
   userId: string;
   email?: string;
+  displayName?: string;
   role: NexofisRole;
   authEnabled: boolean;
   issuedAt?: number;
@@ -19,6 +20,7 @@ export interface AuthenticatedRequest extends Request {
 export interface SignedTokenPayload {
   sub: string;
   email?: string;
+  displayName?: string;
   role: NexofisRole;
   iat: number;
   exp: number;
@@ -26,7 +28,7 @@ export interface SignedTokenPayload {
 
 const VALID_ROLES = new Set<NexofisRole>(['admin', 'analyst', 'viewer']);
 
-// Ephemeral in-memory fallback secret when NEXOFIS_SESSION_SECRET is not set.
+// Ephemeral in-memory fallback secret for non-production local runs when NEXOFIS_SESSION_SECRET is not set.
 // Never hardcoded and never persisted to disk.
 const EPHEMERAL_SESSION_SECRET = crypto.randomBytes(32).toString('hex');
 
@@ -53,7 +55,7 @@ function base64UrlDecode(input: string): string {
 }
 
 export function signNexofisToken(
-  claims: { sub: string; email?: string; role: NexofisRole },
+  claims: { sub: string; email?: string; displayName?: string; role: NexofisRole },
   options: { ttlSeconds?: number; secret?: string; nowSeconds?: number } = {}
 ): string {
   if (!VALID_ROLES.has(claims.role)) {
@@ -64,6 +66,7 @@ export function signNexofisToken(
   const payload: SignedTokenPayload = {
     sub: claims.sub,
     email: claims.email,
+    displayName: claims.displayName,
     role: claims.role,
     iat: now,
     exp: now + ttl,
@@ -118,6 +121,7 @@ export function verifyNexofisToken(
       payload: {
         sub: String(parsed.sub),
         email: parsed.email ? String(parsed.email) : undefined,
+        displayName: parsed.displayName ? String(parsed.displayName) : undefined,
         role: parsed.role,
         iat: typeof parsed.iat === 'number' ? parsed.iat : now,
         exp: parsed.exp,
@@ -145,8 +149,61 @@ export function verifyPasswordScrypt(password: string, storedHash: string): bool
   return crypto.timingSafeEqual(derived, expected);
 }
 
+/**
+ * Fail-closed production auth policy (A09):
+ * - Always enforced if NEXOFIS_AUTH_ENABLED=true.
+ * - In NODE_ENV=production, ALWAYS enforced by default unless NEXOFIS_ALLOW_INSECURE_LOCAL=true is explicitly set.
+ */
 export function isAuthEnforced(env: NodeJS.ProcessEnv = process.env): boolean {
-  return String(env.NEXOFIS_AUTH_ENABLED ?? '').trim().toLowerCase() === 'true';
+  const explicitEnabled = String(env.NEXOFIS_AUTH_ENABLED ?? '').trim().toLowerCase();
+  if (explicitEnabled === 'true') return true;
+
+  const isProd = String(env.NODE_ENV ?? '').trim().toLowerCase() === 'production';
+  const allowInsecureLocal =
+    String(env.NEXOFIS_ALLOW_INSECURE_LOCAL ?? '').trim().toLowerCase() === 'true';
+
+  if (isProd && !allowInsecureLocal) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Validates production auth prerequisites at boot (A09):
+ * Refuses to run with an ephemeral/weak signing secret when auth is enforced in production.
+ */
+export function validateProductionAuthConfig(env: NodeJS.ProcessEnv = process.env): void {
+  const isProd = String(env.NODE_ENV ?? '').trim().toLowerCase() === 'production';
+  if (!isProd) return;
+  if (!isAuthEnforced(env)) return;
+
+  const secret = env.NEXOFIS_SESSION_SECRET?.trim() ?? '';
+  if (secret.length < 32) {
+    throw new Error(
+      'Configuração insegura em produção: NEXOFIS_SESSION_SECRET com pelo menos 32 caracteres é obrigatório quando NODE_ENV=production (ou defina NEXOFIS_ALLOW_INSECURE_LOCAL=true apenas para uso estritamente local).'
+    );
+  }
+}
+
+export function extractOptionalPrincipal(
+  req: Request,
+  options?: { secret?: string }
+): NexofisPrincipal | null {
+  const authHeader = String(req.headers.authorization ?? '').trim();
+  if (!authHeader.toLowerCase().startsWith('bearer ')) return null;
+  const rawToken = authHeader.slice(7).trim();
+  const verification = verifyNexofisToken(rawToken, { secret: options?.secret });
+  if (!verification.valid) return null;
+  return {
+    userId: verification.payload.sub,
+    email: verification.payload.email,
+    displayName: verification.payload.displayName,
+    role: verification.payload.role,
+    authEnabled: true,
+    issuedAt: verification.payload.iat,
+    expiresAt: verification.payload.exp,
+  };
 }
 
 export function createAuthMiddleware(options?: {
@@ -159,8 +216,11 @@ export function createAuthMiddleware(options?: {
   return (req: AuthenticatedRequest, res: Response, next: NextFunction): void => {
     const enforced = options?.enforceOverride ?? isAuthEnforced();
     if (!enforced) {
-      req.nexofisPrincipal = {
+      // Even in local mode, respect a valid Bearer token if present so actor attribution works consistently
+      const optional = extractOptionalPrincipal(req, { secret: options?.secret });
+      req.nexofisPrincipal = optional ?? {
         userId: 'local-workspace',
+        displayName: 'Workspace Local (sem autenticação)',
         role: 'admin',
         authEnabled: false,
       };
@@ -195,6 +255,7 @@ export function createAuthMiddleware(options?: {
     req.nexofisPrincipal = {
       userId: verification.payload.sub,
       email: verification.payload.email,
+      displayName: verification.payload.displayName,
       role: verification.payload.role,
       authEnabled: true,
       issuedAt: verification.payload.iat,

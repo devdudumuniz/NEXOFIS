@@ -35,15 +35,24 @@ function safePdfText(value: string | undefined | null): string {
     .trim();
 }
 
-function getRiskColorRgb(score: number): [number, number, number] {
+function getRiskColorRgb(
+  score: number,
+  coverageStatus?: 'ADEQUATE' | 'PARTIAL' | 'INSUFFICIENT'
+): [number, number, number] {
   if (score >= 70) return [185, 28, 28]; // crimson-700
   if (score >= 40) return [180, 83, 9]; // amber-700
+  if (coverageStatus === 'INSUFFICIENT') return [71, 85, 105]; // slate-600 neutral
   return [21, 128, 61]; // emerald-700
 }
 
-function getTierLabel(score: number): string {
+function getTierLabel(
+  score: number,
+  coverageStatus?: 'ADEQUATE' | 'PARTIAL' | 'INSUFFICIENT'
+): string {
   if (score >= 70) return 'ALTO RISCO';
   if (score >= 40) return 'RISCO MEDIO';
+  if (coverageStatus === 'INSUFFICIENT') return 'COBERTURA INSUFICIENTE';
+  if (coverageStatus === 'PARTIAL') return 'COBERTURA PARCIAL';
   return 'BAIXO RISCO';
 }
 
@@ -83,8 +92,8 @@ export function buildAuditReportPdf(
     latestReviewByFinding.set(rev.findingId, rev);
   }
 
-  // Header Banner
-  doc.setFillColor(15, 23, 42); // slate-900
+  // Header Banner (Brandbook Navy #0B2540)
+  doc.setFillColor(11, 37, 64);
   doc.rect(0, 0, pageWidth, 28, 'F');
 
   doc.setTextColor(255, 255, 255);
@@ -115,9 +124,9 @@ export function buildAuditReportPdf(
   let y = 34;
 
   // 1. Audit Conclusion Summary Box
-  const [r, g, b] = getRiskColorRgb(assessment.score);
+  const [r, g, b] = getRiskColorRgb(assessment.score, assessment.coverageStatus);
   doc.setDrawColor(203, 213, 225);
-  doc.setFillColor(248, 250, 252);
+  doc.setFillColor(250, 249, 245);
   doc.roundedRect(marginX, y, contentWidth, 28, 2, 2, 'FD');
 
   doc.setFont('helvetica', 'bold');
@@ -128,7 +137,7 @@ export function buildAuditReportPdf(
   doc.setFontSize(12);
   doc.setTextColor(r, g, b);
   doc.text(
-    safePdfText(`${getTierLabel(assessment.score)} - ${assessment.headline}`),
+    safePdfText(`${getTierLabel(assessment.score, assessment.coverageStatus)} - ${assessment.headline}`),
     marginX + 4,
     y + 13,
     { maxWidth: contentWidth - 8 }
@@ -166,7 +175,7 @@ export function buildAuditReportPdf(
       [
         'Modalidade e Vigencia',
         safePdfText(
-          `${contract.modality} (${contract.biddersCount} participante(s)) | Assinatura: ${formatDateBR(contract.signatureDate)} | Vigencia: ${formatDateBR(contract.startDate)} a ${formatDateBR(contract.endDate)}`
+          `${contract.modality} (${typeof contract.biddersCount === 'number' && contract.biddersCount > 0 ? `${contract.biddersCount} participante(s)` : 'participantes nao informados'}) | Assinatura: ${formatDateBR(contract.signatureDate)} | Vigencia: ${formatDateBR(contract.startDate)} a ${formatDateBR(contract.endDate)}`
         ),
       ],
       [
@@ -178,13 +187,17 @@ export function buildAuditReportPdf(
       [
         'Nivel 1 - Obrigacao Contratada',
         safePdfText(
-          `Original: ${formatCurrencyBRL(contract.originalValue)} | Atualizado: ${formatCurrencyBRL(contract.updatedValue)} (${formatPercentageBR(assessment.variationPct, true)}) | Estimativa mensal: ${formatCurrencyBRL(exec.estimatedMonthlyContractValue)}/mes (nao comprova pagamento)`
+          contract.originalValue > 0 || contract.updatedValue > 0
+            ? `Original: ${formatCurrencyBRL(contract.originalValue)} | Atualizado: ${formatCurrencyBRL(contract.updatedValue)} (${formatPercentageBR(assessment.variationPct, true)}) | Estimativa mensal: ${exec.estimatedMonthlyContractValue > 0 ? `${formatCurrencyBRL(exec.estimatedMonthlyContractValue)}/mes (nao comprova pagamento)` : 'nao calculavel'}`
+            : 'Valor contratual nao informado na fonte coletada.'
         ),
       ],
       [
         'Nivel 2 - Execucao Comprovada',
         safePdfText(
-          `Empenhado: ${formatCurrencyBRL(exec.committedTotal)} | Liquidado: ${formatCurrencyBRL(exec.liquidatedTotal)} | Pago comprovado: ${formatCurrencyBRL(exec.paidTotal)} | Ordem cronologica: ${exec.chronologicalOrderStatus}`
+          contract.payments.length === 0
+            ? 'Nao verificado (sem execucao financeira coletada nas fontes oficiais).'
+            : `Empenhado: ${formatCurrencyBRL(exec.committedTotal)} | Liquidado: ${formatCurrencyBRL(exec.liquidatedTotal)} | Pago comprovado: ${formatCurrencyBRL(exec.paidTotal)} | Ordem cronologica: ${exec.chronologicalOrderStatus}`
         ),
       ],
     ],
@@ -229,9 +242,14 @@ export function buildAuditReportPdf(
       head: [['ID / Codigo', 'Sev.', 'Estado / Revisao', 'Indicador e Fundamentacao Tecnica']],
       body: assessment.indicators.map((ind) => {
         const rev = latestReviewByFinding.get(ind.findingId);
+        const isStale = Boolean(
+          rev?.findingInputsDigest && ind.inputsDigest && rev.findingInputsDigest !== ind.inputsDigest
+        );
         const revText =
           rev?.action === 'dismiss'
-            ? `DESCARTADO (${rev.author})`
+            ? isStale
+              ? `REVISAO DESATUALIZADA (${rev.author})`
+              : `DESCARTADO (${rev.author})`
             : rev?.action === 'restore'
               ? `RESTAURADO (${rev.author})`
               : 'Pendente';
@@ -239,7 +257,7 @@ export function buildAuditReportPdf(
           safePdfText(`${ind.findingId}\n${ind.code} (v${ind.ruleVersion})`),
           safePdfText(ind.severity),
           safePdfText(`${ind.state}\nNivel ${ind.evidenceLevel}\n${revText}`),
-          safePdfText(`${ind.title}: ${ind.summary} [Base: ${ind.legalReference}]`),
+          safePdfText(`${ind.title}: ${ind.summary}${ind.legalReference ? ` [Base: ${ind.legalReference}]` : ''}`),
         ];
       }),
       columnStyles: {

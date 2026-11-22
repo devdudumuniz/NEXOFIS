@@ -1,10 +1,19 @@
-import { useRef, useState } from 'react';
-import { ArrowRight, CheckCircle2, FileText, FileUp, ShieldCheck } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import {
+  AlertTriangle,
+  ArrowRight,
+  CheckCircle2,
+  Cpu,
+  Download,
+  FileUp,
+  ShieldCheck,
+} from 'lucide-react';
 import type { EvaluatedContract } from '../types/audit';
 import {
-  ingestSampleDocument,
+  fetchOcrStatus,
   uploadContractDocument,
   type DocumentUploadResponse,
+  type OcrStatusResponse,
 } from '../lib/api';
 import { formatCnpj, formatCurrencyBRL } from '../lib/formatters';
 import { RiskScoreInline } from './RiskText';
@@ -20,6 +29,19 @@ export function DocumentUploadView({ onSelectContract }: DocumentUploadViewProps
   const [processing, setProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<DocumentUploadResponse | null>(null);
+  const [ocrStatus, setOcrStatus] = useState<OcrStatusResponse | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchOcrStatus()
+      .then((status) => {
+        if (!cancelled) setOcrStatus(status);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] ?? null;
@@ -28,8 +50,8 @@ export function DocumentUploadView({ onSelectContract }: DocumentUploadViewProps
       setSelectedFile(null);
       return;
     }
-    if (file.size > 10 * 1024 * 1024) {
-      setError('O arquivo excede o limite de 10 MB.');
+    if (file.size > 25 * 1024 * 1024) {
+      setError('O arquivo excede o limite de 25 MB.');
       setSelectedFile(null);
       return;
     }
@@ -39,7 +61,9 @@ export function DocumentUploadView({ onSelectContract }: DocumentUploadViewProps
   const handleUploadSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedFile) {
-      setError('Selecione um documento de contrato (PDF, imagem digitalizada ou TXT) antes de iniciar.');
+      setError(
+        'Selecione um documento de contrato (PDF, PNG, JPEG, WEBP, TIFF ou TXT) antes de iniciar.'
+      );
       return;
     }
 
@@ -55,64 +79,48 @@ export function DocumentUploadView({ onSelectContract }: DocumentUploadViewProps
     }
   };
 
-  const handleRunSample = async (
-    sampleType: 'fsa-123-scan' | 'fsa-087-native' | 'bdc-fms-list'
-  ) => {
-    setProcessing(true);
-    setError(null);
-    try {
-      const response = await ingestSampleDocument(sampleType);
-      setResult(response);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Erro ao executar demonstração do pipeline.');
-    } finally {
-      setProcessing(false);
-    }
-  };
-
   return (
     <div className="space-y-6">
-      <section className="bg-white border border-slate-200 rounded-lg p-6">
+      <section className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg p-6">
         <div className="mb-5">
-          <h1 className="text-2xl font-bold tracking-tight text-slate-900">
-            Pipeline Documental em 4 Níveis (Nativo → Docling → PaddleOCR)
+          <h1 className="text-2xl font-bold tracking-tight text-[#0B2540] dark:text-[#FAF9F5]">
+            Ingestão Documental e Motor Híbrido de OCR
           </h1>
-          <p className="text-sm text-slate-600 mt-1 max-w-3xl">
-            Envie um contrato em PDF, imagem digitalizada ou extrato textual. O original é preservado
-            com hash criptográfico SHA-256, roteado por camada (texto nativo → Docling → fallback
-            seletivo PaddleOCR / PP-StructureV3 apenas para páginas escaneadas) e cruzado com PNCP,
-            Receita/CNPJ, sanções vigentes e regras jurídicas temporais.
+          <p className="text-sm text-slate-600 dark:text-slate-300 mt-1 max-w-3xl">
+            Envie um contrato em PDF, imagem digitalizada (PNG, JPEG, WEBP, TIFF) ou extrato TXT.
+            Os bytes originais são preservados em armazenamento endereçado por SHA-256 antes da
+            extração, com roteamento em camadas e proteção anti zip-bomb.
           </p>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
           {/* Upload Form */}
           <form onSubmit={handleUploadSubmit} className="lg:col-span-7 space-y-4">
-            <div className="border border-dashed border-slate-300 rounded-lg p-6 bg-slate-50/70">
+            <div className="border border-dashed border-slate-300 dark:border-[#1D3A57] rounded-lg p-6 bg-[#FAF9F5] dark:bg-[#061321]">
               <div className="flex items-start gap-4">
-                <FileUp className="w-6 h-6 text-blue-700 shrink-0 mt-0.5" aria-hidden="true" />
+                <FileUp className="w-6 h-6 text-[#D95B35] shrink-0 mt-0.5" aria-hidden="true" />
                 <div className="flex-1 min-w-0">
                   <label
                     htmlFor="contract-file-input"
-                    className="block text-sm font-semibold text-slate-900 cursor-pointer"
+                    className="block text-sm font-semibold text-[#0B2540] dark:text-[#FAF9F5] cursor-pointer"
                   >
-                    Selecionar arquivo do contrato (PDF, PNG, JPG ou TXT · máx. 10 MB)
+                    Selecionar arquivo do contrato (PDF, PNG, JPG, WEBP, TIFF ou TXT · máx. 25 MB)
                   </label>
-                  <p className="text-xs text-slate-500 mt-1">
-                    Se o PDF possuir camada textual válida, a extração ocorre diretamente sem custo
-                    de OCR.
+                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                    PDFs com camada textual válida são extraídos diretamente no Tier 0 sem custo de
+                    OCR neural. Nenhum campo ausente é inventado.
                   </p>
                   <input
                     ref={fileInputRef}
                     id="contract-file-input"
                     type="file"
-                    accept=".pdf,.png,.jpg,.jpeg,.txt,application/pdf,image/png,image/jpeg,text/plain"
+                    accept=".pdf,.png,.jpg,.jpeg,.webp,.tif,.tiff,.txt,application/pdf,image/png,image/jpeg,image/webp,image/tiff,text/plain"
                     onChange={handleFileChange}
-                    className="mt-3 block w-full text-xs text-slate-600 file:mr-3 file:py-2 file:px-3.5 file:rounded-md file:border file:border-slate-300 file:text-xs file:font-semibold file:bg-white file:text-slate-800 hover:file:bg-slate-50"
+                    className="mt-3 block w-full text-xs text-slate-600 dark:text-slate-300 file:mr-3 file:py-2 file:px-3.5 file:rounded-md file:border file:border-slate-300 dark:file:border-[#1D3A57] file:text-xs file:font-semibold file:bg-white dark:file:bg-[#0B1D31] file:text-[#0B2540] dark:file:text-[#FAF9F5] hover:file:bg-[#E8F1F6] dark:hover:file:bg-[#102843]"
                   />
                   {selectedFile && (
-                    <div className="mt-3 text-xs text-slate-700 font-mono">
-                      Arquivo pronto: {selectedFile.name} ({(selectedFile.size / 1024).toFixed(1)} KB)
+                    <div className="mt-3 text-xs text-[#0B2540] dark:text-slate-200 font-mono">
+                      Arquivo selecionado: {selectedFile.name} ({(selectedFile.size / 1024).toFixed(1)} KB)
                     </div>
                   )}
                 </div>
@@ -120,94 +128,109 @@ export function DocumentUploadView({ onSelectContract }: DocumentUploadViewProps
             </div>
 
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-              <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+              <label className="inline-flex items-center gap-2 text-xs text-slate-700 dark:text-slate-300 cursor-pointer">
                 <input
                   type="checkbox"
                   checked={forceOcr}
                   onChange={(e) => setForceOcr(e.target.checked)}
-                  className="rounded border-slate-300 text-blue-700 focus:ring-blue-600"
+                  className="rounded border-slate-300 dark:border-[#1D3A57] text-[#D95B35] focus:ring-[#D95B35]"
                 />
-                Forçar OCR seletivo (páginas escaneadas ou carimbos manuscritos)
+                Forçar OCR externo (páginas digitalizadas ou carimbos)
               </label>
 
               <button
                 type="submit"
                 disabled={processing}
-                className="px-5 py-2.5 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 disabled:opacity-60 rounded-md transition-colors whitespace-nowrap"
+                className="px-5 py-2.5 text-sm font-semibold text-white bg-[#0B2540] hover:bg-[#102843] dark:bg-[#D95B35] dark:hover:bg-[#c04c29] disabled:opacity-60 rounded-md transition-colors whitespace-nowrap"
               >
                 {processing ? 'Processando pipeline...' : 'Ingerir e Auditar Documento'}
               </button>
             </div>
           </form>
 
-          {/* Instant Reproducible Samples */}
-          <div className="lg:col-span-5 border-t lg:border-t-0 lg:border-l border-slate-200 pt-5 lg:pt-0 lg:pl-6 space-y-3">
-            <h2 className="text-sm font-semibold text-slate-900">
-              Testar Fluxo com Documentos de Referência
-            </h2>
-            <p className="text-xs text-slate-500 leading-relaxed">
-              Execute o pipeline completo (SHA-256, extração de campos, cruzamento PNCP e motor de
-              risco) utilizando extratos reais de demonstração:
-            </p>
-
-            <div className="space-y-2.5 pt-1">
-              <button
-                type="button"
-                disabled={processing}
-                onClick={() => handleRunSample('fsa-123-scan')}
-                className="w-full text-left p-3.5 rounded-md border border-slate-200 hover:border-blue-600 hover:bg-blue-50/40 transition-colors disabled:opacity-60"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-semibold text-slate-900">
-                    Contrato 123/2026 — PDF Digitalizado (OCR Seletivo)
-                  </span>
-                  <FileText className="w-4 h-4 text-slate-400 shrink-0" aria-hidden="true" />
-                </div>
-                <div className="text-xs text-slate-500 mt-1">
-                  SMS Feira de Santana · Executa fallback PaddleOCR + cruzamento PNCP/CEIS
-                </div>
-              </button>
-
-              <button
-                type="button"
-                disabled={processing}
-                onClick={() => handleRunSample('fsa-087-native')}
-                className="w-full text-left p-3.5 rounded-md border border-slate-200 hover:border-blue-600 hover:bg-blue-50/40 transition-colors disabled:opacity-60"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-semibold text-slate-900">
-                    Contrato 087/2026 — PDF Nativo (Docling Direto)
-                  </span>
-                  <FileText className="w-4 h-4 text-slate-400 shrink-0" aria-hidden="true" />
-                </div>
-                <div className="text-xs text-slate-500 mt-1">
-                  SEDUC Feira de Santana · Extração nativa sem OCR + análise QSA e merenda
-                </div>
-              </button>
-
-              <button
-                type="button"
-                disabled={processing}
-                onClick={() => handleRunSample('bdc-fms-list')}
-                className="w-full text-left p-3.5 rounded-md border border-slate-200 hover:border-blue-600 hover:bg-blue-50/40 transition-colors disabled:opacity-60"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-semibold text-slate-900">
-                    Relação de Contratos — Sec. Saúde Barra do Choça (Multi-Contrato)
-                  </span>
-                  <FileText className="w-4 h-4 text-blue-600 shrink-0" aria-hidden="true" />
-                </div>
-                <div className="text-xs text-slate-500 mt-1">
-                  Tabela 28/05/2026 (IN011, IN012/2026FMS, IN013, DL056) · Indexação em lote + CNAE Receita
-                </div>
-              </button>
+          {/* Live OCR Architecture & Status (Honest Real-Time Telemetry — zero sample presets) */}
+          <div className="lg:col-span-5 border-t lg:border-t-0 lg:border-l border-slate-200 dark:border-[#1D3A57] pt-5 lg:pt-0 lg:pl-6 space-y-3">
+            <div className="flex items-center gap-2">
+              <Cpu className="w-4 h-4 text-[#D95B35]" aria-hidden="true" />
+              <h2 className="text-sm font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
+                Arquitetura e Status do Motor de OCR
+              </h2>
             </div>
+
+            {ocrStatus ? (
+              <div className="space-y-2.5 text-xs">
+                <div className="p-3 rounded-md border border-slate-200 dark:border-[#1D3A57] bg-[#FAF9F5] dark:bg-[#061321] flex items-center justify-between gap-2">
+                  <div>
+                    <div className="font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
+                      Tier 0 · PDF Nativo &amp; UTF-8
+                    </div>
+                    <div className="text-slate-500 dark:text-slate-400 mt-0.5">
+                      FlateDecode com orçamento anti zip-bomb
+                    </div>
+                  </div>
+                  <span className="font-mono font-semibold text-emerald-700 dark:text-emerald-400">
+                    ATIVO
+                  </span>
+                </div>
+
+                <div className="p-3 rounded-md border border-slate-200 dark:border-[#1D3A57] bg-[#FAF9F5] dark:bg-[#061321] flex items-center justify-between gap-2">
+                  <div>
+                    <div className="font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
+                      Tier 1a · Docling Serve
+                    </div>
+                    <div className="text-slate-500 dark:text-slate-400 mt-0.5">
+                      {ocrStatus.doclingServe.detail}
+                    </div>
+                  </div>
+                  <span
+                    className={`font-mono font-semibold ${
+                      ocrStatus.doclingServe.reachable
+                        ? 'text-emerald-700 dark:text-emerald-400'
+                        : 'text-slate-500 dark:text-slate-400'
+                    }`}
+                  >
+                    {ocrStatus.doclingServe.reachable ? 'ONLINE' : 'OFFLINE'}
+                  </span>
+                </div>
+
+                <div className="p-3 rounded-md border border-slate-200 dark:border-[#1D3A57] bg-[#FAF9F5] dark:bg-[#061321] flex items-center justify-between gap-2">
+                  <div>
+                    <div className="font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
+                      Tier 1b · Worker PaddleOCR PT-BR
+                    </div>
+                    <div className="text-slate-500 dark:text-slate-400 mt-0.5">
+                      {ocrStatus.paddleOcr.detail}
+                    </div>
+                  </div>
+                  <span
+                    className={`font-mono font-semibold ${
+                      ocrStatus.paddleOcr.reachable
+                        ? 'text-emerald-700 dark:text-emerald-400'
+                        : 'text-slate-500 dark:text-slate-400'
+                    }`}
+                  >
+                    {ocrStatus.paddleOcr.reachable ? 'ONLINE' : 'OFFLINE'}
+                  </span>
+                </div>
+
+                <p className="text-[11px] text-slate-600 dark:text-slate-400 leading-relaxed pt-1">
+                  {ocrStatus.note}
+                </p>
+              </div>
+            ) : (
+              <div className="text-xs text-slate-500 dark:text-slate-400">
+                Verificando disponibilidade dos motores OCR...
+              </div>
+            )}
           </div>
         </div>
       </section>
 
       {error && (
-        <div role="alert" className="bg-red-50 border border-red-200 rounded-lg p-4 text-sm text-red-800">
+        <div
+          role="alert"
+          className="bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg p-4 text-sm text-red-800 dark:text-red-300"
+        >
           {error}
         </div>
       )}
@@ -216,29 +239,42 @@ export function DocumentUploadView({ onSelectContract }: DocumentUploadViewProps
       {result && (
         <section
           aria-label="Resultado do pipeline documental"
-          className="bg-white border border-slate-200 rounded-lg overflow-hidden"
+          className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg overflow-hidden"
         >
-          <div className="p-6 border-b border-slate-200 flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="p-6 border-b border-slate-200 dark:border-[#1D3A57] flex flex-col md:flex-row md:items-center justify-between gap-4">
             <div>
-              <div className="flex items-center gap-2 text-xs font-medium text-emerald-700">
+              <div className="flex items-center gap-2 text-xs font-medium text-emerald-700 dark:text-emerald-400">
                 <ShieldCheck className="w-4 h-4" aria-hidden="true" />
                 <span>Cadeia de custódia e extração concluídas</span>
               </div>
-              <h2 className="text-lg font-bold text-slate-900 mt-1">
-                Contrato {result.contract.contractNumber} — {result.contract.municipalityName}/
-                {result.contract.uf}
+              <h2 className="text-lg font-bold text-[#0B2540] dark:text-[#FAF9F5] mt-1">
+                Contrato {result.contract.contractNumber} — {result.contract.municipalityName}
+                {result.contract.uf ? `/${result.contract.uf}` : ''}
               </h2>
-              <div className="text-xs font-mono text-slate-500 mt-1 break-all">
+              <div className="text-xs font-mono text-slate-500 dark:text-slate-400 mt-1 break-all">
                 SHA-256: {result.sha256}
               </div>
+              {result.originalDownloadUrl && (
+                <a
+                  href={result.originalDownloadUrl}
+                  download
+                  className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#D95B35] hover:underline mt-2"
+                >
+                  <Download className="w-3.5 h-3.5" aria-hidden="true" />
+                  Baixar arquivo original preservado (SHA-256 verificado)
+                </a>
+              )}
             </div>
 
             <div className="flex flex-col items-start md:items-end gap-2 shrink-0">
-              <RiskScoreInline score={result.contract.assessment.score} />
+              <RiskScoreInline
+                score={result.contract.assessment.score}
+                coverageStatus={result.contract.assessment.coverageStatus}
+              />
               <button
                 type="button"
                 onClick={() => onSelectContract(result.contract)}
-                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-md transition-colors whitespace-nowrap"
+                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-[#0B2540] dark:bg-[#D95B35] hover:opacity-90 rounded-md transition-colors whitespace-nowrap"
               >
                 Abrir Dossiê Completo
                 <ArrowRight className="w-3.5 h-3.5" aria-hidden="true" />
@@ -246,26 +282,41 @@ export function DocumentUploadView({ onSelectContract }: DocumentUploadViewProps
             </div>
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-12 divide-y lg:divide-y-0 lg:divide-x divide-slate-200">
+          {result.ocrTelemetry?.truncated && (
+            <div className="px-6 py-3 bg-amber-50 dark:bg-amber-950/30 border-b border-amber-200 dark:border-amber-800 text-xs text-amber-900 dark:text-amber-200 flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0" aria-hidden="true" />
+              <span>
+                Cobertura parcial de páginas: {result.ocrTelemetry.processedPageCount} de{' '}
+                {result.ocrTelemetry.originalPageCount} páginas foram processadas dentro do orçamento
+                seguro.
+              </span>
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 lg:grid-cols-12 divide-y lg:divide-y-0 lg:divide-x divide-slate-200 dark:divide-[#1D3A57]">
             {/* Stage Trace */}
             <div className="lg:col-span-5 p-6 space-y-4">
-              <h3 className="text-sm font-semibold text-slate-900">
+              <h3 className="text-sm font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
                 Etapas executadas
               </h3>
               <ol className="space-y-3.5">
                 {result.pipelineSteps.map((step, idx) => (
-                  <li key={step.stage} className="flex items-start gap-3">
+                  <li key={`${step.stage}-${idx}`} className="flex items-start gap-3">
                     <CheckCircle2
                       className={`w-4 h-4 shrink-0 mt-0.5 ${
-                        step.status === 'ok' ? 'text-emerald-600' : 'text-amber-600'
+                        step.status === 'ok'
+                          ? 'text-emerald-600 dark:text-emerald-400'
+                          : 'text-amber-600 dark:text-amber-400'
                       }`}
                       aria-hidden="true"
                     />
                     <div>
-                      <div className="text-sm font-semibold text-slate-900">
+                      <div className="text-sm font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
                         0{idx + 1}. {step.stage}
                       </div>
-                      <p className="text-xs text-slate-600 mt-0.5">{step.detail}</p>
+                      <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5">
+                        {step.detail}
+                      </p>
                     </div>
                   </li>
                 ))}
@@ -275,10 +326,10 @@ export function DocumentUploadView({ onSelectContract }: DocumentUploadViewProps
             {/* Extracted Normalized Fields */}
             <div className="lg:col-span-7 p-6 space-y-4">
               <div className="flex items-center justify-between gap-2">
-                <h3 className="text-sm font-semibold text-slate-900">
+                <h3 className="text-sm font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
                   Campos extraídos e normalizados
                 </h3>
-                <span className="text-xs font-mono text-slate-500">
+                <span className="text-xs font-mono text-slate-500 dark:text-slate-400">
                   Método: {result.extraction.extractionMethod} · Confiança{' '}
                   {Math.round(result.extraction.confidence * 100)}%
                 </span>
@@ -286,20 +337,22 @@ export function DocumentUploadView({ onSelectContract }: DocumentUploadViewProps
 
               <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-3 text-xs">
                 <div>
-                  <dt className="text-slate-500">Nº Contrato</dt>
-                  <dd className="font-mono font-semibold text-slate-900 mt-0.5">
+                  <dt className="text-slate-500 dark:text-slate-400">Nº Contrato</dt>
+                  <dd className="font-mono font-semibold text-[#0B2540] dark:text-[#FAF9F5] mt-0.5">
                     {result.extraction.contractNumber ?? result.contract.contractNumber}
                   </dd>
                 </div>
                 <div>
-                  <dt className="text-slate-500">CNPJ Fornecedor</dt>
-                  <dd className="font-mono font-semibold text-slate-900 mt-0.5">
-                    {formatCnpj(result.extraction.cnpj ?? result.contract.supplier.cnpj)}
+                  <dt className="text-slate-500 dark:text-slate-400">CNPJ Fornecedor</dt>
+                  <dd className="font-mono font-semibold text-[#0B2540] dark:text-[#FAF9F5] mt-0.5">
+                    {result.extraction.cnpj || result.contract.supplier.cnpj
+                      ? formatCnpj(result.extraction.cnpj ?? result.contract.supplier.cnpj)
+                      : 'Não identificado no documento'}
                   </dd>
                 </div>
                 <div>
-                  <dt className="text-slate-500">Valor Original Extraído</dt>
-                  <dd className="font-mono tabular-nums font-semibold text-slate-900 mt-0.5">
+                  <dt className="text-slate-500 dark:text-slate-400">Valor Original Extraído</dt>
+                  <dd className="font-mono tabular-nums font-semibold text-[#0B2540] dark:text-[#FAF9F5] mt-0.5">
                     {result.extraction.originalValue
                       ? formatCurrencyBRL(result.extraction.originalValue)
                       : result.contract.originalValue > 0
@@ -308,34 +361,36 @@ export function DocumentUploadView({ onSelectContract }: DocumentUploadViewProps
                   </dd>
                 </div>
                 <div>
-                  <dt className="text-slate-500">Cruzamento PNCP</dt>
-                  <dd className="font-medium text-slate-900 mt-0.5">
+                  <dt className="text-slate-500 dark:text-slate-400">Cruzamento PNCP</dt>
+                  <dd className="font-medium text-[#0B2540] dark:text-[#FAF9F5] mt-0.5">
                     {result.matchedPncp
                       ? `Reconciliado (${result.contract.pncpControlNumber})`
-                      : 'Sem espelho PNCP — criado via documento'}
+                      : 'Não consultado no PNCP — dossiê documental'}
                   </dd>
                 </div>
                 <div className="sm:col-span-2">
-                  <dt className="text-slate-500">Objeto Identificado</dt>
-                  <dd className="text-slate-900 mt-0.5">
+                  <dt className="text-slate-500 dark:text-slate-400">Objeto Identificado</dt>
+                  <dd className="text-[#0B2540] dark:text-slate-200 mt-0.5">
                     {result.extraction.object ?? result.contract.object}
                   </dd>
                 </div>
               </dl>
 
               {result.extraction.excerpts.length > 0 && (
-                <div className="pt-3 border-t border-slate-100">
-                  <div className="text-xs font-medium text-slate-500 mb-2">
+                <div className="pt-3 border-t border-slate-100 dark:border-[#1D3A57]">
+                  <div className="text-xs font-medium text-slate-500 dark:text-slate-400 mb-2">
                     Trechos Probatórios Capturados
                   </div>
                   <div className="space-y-1.5">
                     {result.extraction.excerpts.slice(0, 4).map((ex, i) => (
                       <div
                         key={`${ex.field}-${i}`}
-                        className="text-xs text-slate-700 font-mono bg-slate-50 border border-slate-200 rounded px-2.5 py-1.5"
+                        className="text-xs text-slate-700 dark:text-slate-200 font-mono bg-[#FAF9F5] dark:bg-[#061321] border border-slate-200 dark:border-[#1D3A57] rounded px-2.5 py-1.5"
                       >
-                        <span className="text-slate-500">p.{ex.pageNumber} [{ex.field}]</span> — “
-                        {ex.excerpt}”
+                        <span className="text-slate-500 dark:text-slate-400">
+                          p.{ex.pageNumber} [{ex.field}]
+                        </span>{' '}
+                        — “{ex.excerpt}”
                       </div>
                     ))}
                   </div>
@@ -343,65 +398,6 @@ export function DocumentUploadView({ onSelectContract }: DocumentUploadViewProps
               )}
             </div>
           </div>
-
-          {result.batchContracts && result.batchContracts.length > 1 && (
-            <div className="border-t border-slate-200">
-              <div className="px-6 py-4 bg-slate-50/70 border-b border-slate-200 flex items-center justify-between gap-4">
-                <div>
-                  <h3 className="text-sm font-semibold text-slate-900">
-                    Contratos Indexados da Tabela Municipal ({result.batchContracts.length})
-                  </h3>
-                  <p className="text-xs text-slate-500 mt-0.5">
-                    Todos os registros extraídos já estão disponíveis na busca e podem ser auditados individualmente.
-                  </p>
-                </div>
-              </div>
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse text-xs">
-                  <thead>
-                    <tr className="border-b border-slate-200 bg-slate-50 text-slate-500">
-                      <th className="py-2.5 px-4">Nº Contrato</th>
-                      <th className="py-2.5 px-4">Fornecedor / CNPJ</th>
-                      <th className="py-2.5 px-4">Objeto</th>
-                      <th className="py-2.5 px-4">Risco</th>
-                      <th className="py-2.5 px-4 text-right">Dossiê</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-200">
-                    {result.batchContracts.map((item) => (
-                      <tr key={item.id} className="hover:bg-slate-50/70">
-                        <td className="py-3 px-4 font-mono font-semibold text-slate-900 whitespace-nowrap">
-                          {item.contractNumber}
-                        </td>
-                        <td className="py-3 px-4">
-                          <div className="font-medium text-slate-900">{item.supplier.legalName}</div>
-                          {item.supplier.cnpj !== '00000000000000' && (
-                            <div className="font-mono text-slate-500">
-                              {formatCnpj(item.supplier.cnpj)}
-                            </div>
-                          )}
-                        </td>
-                        <td className="py-3 px-4 text-slate-700 max-w-md">{item.object}</td>
-                        <td className="py-3 px-4 whitespace-nowrap">
-                          <RiskScoreInline score={item.assessment.score} />
-                        </td>
-                        <td className="py-3 px-4 text-right whitespace-nowrap">
-                          <button
-                            type="button"
-                            onClick={() => onSelectContract(item)}
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 rounded-md"
-                          >
-                            Abrir
-                            <ArrowRight className="w-3 h-3" aria-hidden="true" />
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
         </section>
       )}
     </div>

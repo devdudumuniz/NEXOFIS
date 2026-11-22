@@ -3,11 +3,99 @@ import type {
   FindingReviewRecord,
   GovernmentEntity,
   Municipality,
+  SavedDossierSnapshot,
   SavedDossierSummary,
 } from '../types/audit';
 import type { ExtractedDocumentFields } from './documentParser';
 import type { RiskDashboardSummary } from './dashboardAggregator';
 import type { ParsedContractCode } from './pncpQueryParser';
+
+// In-memory session token ONLY (never persisted to localStorage — SecureCoder / A09)
+let inMemoryAuthToken: string | null = null;
+
+export function setAuthToken(token: string | null): void {
+  inMemoryAuthToken = token && token.trim() ? token.trim() : null;
+}
+
+export function getAuthToken(): string | null {
+  return inMemoryAuthToken;
+}
+
+export function clearAuthToken(): void {
+  inMemoryAuthToken = null;
+}
+
+export class ApiError extends Error {
+  readonly status: number;
+  readonly body?: Record<string, unknown>;
+
+  constructor(message: string, status: number, body?: Record<string, unknown>) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.body = body;
+  }
+}
+
+function buildAuthHeaders(extra?: Record<string, string>): Record<string, string> {
+  const headers: Record<string, string> = { ...(extra ?? {}) };
+  if (inMemoryAuthToken) {
+    headers.Authorization = `Bearer ${inMemoryAuthToken}`;
+  }
+  return headers;
+}
+
+async function parseErrorResponse(res: Response, fallbackMessage: string): Promise<ApiError> {
+  const ct = res.headers.get('content-type') || '';
+  const body = ct.includes('application/json')
+    ? ((await res.json().catch(() => null)) as Record<string, unknown> | null)
+    : null;
+  const msg =
+    body && typeof body.error === 'string' && body.error.trim()
+      ? body.error
+      : `${fallbackMessage} (HTTP ${res.status})`;
+  return new ApiError(msg, res.status, body ?? undefined);
+}
+
+async function readJson<T>(res: Response, fallbackMessage: string): Promise<T> {
+  if (!res.ok) {
+    throw await parseErrorResponse(res, fallbackMessage);
+  }
+  const ct = res.headers.get('content-type') || '';
+  if (!ct.includes('application/json')) {
+    throw new ApiError(
+      `${fallbackMessage} (resposta inesperada do servidor; verifique se a API está ativa)`,
+      res.status || 502
+    );
+  }
+  return (await res.json()) as T;
+}
+
+export interface AuthPrincipalInfo {
+  userId: string;
+  email?: string;
+  displayName?: string;
+  role: 'admin' | 'analyst' | 'viewer';
+  authEnabled: boolean;
+}
+
+export interface AuthStatusResponse {
+  authEnabled: boolean;
+  needsBootstrap: boolean;
+  userCount: number;
+  principal: AuthPrincipalInfo | null;
+}
+
+export interface OcrStatusResponse {
+  tier0NativeReady: boolean;
+  doclingServe: { configured: boolean; reachable: boolean; detail: string };
+  paddleOcr: { configured: boolean; reachable: boolean; detail: string };
+  multimodalFallbackConfigured: boolean;
+  fullOcrReady: boolean;
+  supportedFormats: string[];
+  note: string;
+  checkedAt: string;
+}
 
 export interface RiskDashboardResponse {
   storageEngine: string;
@@ -26,6 +114,7 @@ export interface MunicipalityContextResponse {
     totalValue: number;
     highRiskCount: number;
     livePncpUsed: boolean;
+    pncpMessage?: string;
   };
 }
 
@@ -52,8 +141,11 @@ export interface CnpjCoverageInfo {
 }
 
 export interface DocumentUploadResponse {
+  jobId?: string;
   sha256: string;
   idempotentDuplicate?: boolean;
+  originalObjectStored?: boolean;
+  originalDownloadUrl?: string;
   matchedPncp: boolean;
   matchStatus?: 'matched' | 'ambiguous' | 'unmatched';
   ambiguousCandidates?: Array<{
@@ -66,6 +158,22 @@ export interface DocumentUploadResponse {
     supplierName: string;
   }>;
   extraction: ExtractedDocumentFields;
+  ocrTelemetry?: {
+    engineUsed: string;
+    extractorVersion: string;
+    durationMs: number;
+    totalPages: number;
+    originalPageCount: number;
+    processedPageCount: number;
+    truncated: boolean;
+    budgetExceeded: boolean;
+    budgetReason?: string;
+    pagesSkippedOcr: number;
+    pagesOcrProcessed: number;
+    qualityScore: number;
+    ocrCorrectionsApplied: number;
+    fromCache: boolean;
+  };
   pipelineSteps: Array<{
     stage: string;
     status: 'ok' | 'fallback';
@@ -75,16 +183,62 @@ export interface DocumentUploadResponse {
   batchContracts?: EvaluatedContract[];
 }
 
+export async function fetchAuthStatus(): Promise<AuthStatusResponse> {
+  const res = await fetch('/api/auth/status', { headers: buildAuthHeaders() });
+  return readJson<AuthStatusResponse>(res, 'Falha ao consultar estado de autenticação.');
+}
+
+export async function bootstrapAdmin(payload: {
+  email: string;
+  displayName: string;
+  password: string;
+}): Promise<{ token: string; principal: AuthPrincipalInfo }> {
+  const res = await fetch('/api/auth/bootstrap-admin', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await readJson<{ token: string; principal: AuthPrincipalInfo }>(
+    res,
+    'Falha ao criar administrador inicial.'
+  );
+  setAuthToken(data.token);
+  return data;
+}
+
+export async function loginAuth(payload: {
+  email: string;
+  password: string;
+}): Promise<{ token: string; principal: AuthPrincipalInfo }> {
+  const res = await fetch('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await readJson<{ token: string; principal: AuthPrincipalInfo }>(
+    res,
+    'Falha ao autenticar usuário.'
+  );
+  setAuthToken(data.token);
+  return data;
+}
+
+export async function fetchOcrStatus(): Promise<OcrStatusResponse> {
+  const res = await fetch('/api/ocr/status', { headers: buildAuthHeaders() });
+  return readJson<OcrStatusResponse>(res, 'Falha ao consultar status do motor OCR.');
+}
+
 export async function searchMunicipalities(query: string): Promise<{
   results: Municipality[];
   totalIndexed: number;
 }> {
-  const res = await fetch(`/api/municipalities/search?q=${encodeURIComponent(query)}`);
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: 'Falha ao consultar municípios IBGE.' }));
-    throw new Error(err.error || 'Falha ao consultar municípios IBGE.');
-  }
-  return res.json();
+  const res = await fetch(`/api/municipalities/search?q=${encodeURIComponent(query)}`, {
+    headers: buildAuthHeaders(),
+  });
+  return readJson<{ results: Municipality[]; totalIndexed: number }>(
+    res,
+    'Falha ao consultar municípios IBGE.'
+  );
 }
 
 export async function fetchRiskDashboardSummary(period?: {
@@ -95,12 +249,10 @@ export async function fetchRiskDashboardSummary(period?: {
   if (period?.startDate) qs.set('startDate', period.startDate);
   if (period?.endDate) qs.set('endDate', period.endDate);
   const suffix = qs.toString() ? `?${qs.toString()}` : '';
-  const res = await fetch(`/api/dashboard/risk-summary${suffix}`);
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: 'Falha ao carregar painel de riscos.' }));
-    throw new Error(err.error || 'Falha ao carregar painel de riscos.');
-  }
-  return res.json();
+  const res = await fetch(`/api/dashboard/risk-summary${suffix}`, {
+    headers: buildAuthHeaders(),
+  });
+  return readJson<RiskDashboardResponse>(res, 'Falha ao carregar painel de riscos.');
 }
 
 export async function fetchMunicipalityContext(
@@ -111,12 +263,10 @@ export async function fetchMunicipalityContext(
   if (period?.startDate) qs.set('startDate', period.startDate);
   if (period?.endDate) qs.set('endDate', period.endDate);
   const suffix = qs.toString() ? `?${qs.toString()}` : '';
-  const res = await fetch(`/api/municipalities/${encodeURIComponent(ibgeCode)}/context${suffix}`);
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: 'Falha ao carregar contexto municipal.' }));
-    throw new Error(err.error || 'Falha ao carregar contexto municipal.');
-  }
-  return res.json();
+  const res = await fetch(`/api/municipalities/${encodeURIComponent(ibgeCode)}/context${suffix}`, {
+    headers: buildAuthHeaders(),
+  });
+  return readJson<MunicipalityContextResponse>(res, 'Falha ao carregar contexto municipal.');
 }
 
 export async function searchContracts(params: {
@@ -157,12 +307,10 @@ export async function searchContracts(params: {
   if (params.startDate) qs.set('startDate', params.startDate);
   if (params.endDate) qs.set('endDate', params.endDate);
   if (params.minRisk) qs.set('minRisk', String(params.minRisk));
-  const res = await fetch(`/api/contracts/search?${qs.toString()}`);
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: 'Falha ao buscar contratos.' }));
-    throw new Error(err.error || 'Falha ao buscar contratos.');
-  }
-  return res.json();
+  const res = await fetch(`/api/contracts/search?${qs.toString()}`, {
+    headers: buildAuthHeaders(),
+  });
+  return readJson(res, 'Falha ao buscar contratos.');
 }
 
 export async function fetchSupplierMirrorContracts(cnpj: string): Promise<{
@@ -171,24 +319,31 @@ export async function fetchSupplierMirrorContracts(cnpj: string): Promise<{
   indexSource: string;
   contracts: EvaluatedContract[];
 }> {
-  const res = await fetch(`/api/suppliers/${encodeURIComponent(cnpj)}/contracts`);
-  if (!res.ok) throw new Error('Falha ao consultar contratos horizontais do fornecedor.');
-  return res.json();
+  const res = await fetch(`/api/suppliers/${encodeURIComponent(cnpj)}/contracts`, {
+    headers: buildAuthHeaders(),
+  });
+  return readJson(res, 'Falha ao consultar contratos horizontais do fornecedor.');
 }
 
 export async function fetchContractById(id: string): Promise<EvaluatedContract> {
-  const res = await fetch(`/api/contracts/${encodeURIComponent(id)}`);
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({ error: 'Contrato não encontrado.' }));
-    throw new Error(err.error || 'Contrato não encontrado.');
-  }
-  return res.json();
+  const res = await fetch(`/api/contracts/${encodeURIComponent(id)}`, {
+    headers: buildAuthHeaders(),
+  });
+  return readJson<EvaluatedContract>(res, 'Contrato não encontrado.');
 }
 
+/**
+ * UI-02: Never swallow HTTP errors into an empty array. Always throw ApiError so UI can preserve
+ * last known state and display an explicit retry banner.
+ */
 export async function fetchFindingReviews(contractId: string): Promise<FindingReviewRecord[]> {
-  const res = await fetch(`/api/contracts/${encodeURIComponent(contractId)}/reviews`);
-  if (!res.ok) return [];
-  const data = (await res.json()) as { reviews: FindingReviewRecord[] };
+  const res = await fetch(`/api/contracts/${encodeURIComponent(contractId)}/reviews`, {
+    headers: buildAuthHeaders(),
+  });
+  const data = await readJson<{ reviews: FindingReviewRecord[] }>(
+    res,
+    'Falha ao carregar histórico de revisões do auditor.'
+  );
   return Array.isArray(data.reviews) ? data.reviews : [];
 }
 
@@ -198,23 +353,17 @@ export async function submitFindingReview(
   payload: {
     action: 'dismiss' | 'restore';
     rationale: string;
-    author?: string;
-    ruleVersion?: string;
   }
 ): Promise<{ review: FindingReviewRecord; reviews: FindingReviewRecord[] }> {
   const res = await fetch(
     `/api/contracts/${encodeURIComponent(contractId)}/findings/${encodeURIComponent(findingId)}/review`,
     {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify(payload),
     }
   );
-  const data = await res.json().catch(() => ({ error: 'Falha ao registrar revisão humana.' }));
-  if (!res.ok) {
-    throw new Error(data.error || 'Falha ao registrar revisão humana.');
-  }
-  return data as { review: FindingReviewRecord; reviews: FindingReviewRecord[] };
+  return readJson(res, 'Falha ao registrar revisão humana.');
 }
 
 export async function checkLiveSupplierCnpj(cnpj: string): Promise<{
@@ -231,9 +380,10 @@ export async function checkLiveSupplierCnpj(cnpj: string): Promise<{
     shareholders?: Array<{ name: string; role: string; entryDate: string }>;
   };
 }> {
-  const res = await fetch(`/api/suppliers/${encodeURIComponent(cnpj)}/live-check`);
-  if (!res.ok) throw new Error('Falha ao consultar CNPJ na base externa.');
-  return res.json();
+  const res = await fetch(`/api/suppliers/${encodeURIComponent(cnpj)}/live-check`, {
+    headers: buildAuthHeaders(),
+  });
+  return readJson(res, 'Falha ao consultar CNPJ na base externa.');
 }
 
 export async function uploadContractDocument(
@@ -246,35 +396,33 @@ export async function uploadContractDocument(
 
   const res = await fetch('/api/documents/upload', {
     method: 'POST',
+    headers: buildAuthHeaders(),
     body: form,
   });
-  const payload = await res.json().catch(() => ({ error: 'Erro ao processar resposta do servidor.' }));
-  if (!res.ok) {
-    throw new Error(payload.error || 'Não foi possível processar o documento enviado.');
-  }
-  return payload as DocumentUploadResponse;
+  return readJson<DocumentUploadResponse>(res, 'Não foi possível processar o documento enviado.');
 }
 
-export async function ingestSampleDocument(
-  sampleType: 'fsa-123-scan' | 'fsa-087-native' | 'bdc-fms-list'
-): Promise<DocumentUploadResponse> {
-  const res = await fetch('/api/documents/ingest-sample', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sampleType }),
-  });
-  const payload = await res.json().catch(() => ({ error: 'Falha ao processar documento de demonstração.' }));
-  if (!res.ok) {
-    throw new Error(payload.error || 'Falha ao processar documento de demonstração.');
-  }
-  return payload as DocumentUploadResponse;
-}
-
+/**
+ * UI-02: Never swallow HTTP errors into an empty array.
+ */
 export async function fetchSavedDossiers(): Promise<SavedDossierSummary[]> {
-  const res = await fetch('/api/dossiers');
-  if (!res.ok) return [];
-  const data = (await res.json()) as { dossiers: SavedDossierSummary[] };
-  return data.dossiers;
+  const res = await fetch('/api/dossiers', { headers: buildAuthHeaders() });
+  const data = await readJson<{ dossiers: SavedDossierSummary[] }>(
+    res,
+    'Falha ao carregar dossiês arquivados.'
+  );
+  return Array.isArray(data.dossiers) ? data.dossiers : [];
+}
+
+export async function fetchDossierSnapshot(id: string): Promise<SavedDossierSnapshot> {
+  const res = await fetch(`/api/dossiers/${encodeURIComponent(id)}`, {
+    headers: buildAuthHeaders(),
+  });
+  const data = await readJson<{ dossier: SavedDossierSnapshot }>(
+    res,
+    'Falha ao carregar snapshot do dossiê arquivado.'
+  );
+  return data.dossier;
 }
 
 export async function saveDossier(
@@ -283,19 +431,20 @@ export async function saveDossier(
 ): Promise<{ dossier: SavedDossierSummary; dossiers: SavedDossierSummary[] }> {
   const res = await fetch('/api/dossiers', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ contractId, analystNote }),
   });
-  if (!res.ok) throw new Error('Falha ao salvar dossiê.');
-  return res.json();
+  return readJson(res, 'Falha ao salvar dossiê.');
 }
 
 export async function deleteSavedDossier(id: string): Promise<SavedDossierSummary[]> {
   const res = await fetch(`/api/dossiers/${encodeURIComponent(id)}`, {
     method: 'DELETE',
+    headers: buildAuthHeaders(),
   });
-  if (!res.ok) throw new Error('Falha ao remover dossiê.');
-  const data = (await res.json()) as { dossiers: SavedDossierSummary[] };
+  const data = await readJson<{ dossiers: SavedDossierSummary[] }>(
+    res,
+    'Falha ao remover dossiê.'
+  );
   return data.dossiers;
 }
-

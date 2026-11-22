@@ -38,7 +38,7 @@ export function ContractSearchView({
   onSelectContract,
   onNavigateToDocument,
 }: ContractSearchViewProps) {
-  const [query, setQuery] = useState(filterState?.query ?? '123/2026');
+  const [query, setQuery] = useState(filterState?.query ?? '');
   const [ibgeFilter, setIbgeFilter] = useState(filterState?.ibgeFilter ?? '');
   const [municipalityInput, setMunicipalityInput] = useState(filterState?.municipalityInput ?? '');
   const [municipalitySuggestions, setMunicipalitySuggestions] = useState<Municipality[]>([]);
@@ -85,7 +85,7 @@ export function ContractSearchView({
     });
   }, [query, ibgeFilter, municipalityInput, yearFilter, statusFilter, startDate, endDate, minRisk]);
 
-  // Live IBGE autocomplete for all 5,571 Brazilian municipalities
+  // Live IBGE autocomplete for all Brazilian municipalities
   useEffect(() => {
     let cancelled = false;
     const timer = setTimeout(() => {
@@ -166,16 +166,35 @@ export function ContractSearchView({
     setShowMunicipalityMenu(false);
   };
 
+  const handleResetFilters = () => {
+    setQuery('');
+    handleClearMunicipality();
+    setYearFilter('');
+    setStatusFilter('');
+    setStartDate('');
+    setEndDate('');
+    setMinRisk(0);
+    runSearch({
+      q: '',
+      ibge: '',
+      year: '',
+      status: '',
+      startDate: '',
+      endDate: '',
+      minRisk: 0,
+    });
+  };
+
   const renderContractRow = (contract: EvaluatedContract) => {
     const valueOmitted = contract.originalValue === 0 && contract.updatedValue === 0;
     const lifecycleBucket = resolveContractLifecycleStatus(contract);
     const lifecycleLabel = CONTRACT_LIFECYCLE_LABELS[lifecycleBucket];
     const lifecycleColorClass =
       lifecycleBucket === 'suspenso'
-        ? 'text-red-700 font-semibold'
+        ? 'text-red-700 dark:text-red-400 font-semibold'
         : lifecycleBucket === 'concluido'
-          ? 'text-slate-600 font-medium'
-          : 'text-emerald-700 font-medium';
+          ? 'text-slate-600 dark:text-slate-400 font-medium'
+          : 'text-emerald-700 dark:text-emerald-400 font-medium';
     const roleLabel =
       contract.cnpjRole === 'fornecedor'
         ? 'Papel: Fornecedor'
@@ -184,44 +203,54 @@ export function ContractSearchView({
           : contract.cnpjRole === 'subcontratado'
             ? 'Papel: Subcontratado'
             : null;
+
     return (
       <div
         key={contract.id}
-        className="p-5 hover:bg-slate-50/70 transition-colors flex flex-col lg:flex-row lg:items-center justify-between gap-4"
+        className="p-5 hover:bg-[#FAF9F5] dark:hover:bg-[#102843]/50 transition-colors flex flex-col lg:flex-row lg:items-center justify-between gap-4"
       >
         <div className="space-y-1.5 max-w-3xl">
           <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs">
-            <span className="font-mono font-semibold text-slate-900 text-sm">
+            <span className="font-mono font-semibold text-[#0B2540] dark:text-[#FAF9F5] text-sm">
               Contrato {contract.contractNumber}
             </span>
             <span className="text-slate-400" aria-hidden="true">·</span>
             <span className={lifecycleColorClass}>{lifecycleLabel}</span>
             <span className="text-slate-400" aria-hidden="true">·</span>
-            <span className="font-medium text-slate-700">
-              {contract.municipalityName}/{contract.uf}
+            <span className="font-medium text-slate-700 dark:text-slate-300">
+              {contract.municipalityName}
+              {contract.uf ? `/${contract.uf}` : ''}
             </span>
-            <span className="font-mono tabular-nums text-slate-500">
-              (IBGE {contract.municipalityIbge})
-            </span>
-            <span className="text-slate-400" aria-hidden="true">·</span>
-            <span className="font-mono text-slate-500">
-              {contract.pncpControlNumber}
-            </span>
-          </div>
-
-          <div className="text-xs font-medium text-slate-600">
-            {contract.entityName} · {contract.modality}
-            {roleLabel && (
+            {contract.municipalityIbge && (
+              <span className="font-mono tabular-nums text-slate-500 dark:text-slate-400">
+                (IBGE {contract.municipalityIbge})
+              </span>
+            )}
+            {contract.pncpControlNumber && (
               <>
-                {' '}· <span className="font-mono text-blue-700">{roleLabel}</span>
+                <span className="text-slate-400" aria-hidden="true">·</span>
+                <span className="font-mono text-slate-500 dark:text-slate-400">
+                  {contract.pncpControlNumber}
+                </span>
               </>
             )}
           </div>
-          <p className="text-sm text-slate-900">{contract.object}</p>
-          <div className="text-xs text-slate-500">
+
+          <div className="text-xs font-medium text-slate-600 dark:text-slate-300">
+            {contract.entityName} · {contract.modality}
+            {roleLabel && (
+              <>
+                {' '}· <span className="font-mono text-[#D95B35]">{roleLabel}</span>
+              </>
+            )}
+          </div>
+          <p className="text-sm text-[#0B2540] dark:text-[#FAF9F5]">{contract.object}</p>
+          <div className="text-xs text-slate-500 dark:text-slate-400">
             Fornecedor:{' '}
-            <span className="text-slate-800 font-medium">{contract.supplier.legalName}</span>{' '}
-            {contract.supplier.cnpj !== '00000000000000' && (
+            <span className="text-[#0B2540] dark:text-slate-200 font-medium">
+              {contract.supplier.legalName}
+            </span>{' '}
+            {contract.supplier.cnpj && contract.supplier.cnpj !== '00000000000000' && (
               <span className="font-mono tabular-nums">
                 ({formatCnpj(contract.supplier.cnpj)}
                 {cnpjCoverage?.relatedMatrizCnpj &&
@@ -239,22 +268,27 @@ export function ContractSearchView({
 
         <div className="flex flex-row lg:flex-col items-center lg:items-end justify-between gap-2 shrink-0">
           <div className="text-left lg:text-right">
-            <div className="font-mono tabular-nums font-semibold text-slate-900">
+            <div className="font-mono tabular-nums font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
               {valueOmitted ? (
-                <span className="text-amber-800 text-xs font-semibold">Não divulgado</span>
+                <span className="text-amber-800 dark:text-amber-400 text-xs font-semibold">
+                  Não divulgado
+                </span>
               ) : (
                 formatCurrencyBRL(contract.updatedValue)
               )}
             </div>
             <div className="mt-0.5 text-xs">
-              <RiskScoreInline score={contract.assessment.score} />
+              <RiskScoreInline
+                score={contract.assessment.score}
+                coverageStatus={contract.assessment.coverageStatus}
+              />
             </div>
           </div>
           <button
             type="button"
             onClick={() => onSelectContract(contract)}
-            aria-label={`Abrir dossiê do contrato ${contract.contractNumber} de ${contract.municipalityName}`}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-md transition-colors whitespace-nowrap"
+            aria-label={`Abrir dossiê do contrato ${contract.contractNumber}`}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-[#0B2540] hover:bg-[#102843] dark:bg-[#D95B35] dark:hover:bg-[#c04c29] rounded-md transition-colors whitespace-nowrap"
           >
             Abrir Dossiê
             <ArrowRight className="w-3.5 h-3.5" aria-hidden="true" />
@@ -266,27 +300,29 @@ export function ContractSearchView({
 
   return (
     <div className="space-y-6">
-      <section className="bg-white border border-slate-200 rounded-lg p-6">
+      <section className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg p-6">
         <div className="mb-5">
-          <h1 className="text-2xl font-bold tracking-tight text-slate-900">
-            Busca e Desambiguação de Contrato
+          <h1 className="text-2xl font-bold tracking-tight text-[#0B2540] dark:text-[#FAF9F5]">
+            Busca e Desambiguação de Contratos
           </h1>
-          <p className="text-sm text-slate-600 mt-1 max-w-3xl">
-            Informe o código municipal (ex.: <span className="font-mono text-slate-800">IN012/2026FMS</span>),
-            cole uma <span className="font-mono text-slate-800">URL do PNCP / Transparência</span> ou
-            busque pelo CNPJ do fornecedor. Selecione qualquer um dos 5.571 municípios do IBGE para
-            consultar simultaneamente o espelho local e a API oficial do PNCP em tempo real.
+          <p className="text-sm text-slate-600 dark:text-slate-300 mt-1 max-w-3xl">
+            Consulte por número do contrato, URL oficial do PNCP ou CNPJ (formato numérico tradicional
+            ou alfanumérico RFB 2026). Combine com município IBGE, período de datas e status de ciclo
+            de vida.
           </p>
         </div>
 
         <form onSubmit={handleSubmit} className="grid grid-cols-1 md:grid-cols-12 gap-3">
           <div className="md:col-span-5">
-            <label htmlFor="contract-q" className="block text-xs font-medium text-slate-600 mb-1">
-              Nº do contrato, código municipal, URL PNCP ou CNPJ
+            <label
+              htmlFor="contract-q"
+              className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1"
+            >
+              Nº do contrato, URL PNCP ou CNPJ (numérico ou alfanumérico)
             </label>
             <div className="relative">
               <Search
-                className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
+                className="w-4 h-4 text-slate-400 dark:text-slate-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
                 aria-hidden="true"
               />
               <input
@@ -294,15 +330,18 @@ export function ContractSearchView({
                 type="text"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Ex.: IN012/2026FMS, 123/2026 ou URL do PNCP"
-                className="w-full h-10 pl-9 pr-3 text-sm bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600"
+                placeholder="Digite número do contrato, URL do PNCP ou CNPJ"
+                className="w-full h-10 pl-9 pr-3 text-sm bg-white dark:bg-[#061321] border border-slate-300 dark:border-[#1D3A57] text-[#0B2540] dark:text-[#FAF9F5] placeholder:text-slate-400 dark:placeholder:text-slate-500 rounded-md focus:outline-none focus:ring-2 focus:ring-[#D95B35]"
               />
             </div>
           </div>
 
           <div className="md:col-span-3 relative">
-            <label htmlFor="contract-ibge" className="block text-xs font-medium text-slate-600 mb-1">
-              Município (5.571 IBGE + PNCP ao vivo)
+            <label
+              htmlFor="contract-ibge"
+              className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1"
+            >
+              Município (IBGE + PNCP ao vivo)
             </label>
             <div className="relative">
               <input
@@ -324,14 +363,14 @@ export function ContractSearchView({
                 }}
                 placeholder="Todos · digite cidade ou IBGE"
                 autoComplete="off"
-                className="w-full h-10 px-3 pr-8 text-sm bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600"
+                className="w-full h-10 px-3 pr-8 text-sm bg-white dark:bg-[#061321] border border-slate-300 dark:border-[#1D3A57] text-[#0B2540] dark:text-[#FAF9F5] placeholder:text-slate-400 dark:placeholder:text-slate-500 rounded-md focus:outline-none focus:ring-2 focus:ring-[#D95B35]"
               />
               {(municipalityInput || ibgeFilter) && (
                 <button
                   type="button"
                   onClick={handleClearMunicipality}
                   aria-label="Limpar filtro de município"
-                  className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-700"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-[#0B2540] dark:hover:text-white"
                 >
                   <X className="w-3.5 h-3.5" aria-hidden="true" />
                 </button>
@@ -342,19 +381,22 @@ export function ContractSearchView({
               <ul
                 role="listbox"
                 aria-label="Municípios brasileiros (IBGE)"
-                className="absolute z-20 left-0 right-0 mt-1 bg-white border border-slate-200 rounded-md shadow-lg max-h-64 overflow-y-auto divide-y divide-slate-100"
+                className="absolute z-20 left-0 right-0 mt-1 bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-md shadow-lg max-h-64 overflow-y-auto divide-y divide-slate-100 dark:divide-[#1D3A57]"
               >
                 {municipalitySuggestions.map((m) => (
                   <li key={m.ibgeCode}>
                     <button
                       type="button"
                       onMouseDown={() => handlePickMunicipality(m)}
-                      className="w-full text-left px-3 py-2 hover:bg-slate-50 flex items-center justify-between gap-2 text-xs transition-colors"
+                      className="w-full text-left px-3 py-2 hover:bg-[#E8F1F6] dark:hover:bg-[#102843] flex items-center justify-between gap-2 text-xs transition-colors"
                     >
-                      <span className="font-medium text-slate-900 truncate">
-                        {m.name} <span className="text-slate-500 font-normal">/ {m.uf}</span>
+                      <span className="font-medium text-[#0B2540] dark:text-[#FAF9F5] truncate">
+                        {m.name}{' '}
+                        <span className="text-slate-500 dark:text-slate-400 font-normal">
+                          / {m.uf}
+                        </span>
                       </span>
-                      <span className="font-mono tabular-nums text-slate-500 shrink-0">
+                      <span className="font-mono tabular-nums text-slate-500 dark:text-slate-400 shrink-0">
                         {m.ibgeCode}
                       </span>
                     </button>
@@ -365,31 +407,35 @@ export function ContractSearchView({
           </div>
 
           <div className="md:col-span-2">
-            <label htmlFor="contract-year" className="block text-xs font-medium text-slate-600 mb-1">
+            <label
+              htmlFor="contract-year"
+              className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1"
+            >
               Exercício
             </label>
             <select
               id="contract-year"
               value={yearFilter}
               onChange={(e) => setYearFilter(e.target.value)}
-              className="w-full h-10 px-3 text-sm bg-white border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-600"
+              className="w-full h-10 px-3 text-sm bg-white dark:bg-[#061321] border border-slate-300 dark:border-[#1D3A57] text-[#0B2540] dark:text-[#FAF9F5] rounded-md focus:outline-none focus:ring-2 focus:ring-[#D95B35]"
             >
               <option value="">Todos</option>
               <option value="2026">2026</option>
               <option value="2025">2025</option>
+              <option value="2024">2024</option>
             </select>
           </div>
 
-          <div className="md:col-span-2 flex items-end">
+          <div className="md:col-span-2 flex items-end gap-2">
             <button
               type="submit"
-              className="w-full h-10 px-4 text-sm font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-md transition-colors whitespace-nowrap"
+              className="flex-1 h-10 px-4 text-sm font-semibold text-white bg-[#0B2540] hover:bg-[#102843] dark:bg-[#D95B35] dark:hover:bg-[#c04c29] rounded-md transition-colors whitespace-nowrap"
             >
               Pesquisar
             </button>
           </div>
 
-          <div className="md:col-span-12 pt-3 border-t border-slate-100 grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+          <div className="md:col-span-12 pt-3 border-t border-slate-100 dark:border-[#1D3A57] grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
             <div className="lg:col-span-7">
               <DatePeriodControls
                 idPrefix="contract-search"
@@ -404,7 +450,7 @@ export function ContractSearchView({
               <div>
                 <label
                   htmlFor="contract-status"
-                  className="block text-xs font-medium text-slate-600 mb-1"
+                  className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1"
                 >
                   Status do contrato (ciclo de vida)
                 </label>
@@ -412,7 +458,7 @@ export function ContractSearchView({
                   id="contract-status"
                   value={statusFilter}
                   onChange={(e) => setStatusFilter(e.target.value as ContractLifecycleFilter)}
-                  className="w-full h-10 px-3 text-sm bg-white border border-slate-300 rounded-md text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  className="w-full h-10 px-3 text-sm bg-white dark:bg-[#061321] border border-slate-300 dark:border-[#1D3A57] rounded-md text-[#0B2540] dark:text-[#FAF9F5] focus:outline-none focus:ring-2 focus:ring-[#D95B35]"
                 >
                   {CONTRACT_LIFECYCLE_OPTIONS.map((opt) => (
                     <option key={opt.value || 'all'} value={opt.value}>
@@ -421,153 +467,44 @@ export function ContractSearchView({
                   ))}
                 </select>
               </div>
-              <div
-                role="group"
-                aria-label="Filtro rápido de status do contrato"
-                className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-500"
-              >
-                <span>Status rápido:</span>
-                {CONTRACT_LIFECYCLE_OPTIONS.map((opt) => {
-                  const active = statusFilter === opt.value;
-                  return (
-                    <button
-                      key={opt.value || 'all-btn'}
-                      type="button"
-                      onClick={() => setStatusFilter(opt.value)}
-                      aria-pressed={active}
-                      className={`transition-colors whitespace-nowrap underline-offset-4 ${
-                        active
-                          ? 'text-blue-700 font-semibold underline'
-                          : 'text-slate-700 hover:text-blue-700 hover:underline'
-                      }`}
-                    >
-                      {opt.value === '' ? 'Todos' : opt.label}
-                    </button>
-                  );
-                })}
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
+                <div
+                  role="group"
+                  aria-label="Filtro rápido de status do contrato"
+                  className="flex flex-wrap items-center gap-x-3 gap-y-1"
+                >
+                  {CONTRACT_LIFECYCLE_OPTIONS.map((opt) => {
+                    const active = statusFilter === opt.value;
+                    return (
+                      <button
+                        key={opt.value || 'all-btn'}
+                        type="button"
+                        onClick={() => setStatusFilter(opt.value)}
+                        aria-pressed={active}
+                        className={`transition-colors whitespace-nowrap underline-offset-4 ${
+                          active
+                            ? 'text-[#D95B35] font-semibold underline'
+                            : 'text-slate-700 dark:text-slate-300 hover:text-[#D95B35] hover:underline'
+                        }`}
+                      >
+                        {opt.value === '' ? 'Todos' : opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+                {(query || ibgeFilter || yearFilter || statusFilter || startDate || endDate) && (
+                  <button
+                    type="button"
+                    onClick={handleResetFilters}
+                    className="text-[#D95B35] font-medium hover:underline whitespace-nowrap"
+                  >
+                    Limpar filtros
+                  </button>
+                )}
               </div>
             </div>
           </div>
         </form>
-
-        <div className="mt-4 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-slate-500">
-          <span>Consultas rápidas:</span>
-          <button
-            type="button"
-            onClick={() => {
-              setQuery('10.562.589/0002-56');
-              handleClearMunicipality();
-              setYearFilter('');
-              setStatusFilter('');
-              setStartDate('');
-              setEndDate('');
-              runSearch({
-                q: '10.562.589/0002-56',
-                ibge: '',
-                year: '',
-                status: '',
-                startDate: '',
-                endDate: '',
-              });
-            }}
-            className="text-blue-700 font-semibold hover:text-blue-800 underline underline-offset-4"
-          >
-            CNPJ Nacional: WM Saúde (10.562.589/0002-56 · Filial + Matriz)
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setQuery('08.562.959/0001-22');
-              handleClearMunicipality();
-              setYearFilter('');
-              setStartDate('');
-              setEndDate('');
-              runSearch({ q: '08.562.959/0001-22', ibge: '', year: '', startDate: '', endDate: '' });
-            }}
-            className="text-blue-700 font-medium hover:text-blue-800 underline underline-offset-4"
-          >
-            CNPJ Nacional: Plenna (08.562.959/0001-22)
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setQuery('13.265.251/0002-20');
-              handleClearMunicipality();
-              setYearFilter('');
-              setStartDate('');
-              setEndDate('');
-              runSearch({ q: '13.265.251/0002-20', ibge: '', year: '', startDate: '', endDate: '' });
-            }}
-            className="text-blue-700 font-medium hover:text-blue-800 underline underline-offset-4"
-          >
-            CNPJ Nacional: Movel Motores (13.265.251/0002-20)
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setQuery('IN012/2026FMS');
-              setIbgeFilter('2902906');
-              setMunicipalityInput('Barra do Choça/BA (2902906)');
-              setYearFilter('2026');
-              setStartDate('2026-01-01');
-              setEndDate('2026-12-31');
-              runSearch({
-                q: 'IN012/2026FMS',
-                ibge: '2902906',
-                year: '2026',
-                startDate: '2026-01-01',
-                endDate: '2026-12-31',
-              });
-            }}
-            className="text-slate-700 hover:text-blue-700 underline underline-offset-4"
-          >
-            IN012/2026FMS (Barra do Choça / BA)
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setQuery('123/2026');
-              handleClearMunicipality();
-              setYearFilter('2026');
-              setStartDate('2026-01-01');
-              setEndDate('2026-12-31');
-              runSearch({
-                q: '123/2026',
-                ibge: '',
-                year: '2026',
-                startDate: '2026-01-01',
-                endDate: '2026-12-31',
-              });
-            }}
-            className="text-slate-700 hover:text-blue-700 underline underline-offset-4"
-          >
-            Desambiguar "123/2026"
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setQuery('');
-              handleClearMunicipality();
-              setYearFilter('');
-              setStatusFilter('');
-              setStartDate('');
-              setEndDate('');
-              setMinRisk(0);
-              runSearch({
-                q: '',
-                ibge: '',
-                year: '',
-                status: '',
-                startDate: '',
-                endDate: '',
-                minRisk: 0,
-              });
-            }}
-            className="text-slate-700 hover:text-blue-700 underline underline-offset-4"
-          >
-            Listar toda a base auditada
-          </button>
-        </div>
       </section>
 
       {cnpjCoverage && (
@@ -575,49 +512,32 @@ export function ContractSearchView({
           data-testid="cnpj-national-coverage"
           className={`border rounded-lg p-5 space-y-4 ${
             cnpjCoverage.pncpStatus === 'rate_limited' || cnpjCoverage.pncpStatus === 'unavailable'
-              ? 'bg-amber-50 border-amber-200'
-              : 'bg-white border-slate-200'
+              ? 'bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800'
+              : 'bg-white dark:bg-[#0B1D31] border-slate-200 dark:border-[#1D3A57]'
           }`}
         >
-          <div className="flex flex-col md:flex-row md:items-start justify-between gap-3 pb-4 border-b border-slate-200">
+          <div className="flex flex-col md:flex-row md:items-start justify-between gap-3 pb-4 border-b border-slate-200 dark:border-[#1D3A57]">
             <div className="space-y-1">
-              <div className="text-xs font-mono text-blue-700 font-semibold">
+              <div className="text-xs font-mono text-[#D95B35] font-semibold">
                 BUSCA NACIONAL POR CNPJ · {formatCnpj(cnpjCoverage.cnpj)}
                 {cnpjCoverage.relatedMatrizCnpj && (
-                  <span className="text-slate-600 font-normal">
+                  <span className="text-slate-600 dark:text-slate-400 font-normal">
                     {' '}
                     + Matriz {formatCnpj(cnpjCoverage.relatedMatrizCnpj)}
                   </span>
                 )}
               </div>
-              <h2 className="text-base font-bold text-slate-900">
+              <h2 className="text-base font-bold text-[#0B2540] dark:text-[#FAF9F5]">
                 {cnpjCoverage.legalName ?? `CNPJ ${formatCnpj(cnpjCoverage.cnpj)}`}
               </h2>
-              <div className="text-xs text-slate-600 flex flex-wrap gap-x-3 gap-y-1">
-                {cnpjCoverage.registrationStatus && (
-                  <span>
-                    Situação: <strong className="text-slate-900">{cnpjCoverage.registrationStatus}</strong>
-                  </span>
-                )}
-                {cnpjCoverage.primaryCnae && <span>CNAE: {cnpjCoverage.primaryCnae}</span>}
-                {cnpjCoverage.relatedMatrizCnpj && (
-                  <span className="font-mono text-slate-700">
-                    Filial: {cnpjCoverage.filialPncpFetchedCount ?? 0} · Matriz:{' '}
-                    {cnpjCoverage.matrizPncpFetchedCount ?? 0}
-                  </span>
-                )}
-                {cnpjCoverage.profileSource && (
-                  <span className="text-slate-500">Cadastro via {cnpjCoverage.profileSource}</span>
-                )}
-              </div>
             </div>
-            <div className="font-mono text-xs shrink-0 text-slate-700">
+            <div className="font-mono text-xs shrink-0 text-slate-700 dark:text-slate-300">
               PNCP:{' '}
               <strong
                 className={
                   cnpjCoverage.pncpStatus === 'complete'
-                    ? 'text-emerald-700'
-                    : 'text-amber-800'
+                    ? 'text-emerald-700 dark:text-emerald-400'
+                    : 'text-amber-800 dark:text-amber-400'
                 }
               >
                 {cnpjCoverage.pncpStatus.toUpperCase()}
@@ -625,40 +545,34 @@ export function ContractSearchView({
             </div>
           </div>
 
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-4 text-xs">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
             <div>
-              <div className="text-slate-500">Declarados no PNCP</div>
-              <div className="font-mono tabular-nums text-lg font-semibold text-slate-900 mt-0.5">
+              <div className="text-slate-500 dark:text-slate-400">Declarados no PNCP</div>
+              <div className="font-mono tabular-nums text-lg font-semibold text-[#0B2540] dark:text-[#FAF9F5] mt-0.5">
                 {cnpjCoverage.pncpTotalDeclared}
               </div>
             </div>
             <div>
-              <div className="text-slate-500">Capturados no PNCP</div>
-              <div className="font-mono tabular-nums text-lg font-semibold text-slate-900 mt-0.5">
+              <div className="text-slate-500 dark:text-slate-400">Capturados no PNCP</div>
+              <div className="font-mono tabular-nums text-lg font-semibold text-[#0B2540] dark:text-[#FAF9F5] mt-0.5">
                 {cnpjCoverage.pncpFetchedCount}
               </div>
             </div>
             <div>
-              <div className="text-slate-500">Como Fornecedor</div>
-              <div className="font-mono tabular-nums text-lg font-semibold text-blue-700 mt-0.5">
+              <div className="text-slate-500 dark:text-slate-400">Como Fornecedor</div>
+              <div className="font-mono tabular-nums text-lg font-semibold text-[#D95B35] mt-0.5">
                 {cnpjCoverage.byRole.fornecedor}
               </div>
             </div>
             <div>
-              <div className="text-slate-500">Como Órgão Contratante</div>
-              <div className="font-mono tabular-nums text-lg font-semibold text-slate-900 mt-0.5">
+              <div className="text-slate-500 dark:text-slate-400">Como Órgão Contratante</div>
+              <div className="font-mono tabular-nums text-lg font-semibold text-[#0B2540] dark:text-[#FAF9F5] mt-0.5">
                 {cnpjCoverage.byRole.orgao_contratante}
-              </div>
-            </div>
-            <div>
-              <div className="text-slate-500">Extras no Índice Local</div>
-              <div className="font-mono tabular-nums text-lg font-semibold text-slate-900 mt-0.5">
-                {cnpjCoverage.localOnlyCount}
               </div>
             </div>
           </div>
 
-          <p className="text-xs text-slate-700 leading-relaxed pt-2 border-t border-slate-100">
+          <p className="text-xs text-slate-700 dark:text-slate-300 leading-relaxed pt-2 border-t border-slate-100 dark:border-[#1D3A57]">
             {cnpjCoverage.message}
           </p>
         </section>
@@ -667,10 +581,10 @@ export function ContractSearchView({
       {parsedReference && (
         <div
           data-testid="pncp-url-parsed"
-          className="bg-blue-50/70 border border-blue-200 rounded-lg p-4 text-xs text-slate-800 leading-relaxed"
+          className="bg-[#E8F1F6] dark:bg-[#102843] border border-slate-200 dark:border-[#1D3A57] rounded-lg p-4 text-xs text-[#0B2540] dark:text-[#FAF9F5] leading-relaxed"
         >
-          <span className="font-semibold text-blue-900">URL oficial interpretada localmente:</span>{' '}
-          host <span className="font-mono">{parsedReference.sourceHost}</span>
+          <span className="font-semibold">URL oficial interpretada localmente:</span> host{' '}
+          <span className="font-mono">{parsedReference.sourceHost}</span>
           {parsedReference.orgaoCnpj && (
             <>
               {' '}· CNPJ do órgão <span className="font-mono">{parsedReference.orgaoCnpj}</span>
@@ -693,14 +607,14 @@ export function ContractSearchView({
       {parsedContractCode && (parsedContractCode.prefix || parsedContractCode.unitSuffix) && (
         <div
           data-testid="parsed-contract-code"
-          className="bg-slate-50 border border-slate-200 rounded-lg p-4 text-xs text-slate-800 leading-relaxed"
+          className="bg-[#FAF9F5] dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg p-4 text-xs text-[#0B2540] dark:text-slate-200 leading-relaxed"
         >
-          <span className="font-semibold text-slate-900">Código municipal interpretado:</span>{' '}
+          <span className="font-semibold">Código municipal interpretado:</span>{' '}
           <span className="font-mono font-semibold">{parsedContractCode.raw}</span>
           {parsedContractCode.modalityHint && (
             <>
               {' '}→ Modalidade provável:{' '}
-              <span className="font-medium text-slate-900">{parsedContractCode.modalityHint}</span>
+              <span className="font-medium">{parsedContractCode.modalityHint}</span>
             </>
           )}
           {' '}· Sequencial normalizado{' '}
@@ -708,7 +622,7 @@ export function ContractSearchView({
           {parsedContractCode.unitHint && (
             <>
               {' '}· Unidade:{' '}
-              <span className="font-medium text-slate-900">
+              <span className="font-medium">
                 {parsedContractCode.unitHint} ({parsedContractCode.unitSuffix})
               </span>
             </>
@@ -719,18 +633,18 @@ export function ContractSearchView({
       {livePncpStatus && !cnpjCoverage && (
         <div
           data-testid="live-pncp-status"
-          className="bg-blue-50/50 border border-blue-200 rounded-lg px-4 py-3 text-xs text-slate-800 flex items-start gap-2.5"
+          className="bg-[#E8F1F6] dark:bg-[#102843] border border-slate-200 dark:border-[#1D3A57] rounded-lg px-4 py-3 text-xs text-[#0B2540] dark:text-slate-200 flex items-start gap-2.5"
         >
-          <Info className="w-4 h-4 text-blue-700 shrink-0 mt-0.5" aria-hidden="true" />
+          <Info className="w-4 h-4 text-[#D95B35] shrink-0 mt-0.5" aria-hidden="true" />
           <div>{livePncpStatus.message}</div>
         </div>
       )}
 
       {disambiguationRequired && (
-        <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 flex items-start gap-3">
-          <Info className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" aria-hidden="true" />
-          <div className="text-xs text-amber-900 leading-relaxed">
-            <span className="font-semibold">Desambiguação necessária:</span> o número{' '}
+        <div className="bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-lg p-4 flex items-start gap-3">
+          <Info className="w-4 h-4 text-amber-700 dark:text-amber-400 shrink-0 mt-0.5" aria-hidden="true" />
+          <div className="text-xs text-amber-900 dark:text-amber-200 leading-relaxed">
+            <span className="font-semibold">Desambiguação necessária:</span> o termo{' '}
             <span className="font-mono font-semibold">{query}</span> ocorre em{' '}
             {new Set(results.map((r) => r.municipalityIbge)).size} municípios distintos. Confirme o
             código IBGE, o órgão contratante e o número de controle PNCP antes de abrir o dossiê.
@@ -739,43 +653,44 @@ export function ContractSearchView({
       )}
 
       {error && (
-        <div role="alert" className="bg-red-50 border border-red-200 rounded-lg p-4 text-sm text-red-800">
+        <div
+          role="alert"
+          className="bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 rounded-lg p-4 text-sm text-red-800 dark:text-red-300"
+        >
           {error}
         </div>
       )}
 
-      <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
-        <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between gap-4">
-          <h2 className="text-sm font-semibold text-slate-900">
+      <section className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg overflow-hidden">
+        <div className="px-5 py-4 border-b border-slate-200 dark:border-[#1D3A57] flex items-center justify-between gap-4">
+          <h2 className="text-sm font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
             Resultados Localizados ({results.length})
           </h2>
-          <span className="text-xs text-slate-500">
-            Espelho auditado + consulta ao vivo na API do PNCP
+          <span className="text-xs text-slate-500 dark:text-slate-400">
+            SQLite local + consulta ao vivo na API do PNCP
           </span>
         </div>
 
         {loading ? (
-          <div className="p-8 text-center text-sm text-slate-500">
-            Consultando espelho municipal e API oficial do PNCP...
+          <div className="p-8 text-center text-sm text-slate-500 dark:text-slate-400">
+            Consultando repositório local e API oficial do PNCP...
           </div>
         ) : results.length === 0 ? (
           <div className="p-8 text-center space-y-3">
-            <p className="text-sm font-semibold text-slate-900">
-              Contrato não localizado no PNCP nem no repositório local.
+            <p className="text-sm font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
+              Nenhum contrato localizado para os critérios informados.
             </p>
-            <p className="text-xs text-slate-600 max-w-xl mx-auto leading-relaxed">
-              Muitos contratos municipais (especialmente inexigibilidades, dispensas e relações
-              internas de fiscais) são publicados apenas no Portal da Transparência do município e
-              ainda não foram sincronizados ao PNCP (estado{' '}
-              <span className="font-mono font-semibold">NOT_VERIFIABLE</span> via PNCP). Você pode
-              importar o PDF ou a relação tabular do portal municipal para auditar imediatamente.
+            <p className="text-xs text-slate-600 dark:text-slate-300 max-w-xl mx-auto leading-relaxed">
+              Informe um CNPJ (14 caracteres numéricos ou alfanuméricos) para consultar a API do
+              PNCP em âmbito nacional, selecione um município IBGE ou importe um PDF / extrato na
+              aba Documento para iniciar a auditoria.
             </p>
             {onNavigateToDocument && (
               <div className="pt-1">
                 <button
                   type="button"
                   onClick={onNavigateToDocument}
-                  className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-blue-700 hover:bg-blue-800 rounded-md transition-colors"
+                  className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-[#0B2540] dark:bg-[#D95B35] hover:opacity-90 rounded-md transition-colors"
                 >
                   <FileUp className="w-3.5 h-3.5" aria-hidden="true" />
                   Enviar PDF / Extrato do Portal Municipal
@@ -784,23 +699,25 @@ export function ContractSearchView({
             )}
           </div>
         ) : (
-          <div className="divide-y divide-slate-200">{results.map(renderContractRow)}</div>
+          <div className="divide-y divide-slate-200 dark:divide-[#1D3A57]">
+            {results.map(renderContractRow)}
+          </div>
         )}
       </section>
 
       {results.length === 0 && relatedResults.length > 0 && (
-        <section className="bg-white border border-slate-200 rounded-lg overflow-hidden">
-          <div className="px-5 py-4 border-b border-slate-200 flex items-center justify-between gap-4">
-            <div>
-              <h2 className="text-sm font-semibold text-slate-900">
-                Processos com numeração relacionada no mesmo município ({relatedResults.length})
-              </h2>
-              <p className="text-xs text-slate-500 mt-0.5">
-                Contratos ou compras do mesmo sequencial/ano em outras modalidades no PNCP.
-              </p>
-            </div>
+        <section className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg overflow-hidden">
+          <div className="px-5 py-4 border-b border-slate-200 dark:border-[#1D3A57]">
+            <h2 className="text-sm font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
+              Processos com numeração relacionada ({relatedResults.length})
+            </h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+              Contratos ou compras do mesmo sequencial/ano em outras modalidades.
+            </p>
           </div>
-          <div className="divide-y divide-slate-200">{relatedResults.map(renderContractRow)}</div>
+          <div className="divide-y divide-slate-200 dark:divide-[#1D3A57]">
+            {relatedResults.map(renderContractRow)}
+          </div>
         </section>
       )}
     </div>

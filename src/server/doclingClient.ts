@@ -1,11 +1,12 @@
 /**
- * NEXOFIS — Adaptador Real Docling Serve + PaddleOCR Worker (R-13)
+ * NEXOFIS — Adaptador Real Docling Serve + PaddleOCR Worker (R-13 / A10 / A11)
  * Licença: GNU AGPL-3.0-only (Eduardo Muniz — DM Technology)
  *
  * Princípios obrigatórios:
  * - Nunca simular Docling ou PaddleOCR quando os serviços estiverem offline.
- * - Retornar estado explícito `SOURCE_UNAVAILABLE` quando URLs não estiverem configuradas ou inacessíveis.
- * - Registrar latência real, versão do extrator e contagem real de páginas.
+ * - Retornar estado explícito `source_unavailable` quando URLs não estiverem configuradas ou inacessíveis.
+ * - Redigir URLs internas em respostas públicas de saúde/integração (A11).
+ * - Preservar metadados de cobertura parcial de páginas (originalPageCount vs processedPageCount).
  */
 
 import crypto from 'node:crypto';
@@ -17,24 +18,29 @@ export interface ExternalDocumentExtractionResult {
   text: string;
   markdown?: string;
   pageCount: number;
+  originalPageCount?: number;
+  processedPageCount?: number;
+  truncated?: boolean;
+  pages?: Array<{
+    pageNumber: number;
+    method: 'native' | 'docling' | 'paddleocr';
+    text: string;
+    confidence: number;
+  }>;
   durationMs: number;
   inputSha256: string;
   errorDetail?: string;
 }
 
+export interface ExternalOcrServiceStatus {
+  configured: boolean;
+  reachable: boolean;
+  detail: string;
+}
+
 export interface ExternalOcrHealthStatus {
-  doclingServe: {
-    configured: boolean;
-    url: string | null;
-    reachable: boolean;
-    detail: string;
-  };
-  paddleOcr: {
-    configured: boolean;
-    url: string | null;
-    reachable: boolean;
-    detail: string;
-  };
+  doclingServe: ExternalOcrServiceStatus;
+  paddleOcr: ExternalOcrServiceStatus;
 }
 
 function getConfiguredUrl(envKey: 'DOCLING_SERVE_URL' | 'PADDLE_OCR_URL'): string | null {
@@ -49,17 +55,26 @@ function getConfiguredUrl(envKey: 'DOCLING_SERVE_URL' | 'PADDLE_OCR_URL'): strin
   }
 }
 
+function sanitizeNetworkDetail(err: unknown): string {
+  const raw = err instanceof Error ? err.message : 'Falha de conexão';
+  // Strip any internal hostnames/IPs/ports from public error details
+  return raw.replace(/https?:\/\/[^\s)]+/gi, '[serviço-interno]').slice(0, 140);
+}
+
+/**
+ * Checks Docling Serve and PaddleOCR worker reachability WITHOUT leaking internal URLs/hosts/ports
+ * in public responses (A11).
+ */
 export async function checkExternalOcrHealth(
   timeoutMs = 2500
 ): Promise<ExternalOcrHealthStatus> {
   const doclingUrl = getConfiguredUrl('DOCLING_SERVE_URL');
   const paddleUrl = getConfiguredUrl('PADDLE_OCR_URL');
 
-  const probe = async (baseUrl: string | null, healthPath: string) => {
+  const probe = async (baseUrl: string | null, healthPath: string): Promise<ExternalOcrServiceStatus> => {
     if (!baseUrl) {
       return {
         configured: false,
-        url: null,
         reachable: false,
         detail: 'Serviço não configurado no ambiente (.env).',
       };
@@ -71,7 +86,6 @@ export async function checkExternalOcrHealth(
       clearTimeout(timer);
       return {
         configured: true,
-        url: baseUrl,
         reachable: res.ok,
         detail: res.ok ? `Online (HTTP ${res.status})` : `Respondeu HTTP ${res.status}`,
       };
@@ -79,9 +93,8 @@ export async function checkExternalOcrHealth(
       clearTimeout(timer);
       return {
         configured: true,
-        url: baseUrl,
         reachable: false,
-        detail: err instanceof Error ? err.message : 'Falha de conexão',
+        detail: sanitizeNetworkDetail(err),
       };
     }
   };
@@ -96,7 +109,6 @@ export async function checkExternalOcrHealth(
 
 /**
  * Envia arquivo PDF/imagem ao Docling Serve (`/v1/convert/file`) quando configurado.
- * Retorna `source_unavailable` sem fabricar resultados caso o daemon esteja indisponível.
  */
 export async function convertWithDoclingServe(
   buffer: Buffer,
@@ -118,7 +130,7 @@ export async function convertWithDoclingServe(
       durationMs: Date.now() - startedAt,
       inputSha256,
       errorDetail:
-        'DOCLING_SERVE_URL não configurada. Suba o serviço com `docker compose up -d docling-serve` e configure DOCLING_SERVE_URL no .env.',
+        'DOCLING_SERVE_URL não configurada. Suba o perfil full-ocr via docker compose e configure DOCLING_SERVE_URL no .env.',
     };
   }
 
@@ -178,6 +190,9 @@ export async function convertWithDoclingServe(
       text,
       markdown,
       pageCount,
+      originalPageCount: pageCount,
+      processedPageCount: pageCount,
+      truncated: false,
       durationMs: Date.now() - startedAt,
       inputSha256,
     };
@@ -191,7 +206,7 @@ export async function convertWithDoclingServe(
       pageCount: 0,
       durationMs: Date.now() - startedAt,
       inputSha256,
-      errorDetail: `Docling Serve inacessível: ${err instanceof Error ? err.message : 'erro de rede'}.`,
+      errorDetail: `Docling Serve inacessível: ${sanitizeNetworkDetail(err)}.`,
     };
   }
 }
@@ -253,15 +268,39 @@ export async function extractWithPaddleOcrWorker(
     const payload = (await res.json()) as {
       text?: string;
       page_count?: number;
+      original_page_count?: number;
+      processed_page_count?: number;
+      truncated?: boolean;
       extractor_version?: string;
+      pages?: Array<{
+        page_number: number;
+        method?: string;
+        text?: string;
+        mean_ocr_score?: number | null;
+      }>;
     };
+
+    const processedCount = Number(payload.processed_page_count ?? payload.page_count ?? 0);
+    const originalCount = Number(payload.original_page_count ?? processedCount);
+    const truncated = Boolean(payload.truncated ?? originalCount > processedCount);
 
     return {
       status: 'ok',
       engine: 'paddleocr-worker',
       extractorVersion: payload.extractor_version ?? 'paddleocr-worker',
       text: payload.text ?? '',
-      pageCount: Number(payload.page_count ?? 0),
+      pageCount: processedCount,
+      originalPageCount: originalCount,
+      processedPageCount: processedCount,
+      truncated,
+      pages: Array.isArray(payload.pages)
+        ? payload.pages.map((p) => ({
+            pageNumber: Number(p.page_number ?? 1),
+            method: p.method === 'native' ? 'native' : 'paddleocr',
+            text: String(p.text ?? ''),
+            confidence: typeof p.mean_ocr_score === 'number' ? p.mean_ocr_score : 0.85,
+          }))
+        : undefined,
       durationMs: Date.now() - startedAt,
       inputSha256,
     };
@@ -275,7 +314,7 @@ export async function extractWithPaddleOcrWorker(
       pageCount: 0,
       durationMs: Date.now() - startedAt,
       inputSha256,
-      errorDetail: `PaddleOCR worker inacessível: ${err instanceof Error ? err.message : 'erro de rede'}.`,
+      errorDetail: `PaddleOCR worker inacessível: ${sanitizeNetworkDetail(err)}.`,
     };
   }
 }
