@@ -19,6 +19,7 @@ import {
 } from '../lib/formatters';
 import { DatePeriodControls } from './DatePeriodControls';
 import { RiskScoreInline } from './RiskText';
+import { notificationService } from '../lib/notificationService';
 
 interface RiskDashboardViewProps {
   startDate: string;
@@ -543,6 +544,12 @@ export function RiskDashboardView({
         endDate: endDate || undefined,
       });
       setData(res);
+      if (res.contracts.length > 0) {
+        notificationService.notifyHighRiskBatch(res.contracts, {
+          sourceLabel: 'Dashboard de Riscos (SQLite)',
+          onOpenContract: onSelectContract,
+        });
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao carregar painel de riscos.');
     } finally {

@@ -16,6 +16,7 @@ import {
   type OcrStatusResponse,
 } from '../lib/api';
 import { formatCnpj, formatCurrencyBRL } from '../lib/formatters';
+import { notificationService } from '../lib/notificationService';
 import { RiskScoreInline } from './RiskText';
 
 interface DocumentUploadViewProps {
@@ -24,11 +25,17 @@ interface DocumentUploadViewProps {
 
 export function DocumentUploadView({ onSelectContract }: DocumentUploadViewProps) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
   const [forceOcr, setForceOcr] = useState(false);
   const [processing, setProcessing] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<{ current: number; total: number } | null>(
+    null
+  );
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<DocumentUploadResponse | null>(null);
+  const [batchResults, setBatchResults] = useState<
+    Array<{ fileName: string; response?: DocumentUploadResponse; error?: string }>
+  >([]);
   const [ocrStatus, setOcrStatus] = useState<OcrStatusResponse | null>(null);
 
   useEffect(() => {
@@ -44,38 +51,89 @@ export function DocumentUploadView({ onSelectContract }: DocumentUploadViewProps
   }, []);
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0] ?? null;
+    const files = Array.from(e.target.files ?? []);
     setError(null);
-    if (!file) {
-      setSelectedFile(null);
+    if (files.length === 0) {
+      setSelectedFiles([]);
       return;
     }
-    if (file.size > 25 * 1024 * 1024) {
-      setError('O arquivo excede o limite de 25 MB.');
-      setSelectedFile(null);
+    const oversized = files.find((file) => file.size > 25 * 1024 * 1024);
+    if (oversized) {
+      setError(`O arquivo "${oversized.name}" excede o limite de 25 MB.`);
+      setSelectedFiles([]);
       return;
     }
-    setSelectedFile(file);
+    setSelectedFiles(files);
   };
 
   const handleUploadSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!selectedFile) {
+    if (selectedFiles.length === 0) {
       setError(
-        'Selecione um documento de contrato (PDF, PNG, JPEG, WEBP, TIFF ou TXT) antes de iniciar.'
+        'Selecione um ou mais documentos de contrato (PDF, PNG, JPEG, WEBP, TIFF ou TXT) antes de iniciar.'
       );
       return;
     }
 
     setProcessing(true);
     setError(null);
+    setBatchResults([]);
+    setBatchProgress(selectedFiles.length > 1 ? { current: 0, total: selectedFiles.length } : null);
+
     try {
-      const response = await uploadContractDocument(selectedFile, forceOcr);
-      setResult(response);
+      if (selectedFiles.length === 1) {
+        const response = await uploadContractDocument(selectedFiles[0], forceOcr);
+        setResult(response);
+        notificationService.notifyHighRiskBatch([response.contract], {
+          sourceLabel: `Análise Documental (${selectedFiles[0].name})`,
+          batchKey: `doc-upload:${response.sha256}:${Date.now()}`,
+          onOpenContract: onSelectContract,
+        });
+      } else {
+        const outcomes: Array<{
+          fileName: string;
+          response?: DocumentUploadResponse;
+          error?: string;
+        }> = [];
+        const evaluatedContracts: EvaluatedContract[] = [];
+
+        for (let i = 0; i < selectedFiles.length; i += 1) {
+          const file = selectedFiles[i];
+          setBatchProgress({ current: i + 1, total: selectedFiles.length });
+          try {
+            const response = await uploadContractDocument(file, forceOcr);
+            outcomes.push({ fileName: file.name, response });
+            evaluatedContracts.push(response.contract);
+          } catch (fileErr) {
+            outcomes.push({
+              fileName: file.name,
+              error: fileErr instanceof Error ? fileErr.message : 'Erro ao processar arquivo.',
+            });
+          }
+        }
+
+        setBatchResults(outcomes);
+        const firstSuccess = outcomes.find((o) => o.response)?.response ?? null;
+        setResult(firstSuccess);
+
+        if (evaluatedContracts.length > 0) {
+          notificationService.notifyHighRiskBatch(evaluatedContracts, {
+            sourceLabel: `Análise em Lote (${selectedFiles.length} documentos)`,
+            batchKey: `doc-batch:${Date.now()}:${evaluatedContracts.map((c) => c.id).join(',')}`,
+            onOpenContract: onSelectContract,
+          });
+        }
+
+        const failedCount = outcomes.filter((o) => o.error).length;
+        if (failedCount === outcomes.length) {
+          setError('Nenhum documento do lote pôde ser processado.');
+        }
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao processar o documento.');
     } finally {
       setProcessing(false);
+      setBatchProgress(null);
     }
   };
 
@@ -104,23 +162,39 @@ export function DocumentUploadView({ onSelectContract }: DocumentUploadViewProps
                     htmlFor="contract-file-input"
                     className="block text-sm font-semibold text-[#0B2540] dark:text-[#FAF9F5] cursor-pointer"
                   >
-                    Selecionar arquivo do contrato (PDF, PNG, JPG, WEBP, TIFF ou TXT · máx. 25 MB)
+                    Selecionar arquivo(s) de contrato (individual ou em lote · máx. 25 MB cada)
                   </label>
                   <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-                    PDFs com camada textual válida são extraídos diretamente no Tier 0 sem custo de
-                    OCR neural. Nenhum campo ausente é inventado.
+                    Selecione um ou múltiplos documentos (PDF, PNG, JPG, WEBP, TIFF ou TXT). Contratos
+                    de alto risco detectados em lote disparam alerta imediato ao auditor.
                   </p>
                   <input
                     ref={fileInputRef}
                     id="contract-file-input"
                     type="file"
+                    multiple
                     accept=".pdf,.png,.jpg,.jpeg,.webp,.tif,.tiff,.txt,application/pdf,image/png,image/jpeg,image/webp,image/tiff,text/plain"
                     onChange={handleFileChange}
                     className="mt-3 block w-full text-xs text-slate-600 dark:text-slate-300 file:mr-3 file:py-2 file:px-3.5 file:rounded-md file:border file:border-slate-300 dark:file:border-[#1D3A57] file:text-xs file:font-semibold file:bg-white dark:file:bg-[#0B1D31] file:text-[#0B2540] dark:file:text-[#FAF9F5] hover:file:bg-[#E8F1F6] dark:hover:file:bg-[#102843]"
                   />
-                  {selectedFile && (
+                  {selectedFiles.length === 1 && (
                     <div className="mt-3 text-xs text-[#0B2540] dark:text-slate-200 font-mono">
-                      Arquivo selecionado: {selectedFile.name} ({(selectedFile.size / 1024).toFixed(1)} KB)
+                      Arquivo selecionado: {selectedFiles[0].name} (
+                      {(selectedFiles[0].size / 1024).toFixed(1)} KB)
+                    </div>
+                  )}
+                  {selectedFiles.length > 1 && (
+                    <div className="mt-3 space-y-1">
+                      <div className="text-xs font-semibold text-[#0B2540] dark:text-slate-200">
+                        Lote selecionado: {selectedFiles.length} documento(s)
+                      </div>
+                      <ul className="text-[11px] font-mono text-slate-600 dark:text-slate-400 space-y-0.5 max-h-24 overflow-y-auto">
+                        {selectedFiles.map((f) => (
+                          <li key={`${f.name}-${f.size}`}>
+                            · {f.name} ({(f.size / 1024).toFixed(1)} KB)
+                          </li>
+                        ))}
+                      </ul>
                     </div>
                   )}
                 </div>
@@ -143,7 +217,13 @@ export function DocumentUploadView({ onSelectContract }: DocumentUploadViewProps
                 disabled={processing}
                 className="px-5 py-2.5 text-sm font-semibold text-white bg-[#0B2540] hover:bg-[#102843] dark:bg-[#D95B35] dark:hover:bg-[#c04c29] disabled:opacity-60 rounded-md transition-colors whitespace-nowrap"
               >
-                {processing ? 'Processando pipeline...' : 'Ingerir e Auditar Documento'}
+                {processing
+                  ? batchProgress
+                    ? `Processando lote (${batchProgress.current}/${batchProgress.total})...`
+                    : 'Processando pipeline...'
+                  : selectedFiles.length > 1
+                    ? `Auditar Lote (${selectedFiles.length} documentos)`
+                    : 'Ingerir e Auditar Documento'}
               </button>
             </div>
           </form>
@@ -233,6 +313,76 @@ export function DocumentUploadView({ onSelectContract }: DocumentUploadViewProps
         >
           {error}
         </div>
+      )}
+
+      {/* Batch Summary Table when multiple documents were processed */}
+      {batchResults.length > 1 && (
+        <section
+          data-testid="batch-upload-summary"
+          aria-label="Resumo da análise em lote de documentos"
+          className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg overflow-hidden"
+        >
+          <div className="px-6 py-4 border-b border-slate-200 dark:border-[#1D3A57] flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="text-sm font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
+                Resultado da Análise em Lote ({batchResults.length} documentos)
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                Selecione qualquer contrato do lote para inspecionar os detalhes ou abrir o dossiê
+                completo.
+              </p>
+            </div>
+          </div>
+          <div className="divide-y divide-slate-200 dark:divide-[#1D3A57]">
+            {batchResults.map((entry, idx) => (
+              <div
+                key={`${entry.fileName}-${idx}`}
+                className="px-6 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:bg-[#FAF9F5] dark:hover:bg-[#102843]/40 transition-colors"
+              >
+                <div className="min-w-0">
+                  <div className="text-xs font-mono font-semibold text-[#0B2540] dark:text-[#FAF9F5] truncate">
+                    {entry.fileName}
+                  </div>
+                  {entry.response ? (
+                    <div className="text-xs text-slate-600 dark:text-slate-300 mt-0.5 truncate">
+                      Contrato {entry.response.contract.contractNumber} ·{' '}
+                      {entry.response.contract.municipalityName}
+                      {entry.response.contract.uf ? `/${entry.response.contract.uf}` : ''}
+                    </div>
+                  ) : (
+                    <div className="text-xs text-red-700 dark:text-red-400 mt-0.5">
+                      {entry.error}
+                    </div>
+                  )}
+                </div>
+
+                {entry.response && (
+                  <div className="flex items-center gap-3 shrink-0">
+                    <RiskScoreInline
+                      score={entry.response.contract.assessment.score}
+                      coverageStatus={entry.response.contract.assessment.coverageStatus}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setResult(entry.response!)}
+                      className="px-2.5 py-1.5 text-xs font-medium text-[#0B2540] dark:text-slate-200 border border-slate-300 dark:border-[#1D3A57] rounded-md hover:bg-[#E8F1F6] dark:hover:bg-[#102843]"
+                    >
+                      Detalhes
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onSelectContract(entry.response!.contract)}
+                      className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-semibold text-white bg-[#0B2540] dark:bg-[#D95B35] rounded-md hover:opacity-90"
+                    >
+                      Dossiê
+                      <ArrowRight className="w-3 h-3" aria-hidden="true" />
+                    </button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </section>
       )}
 
       {/* Pipeline Result & Provenance */}

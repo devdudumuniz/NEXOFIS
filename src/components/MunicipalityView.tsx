@@ -22,6 +22,7 @@ import {
 } from '../lib/formatters';
 import { validateDatePeriod } from '../lib/datePeriod';
 import { validateMunicipalityInput } from '../lib/municipalitySearch';
+import { notificationService } from '../lib/notificationService';
 import { DatePeriodControls } from './DatePeriodControls';
 import { RiskScoreInline } from './RiskText';
 
@@ -133,6 +134,12 @@ export function MunicipalityView({
           municipality: data.municipality,
           entityName: preservedEnt ? preservedEnt.shortName : null,
         });
+        if (data.contracts.length > 0) {
+          notificationService.notifyHighRiskBatch(data.contracts, {
+            sourceLabel: `Análise Municipal — ${data.municipality.name}/${data.municipality.uf}`,
+            onOpenContract: onSelectContract,
+          });
+        }
       })
       .catch((err) => {
         if (cancelled) return;

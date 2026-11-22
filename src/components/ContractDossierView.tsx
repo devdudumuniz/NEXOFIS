@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Archive,
@@ -40,7 +40,8 @@ import {
   buildStructuredDossierJson,
 } from '../lib/dossierJsonExporter';
 import { buildAuditDossierMarkdown, mapContractToOCDS } from '../lib/ocdsMapper';
-import { downloadAuditReportPdf } from '../lib/pdfReportGenerator';
+import { downloadConsolidatedAuditReportPdf } from '../lib/pdfReportGenerator';
+import { DossierRiskCharts } from './DossierRiskCharts';
 import { getRiskToneClass, SeverityText } from './RiskText';
 import { EntityGraphTab } from './EntityGraphTab';
 
@@ -167,6 +168,9 @@ export function ContractDossierView({
   const [dismissRationaleInput, setDismissRationaleInput] = useState('');
   const [submittingReview, setSubmittingReview] = useState(false);
   const [reviewError, setReviewError] = useState<string | null>(null);
+
+  const riskChartsRef = useRef<HTMLDivElement | null>(null);
+  const [exportingPdf, setExportingPdf] = useState(false);
 
   // Save dossier state
   const [showSaveBox, setShowSaveBox] = useState(false);
@@ -314,15 +318,25 @@ export function ContractDossierView({
     }
   };
 
-  const handleExportPdfReport = () => {
+  const handleExportPdfReport = async () => {
+    setExportingPdf(true);
+    setSaveError(null);
     try {
-      const filename = downloadAuditReportPdf(contract, {
+      const { filename, embeddedChartsCount } = await downloadConsolidatedAuditReportPdf(contract, {
         analystNote,
         reviews: reviewHistory,
+        archivedSnapshot,
+        chartContainerEl: riskChartsRef.current,
       });
-      setSavedFeedback(`Relatório PDF gerado e baixado (${filename}).`);
+      setSavedFeedback(
+        embeddedChartsCount > 0
+          ? `Relatório PDF consolidado gerado com ${embeddedChartsCount} gráfico(s) de risco (${filename}).`
+          : `Relatório PDF consolidado gerado e baixado (${filename}).`
+      );
     } catch {
-      setSaveError('Não foi possível gerar o relatório em PDF neste momento.');
+      setSaveError('Não foi possível gerar o relatório consolidado em PDF neste momento.');
+    } finally {
+      setExportingPdf(false);
     }
   };
 
@@ -527,11 +541,12 @@ export function ContractDossierView({
           <button
             type="button"
             data-testid="export-pdf-report-btn"
-            onClick={handleExportPdfReport}
-            className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-white bg-[#0B2540] hover:bg-[#103256] dark:bg-[#D95B35] dark:hover:bg-[#C24C28] rounded-md transition-colors whitespace-nowrap"
+            disabled={exportingPdf}
+            onClick={() => void handleExportPdfReport()}
+            className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-white bg-[#0B2540] hover:bg-[#103256] dark:bg-[#D95B35] dark:hover:bg-[#C24C28] disabled:opacity-60 rounded-md transition-colors whitespace-nowrap"
           >
             <FileDown className="w-3.5 h-3.5" aria-hidden="true" />
-            Exportar Relatório
+            {exportingPdf ? 'Gerando PDF...' : 'Relatório Consolidado (PDF)'}
           </button>
         </div>
       </div>
@@ -890,6 +905,12 @@ export function ContractDossierView({
       {/* TAB 1: RESUMO E RISCOS */}
       {activeTab === 'overview' && (
         <div className="space-y-6">
+          <DossierRiskCharts
+            ref={riskChartsRef}
+            contract={contract}
+            dismissedFindings={dismissedFindings}
+          />
+
           {assessment.indicators.length === 0 ? (
             <section className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg p-8 text-center">
               {assessment.coverageStatus === 'INSUFFICIENT' ? (

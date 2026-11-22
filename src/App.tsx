@@ -53,6 +53,7 @@ import { DocumentUploadView } from './components/DocumentUploadView';
 import { ContractDossierView } from './components/ContractDossierView';
 import { SavedDossiersView } from './components/SavedDossiersView';
 import { RiskDashboardView } from './components/RiskDashboardView';
+import { ToastContainer } from './components/ToastContainer';
 
 type ActiveSection = 'dashboard' | 'municipio' | 'contrato' | 'documento' | 'dossies';
 
@@ -1133,6 +1134,7 @@ export default function App() {
           </div>
         </div>
       )}
+      <ToastContainer />
     </div>
   );
 }

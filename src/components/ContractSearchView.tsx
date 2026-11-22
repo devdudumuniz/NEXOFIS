@@ -11,6 +11,7 @@ import {
 } from '../lib/contractStatus';
 import { formatCnpj, formatCurrencyBRL } from '../lib/formatters';
 import { validateDatePeriod } from '../lib/datePeriod';
+import { notificationService } from '../lib/notificationService';
 import { DatePeriodControls } from './DatePeriodControls';
 import { RiskScoreInline } from './RiskText';
 
@@ -151,6 +152,12 @@ export function ContractSearchView({
       setParsedContractCode(res.parsedContractCode ?? null);
       setLivePncpStatus(res.livePncpStatus ?? null);
       setCnpjCoverage(res.cnpjCoverage ?? null);
+      if (res.results.length > 0) {
+        notificationService.notifyHighRiskBatch(res.results, {
+          sourceLabel: 'Busca em Lote de Contratos',
+          onOpenContract: onSelectContract,
+        });
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Erro ao consultar contratos.');
     } finally {
