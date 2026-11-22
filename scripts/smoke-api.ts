@@ -20,6 +20,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
+import { verifyInvestigationPackage } from '../src/server/investigationVerifier';
+import type { InvestigationResponse } from '../src/types/investigation';
 
 const PORT = 3200 + Math.floor(Math.random() * 500);
 const BASE_URL = `http://127.0.0.1:${PORT}`;
@@ -256,6 +258,41 @@ async function main() {
     assert.equal(snapJson.dossier.snapshotReviews[0].author, 'Auditor Chefe Smoke');
     console.log('[smoke] 8. Immutable dossier snapshot save & reopen OK');
 
+    // Private investigation is mounted in the real application and never serves
+    // its originals from the public document endpoint.
+    const investigationUrl = `${BASE_URL}/api/contracts/${encodeURIComponent(contractId)}/investigation`;
+    assert.equal((await fetch(investigationUrl)).status, 401);
+    const privateBytes = Buffer.from('Evidência exclusivamente sintética para QA da investigação restrita.');
+    const privateSha = crypto.createHash('sha256').update(privateBytes).digest('hex');
+    const artifactRes = await fetch(`${investigationUrl}/artifacts`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeader },
+      body: JSON.stringify({ filename: 'synthetic-private-evidence.txt', mimeType: 'text/plain', contentBase64: privateBytes.toString('base64') }),
+    });
+    assert.equal(artifactRes.status, 201);
+    assert.equal((await fetch(`${BASE_URL}/api/documents/${privateSha}/original`)).status, 404);
+    assert.equal((await fetch(`${investigationUrl}/artifacts/${privateSha}`)).status, 401);
+    const datasetRes = await fetch(`${investigationUrl}/dataset`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeader },
+      body: JSON.stringify({
+        expectedRevisionDigest: null, rationale: 'Verificação sintética de integração e preservação privada.',
+        dataset: {
+          schemaVersion: '1.0', purpose: 'Validação sintética em ambiente de teste isolado.',
+          legalBasis: 'Somente dados sintéticos criados para o teste automatizado.',
+          evidence: [{ id: 'smoke-private-source', sourceName: 'Documento sintético de QA', sourceKind: 'analyst_document', sourceUrl: null, retrievedAt: new Date().toISOString(), artifactSha256: privateSha, locator: 'Texto sintético integral; sem pessoas reais.' }],
+          companyEvents: [], people: [], corporateLinks: [], publicRoles: [], familyLinks: [], competitions: [],
+        },
+      }),
+    });
+    assert.equal(datasetRes.status, 200, await datasetRes.clone().text());
+    const investigationState = await datasetRes.json() as InvestigationResponse;
+    assert.equal(investigationState.integrity.valid, true);
+    const investigationExportRes = await fetch(`${investigationUrl}/export`, { headers: authHeader });
+    assert.equal(investigationExportRes.status, 200);
+    const investigationPackage = await investigationExportRes.json();
+    const investigationVerification = verifyInvestigationPackage(investigationPackage, (sha) => sha === privateSha ? privateBytes : sha === expectedSha ? rawBytes : null);
+    assert.equal(investigationVerification.exitCode, 0, JSON.stringify(investigationVerification));
+    console.log('[smoke] Private investigation auth + artifact isolation + independent replay OK');
+
     // 8. Restart server over same SQLite DB & verify persistence
     await stopServer(server);
     server = startServer(dbPath, jobsDbPath);
@@ -275,6 +312,14 @@ async function main() {
     assert.equal(afterRestartReviews.status, 200);
     const reviewsBody = (await afterRestartReviews.json()) as { reviews: Array<{ author: string }> };
     assert.equal(reviewsBody.reviews.length, 1);
+    const afterRestartInvestigation = await fetch(investigationUrl, { headers: authHeader });
+    assert.equal(afterRestartInvestigation.status, 200);
+    const investigationRestored = await afterRestartInvestigation.json() as InvestigationResponse;
+    assert.equal(investigationRestored.currentRevision?.datasetDigest, investigationState.currentRevision?.datasetDigest);
+    assert.equal(investigationRestored.integrity.headHash, investigationState.integrity.headHash);
+    const afterRestartPrivateArtifact = await fetch(`${investigationUrl}/artifacts/${privateSha}`, { headers: authHeader });
+    assert.equal(afterRestartPrivateArtifact.status, 200);
+    assert.deepEqual(Buffer.from(await afterRestartPrivateArtifact.arrayBuffer()), privateBytes);
     console.log('[smoke] 9. Persistence across full server restart OK');
 
     // 9. Unmatched /api/* returns JSON 404

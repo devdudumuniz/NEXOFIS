@@ -7,4 +7,11 @@ coverage/
 .env*
 !.env.example
 data/
+backups/
+*.db
+*.sqlite
+*.sqlite3
+*-wal
+*-shm
+*.pre-restore-*/
 

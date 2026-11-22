@@ -9,6 +9,7 @@ import type {
 import type { ExtractedDocumentFields } from './documentParser';
 import type { RiskDashboardSummary } from './dashboardAggregator';
 import type { ParsedContractCode } from './pncpQueryParser';
+import type { InvestigationDataset, InvestigationResponse } from '../types/investigation';
 
 // In-memory session token ONLY (never persisted to localStorage — SecureCoder / A09)
 let inMemoryAuthToken: string | null = null;
@@ -23,6 +24,85 @@ export function getAuthToken(): string | null {
 
 export function clearAuthToken(): void {
   inMemoryAuthToken = null;
+}
+
+function investigationPath(contractId: string, suffix = ''): string {
+  return `/api/contracts/${encodeURIComponent(contractId)}/investigation${suffix}`;
+}
+
+export async function fetchInvestigation(contractId: string): Promise<InvestigationResponse> {
+  return readJson(await fetch(investigationPath(contractId), {
+    headers: buildAuthHeaders(), cache: 'no-store',
+  }), 'Não foi possível carregar a investigação.');
+}
+
+export async function importInvestigationDataset(
+  contractId: string,
+  dataset: InvestigationDataset,
+  rationale: string,
+  expectedRevisionDigest: string | null,
+): Promise<InvestigationResponse> {
+  return readJson(await fetch(investigationPath(contractId, '/dataset'), {
+    method: 'POST', headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ dataset, rationale, expectedRevisionDigest }),
+  }), 'Não foi possível registrar esta revisão da investigação.');
+}
+
+export async function reviewInvestigationFinding(
+  contractId: string,
+  payload: { findingId: string; findingInputDigest: string; action: 'dismiss' | 'restore'; rationale: string },
+): Promise<InvestigationResponse> {
+  return readJson(await fetch(investigationPath(contractId, '/reviews'), {
+    method: 'POST', headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  }), 'Não foi possível registrar a revisão do apontamento.');
+}
+
+export async function refreshInvestigationRegistry(
+  contractId: string,
+  payload: { purpose: string; legalBasis: string; rationale: string; expectedRevisionDigest: string | null },
+): Promise<InvestigationResponse & { registryMessage?: string }> {
+  return readJson(await fetch(investigationPath(contractId, '/refresh-registry'), {
+    method: 'POST', headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  }), 'Não foi possível consultar o cadastro empresarial.');
+}
+
+export async function exportInvestigation(contractId: string): Promise<Record<string, unknown>> {
+  return readJson(await fetch(investigationPath(contractId, '/export'), {
+    headers: buildAuthHeaders(), cache: 'no-store',
+  }), 'Não foi possível exportar a investigação.');
+}
+
+export interface InvestigationArtifactReceipt {
+  artifactSha256: string;
+  filename: string;
+  mimeType: string;
+  sizeBytes: number;
+}
+
+export async function uploadInvestigationArtifact(
+  contractId: string, file: File,
+): Promise<InvestigationArtifactReceipt> {
+  if (file.size > 1024 * 1024) throw new Error('O limite por evidência é 1 MiB.');
+  const contentBase64 = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(',')[1] ?? '');
+    reader.onerror = () => reject(new Error('Não foi possível ler o arquivo selecionado.'));
+    reader.readAsDataURL(file);
+  });
+  return readJson(await fetch(investigationPath(contractId, '/artifacts'), {
+    method: 'POST', headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ filename: file.name, mimeType: file.type || 'application/octet-stream', contentBase64 }),
+  }), 'Não foi possível preservar o arquivo de evidência.');
+}
+
+export async function downloadInvestigationArtifact(contractId: string, sha256: string): Promise<Blob> {
+  const res = await fetch(investigationPath(contractId, `/artifacts/${encodeURIComponent(sha256)}`), {
+    headers: buildAuthHeaders(), cache: 'no-store',
+  });
+  if (!res.ok) throw await parseErrorResponse(res, 'Não foi possível verificar e baixar a evidência.');
+  return res.blob();
 }
 
 export class ApiError extends Error {
@@ -318,6 +398,7 @@ export async function fetchSupplierMirrorContracts(cnpj: string): Promise<{
   total: number;
   indexSource: string;
   contracts: EvaluatedContract[];
+  pncpCnpjSync?: { message: string; status: 'complete' | 'partial' | 'rate_limited' | 'unavailable' };
 }> {
   const res = await fetch(`/api/suppliers/${encodeURIComponent(cnpj)}/contracts`, {
     headers: buildAuthHeaders(),
