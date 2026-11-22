@@ -68,10 +68,31 @@ Desenvolvido por **Eduardo Muniz — DM Technology**.
 | **Regras e sanções** | Catálogo normativo temporal e análise de registros de sanção, considerando os dados disponíveis sobre efeito, período e alcance. |
 | **Execução e entrega** | Separação dos estágios financeiros e indicadores de gasto por entrega, quando existirem dados compatíveis. |
 | **Investigação** | Achados identificados, justificativas de revisão, histórico e dossiês com snapshot dos dados analisados. |
+| **Inteligência documental** | Oito trilhas de cronologia empresarial, concentração e vínculos societários/familiares documentados, com vigência, cobertura e revisão humana. |
+| **Acervo restrito** | Evidências privadas por contrato, acesso identificado, versões encadeadas por hash e exportação reproduzível com verificador independente. |
 | **Exportação** | PDF, Markdown, JSON estruturado do dossiê e JSON no formato OCDS 1.1. |
 | **Experiência** | Temas claro e escuro, navegação por contexto, filtros e identidade visual NEXOFIS. |
 
 A disponibilidade de uma análise depende dos documentos, das fontes habilitadas e da configuração da instalação. Uma tela disponível não implica cobertura completa de todas as fontes.
+
+### Investigação forense de fornecedores
+
+Na aba **Investigação Forense** do dossiê, analistas e administradores podem investigar:
+
+- Assinatura no mesmo dia ou no dia seguinte ao evento cadastral, mantendo constituição, inscrição e início de atividade separados.
+- Alterações societárias próximas da contratação e concentração no universo de contratos efetivamente observado.
+- Relações documentadas entre fornecedor, pessoas, agentes públicos e familiares, com identidade, função e vigência verificadas.
+- Vínculos empresariais comuns entre participantes de um mesmo lote, apoiados em documentos.
+
+O QSA automático entra como extrato minimizado de um provedor intermediário. Nomes iguais não resolvem identidades; parentesco exige documentação e revisão. “Um contrato encontrado” não significa “único contrato existente”. O módulo organiza elementos para apuração, sem atribuir culpabilidade ou certificar admissibilidade judicial.
+
+O pacote exportado conserva as entradas da análise, versão do motor, fontes e histórico. Os originais privados acompanham um manifesto e podem ser conferidos fora da plataforma:
+
+```powershell
+npx tsx scripts/verify-investigation.ts .\investigacao.json .\originais
+```
+
+Consulte o [guia de investigação documental](./docs/INVESTIGACAO_FORENSE.md) para metodologia, fórmulas, esquema, API, limites de acesso e procedimentos de preservação.
 
 <a id="arquitetura"></a>
 
@@ -324,7 +345,7 @@ Consulte a [implementação de autenticação](./src/server/authMiddleware.ts) e
 
 ### Backup e restauração
 
-O [script de backup](./scripts/backup-restore.sh) cria um snapshot SQLite com `VACUUM INTO`, verifica sua integridade e empacota os objetos originais quando disponíveis.
+O [script de backup](./scripts/backup-restore.sh) cria um snapshot SQLite com `VACUUM INTO`, verifica sua integridade e empacota os objetos originais. O acervo privado de investigação é conferido por SHA-256 e incluído de acordo com as referências do snapshot; uma restauração com originais privados ausentes ou corrompidos é interrompida antes de substituir o destino.
 
 ```bash
 bash scripts/backup-restore.sh backup-sqlite
@@ -345,6 +366,7 @@ No Windows, os comandos Bash podem ser executados por WSL ou Git Bash. Planeje a
 | Documento | Conteúdo |
 |---|---|
 | [Arquitetura e operação](./docs/ARQUITETURA_E_OPERACAO.md) | Serviços, configuração e procedimentos operacionais. |
+| [Investigação documental de fornecedores](./docs/INVESTIGACAO_FORENSE.md) | Regras investigativas, relações documentadas, acervo privado, API e verificação independente. |
 | [Matriz de rastreabilidade](./docs/MATRIZ_RASTREABILIDADE.md) | Acompanhamento dos achados e das verificações documentadas. |
 | [Guia de contribuição](./CONTRIBUTING.md) | Orientações para contribuir com o projeto. |
 | [Política de segurança](./SECURITY.md) | Canal e orientações para comunicar problemas de segurança. |

@@ -892,6 +892,8 @@ export default function App() {
               }
               onDossierSaved={refreshDossiers}
               onSelectContract={handleOpenContract}
+              authenticationKey={principal?.authEnabled ? principal.userId : 'anonymous'}
+              onRequestAuthentication={() => { setAuthError(null); setAuthModalOpen(true); }}
             />
           ) : section === 'dashboard' ? (
             <RiskDashboardView

@@ -44,11 +44,13 @@ import { downloadConsolidatedAuditReportPdf } from '../lib/pdfReportGenerator';
 import { DossierRiskCharts } from './DossierRiskCharts';
 import { getRiskToneClass, SeverityText } from './RiskText';
 import { EntityGraphTab } from './EntityGraphTab';
+import { ForensicInvestigationTab } from './ForensicInvestigationTab';
 
 type DossierTab =
   | 'overview'
   | 'benchmark'
   | 'graph'
+  | 'investigation'
   | 'supplier'
   | 'financials'
   | 'sources_docs';
@@ -60,6 +62,8 @@ interface ContractDossierViewProps {
   onSelectContract?: (contract: EvaluatedContract) => void;
   archivedSnapshot?: SavedDossierSnapshot | null;
   onOpenCurrentContract?: () => void;
+  onRequestAuthentication?: () => void;
+  authenticationKey?: string;
 }
 
 function downloadTextFile(filename: string, content: string, mimeType: string) {
@@ -148,6 +152,8 @@ export function ContractDossierView({
   onSelectContract,
   archivedSnapshot,
   onOpenCurrentContract,
+  onRequestAuthentication,
+  authenticationKey,
 }: ContractDossierViewProps) {
   const { assessment } = contract;
   const isSnapshotReadOnly = Boolean(archivedSnapshot);
@@ -873,6 +879,7 @@ export function ContractDossierView({
               { id: 'overview', label: `Resumo e Riscos (${assessment.indicators.length})` },
               { id: 'benchmark', label: 'Benchmarking & Execução' },
               { id: 'graph', label: 'Grafo FollowTheMoney' },
+              { id: 'investigation', label: 'Investigação Forense' },
               { id: 'supplier', label: 'Fornecedor e Sanções' },
               { id: 'financials', label: 'Itens e Aditivos' },
               {
@@ -1682,6 +1689,15 @@ export function ContractDossierView({
       {/* TAB 3: GRAFO FOLLOWTHEMONEY */}
       {activeTab === 'graph' && (
         <EntityGraphTab contract={contract} onSelectContract={onSelectContract} />
+      )}
+
+      {activeTab === 'investigation' && (
+        <ForensicInvestigationTab
+          key={`${contract.id}:${authenticationKey ?? 'anonymous'}`}
+          contract={contract}
+          archived={isSnapshotReadOnly}
+          onRequestAuthentication={onRequestAuthentication}
+        />
       )}
 
       {/* TAB 4: FORNECEDOR, RECEITA/CNPJ, QSA E SANÇÕES */}

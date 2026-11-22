@@ -16,126 +16,269 @@ TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="${NEXOFIS_BACKUP_DIR:-backups}"
 mkdir -p "$BACKUP_DIR"
 
-run_node_sqlite_backup() {
-  local src="$1"
-  local dest="$2"
-  node --input-type=module - "$src" "$dest" <<'EOF'
+# SQLite and private originals are a recovery set. Stop NEXOFIS before restore.
+# The multi-file swap is recoverable, not a cross-filesystem atomic transaction.
+run_node_sqlite_recovery() {
+  node --input-type=module - "$ACTION" "$TARGET" "$BACKUP_DIR" "$TIMESTAMP" <<'EOF'
+import crypto from 'node:crypto';
 import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { createGunzip } from 'node:zlib';
 import { DatabaseSync } from 'node:sqlite';
 
-const [src, dest] = process.argv.slice(2);
-if (fs.existsSync(dest)) fs.unlinkSync(dest);
-
-const srcDb = new DatabaseSync(src);
-try {
-  // VACUUM INTO creates a single self-contained, transactionally consistent SQLite snapshot
-  // capturing all committed WAL transactions without locking readers or copying raw -wal/-shm files.
-  const escapedDest = dest.replace(/'/g, "''");
-  srcDb.exec(`VACUUM INTO '${escapedDest}';`);
-} finally {
-  srcDb.close();
+const [action, targetArg, backupDirArg, stamp] = process.argv.slice(2);
+const dbPath = path.resolve(process.env.NEXOFIS_SQLITE_PATH || 'data/nexofis.db');
+const backupDir = path.resolve(backupDirArg);
+const parent = path.dirname(dbPath);
+const PRIVATE = 'investigation-objects';
+const PUBLIC = 'objects';
+const MAX_PRIVATE_BYTES = 1024 * 1024;
+const MAX_PUBLIC_BYTES = 32 * 1024 * 1024;
+const MAX_ARCHIVE_BYTES = 2 * 1024 * 1024 * 1024;
+const HASH = /^[a-f0-9]{64}$/;
+function fail(message) { throw new Error(message); }
+function hash(bytes) { return crypto.createHash('sha256').update(bytes).digest('hex'); }
+function canonical(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  return `{${Object.keys(value).filter((k) => value[k] !== undefined).sort().map((k) => `${JSON.stringify(k)}:${canonical(value[k])}`).join(',')}}`;
+}
+function snapshot(source, dest) {
+  if (!fs.existsSync(source)) fail('Banco SQLite de origem não encontrado.');
+  const db = new DatabaseSync(source, { readOnly: true });
+  try { db.exec(`VACUUM INTO '${dest.replace(/'/g, "''")}';`); } finally { db.close(); }
+  verifyDatabase(dest);
+}
+function verifyDatabase(file) {
+  const db = new DatabaseSync(file, { readOnly: true });
+  try {
+    const result = db.prepare('PRAGMA integrity_check').get();
+    if (result?.integrity_check !== 'ok') fail('Arquivo SQLite inválido: integrity_check falhou.');
+  } finally { db.close(); }
+}
+function artifactReferences(file) {
+  const db = new DatabaseSync(file, { readOnly: true });
+  const refs = new Map();
+  try {
+    if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='investigation_events'").get()) return refs;
+    let contractId = null; let previous = null; let sequence = 0;
+    const rows = db.prepare('SELECT contract_id,sequence,id,kind,event_json,previous_event_hash,event_hash FROM investigation_events ORDER BY contract_id,sequence');
+    for (const row of rows.iterate()) {
+      if (row.contract_id !== contractId) { contractId = row.contract_id; previous = null; sequence = 0; }
+      const event = JSON.parse(row.event_json);
+      const { eventHash, ...unsigned } = event;
+      if (!event.payload || event.contractId !== row.contract_id || event.sequence !== ++sequence || event.sequence !== row.sequence
+        || event.id !== row.id || event.kind !== row.kind || event.previousEventHash !== previous || row.previous_event_hash !== previous
+        || eventHash !== row.event_hash || hash(canonical(unsigned)) !== eventHash) fail('Hashchain investigativa inválida no snapshot.');
+      if (event.kind === 'dataset' && hash(canonical(event.payload.dataset)) !== event.payload.datasetDigest) fail('Digest de dataset inválido no snapshot.');
+      previous = eventHash;
+      if (event.kind !== 'artifact') continue;
+      const { artifactSha256: sha, sizeBytes: size } = event.payload;
+      if (!HASH.test(sha) || !Number.isInteger(size) || size < 1 || size > MAX_PRIVATE_BYTES) fail('Referência de artefato inválida no snapshot.');
+      if (refs.has(sha) && refs.get(sha) !== size) fail('Tamanhos conflitantes para o mesmo artefato.');
+      refs.set(sha, size);
+    }
+    return refs;
+  } finally { db.close(); }
+}
+function regularDirectory(dir) {
+  const stat = fs.lstatSync(dir);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) fail('Diretório de objetos ausente ou contém vínculo simbólico.');
+}
+function verifiedPrivateBytes(root, sha, size) {
+  regularDirectory(root); regularDirectory(path.join(root, sha.slice(0, 2)));
+  const file = path.join(root, sha.slice(0, 2), `${sha}.bin`);
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size !== size || stat.size > MAX_PRIVATE_BYTES) fail('Artefato ausente, inválido ou com metadados divergentes.');
+  const bytes = fs.readFileSync(file);
+  if (hash(bytes) !== sha) fail('SHA-256 do artefato diverge do evento registrado.');
+  return bytes;
+}
+function verifyPrivateObjects(root, refs) {
+  for (const [sha, size] of refs) verifiedPrivateBytes(root, sha, size);
+}
+function archiveObjects(stage, kind, dest) {
+  const proc = spawnSync('tar', ['--format=ustar', '-czf', dest, '-C', stage, kind], { encoding: 'utf8' });
+  if (proc.status !== 0) fail('Não foi possível empacotar objetos com tar.');
+}
+function octal(header, start, end) {
+  const text = header.subarray(start, end).toString('ascii').replace(/\0/g, '').trim();
+  if (!/^[0-7]+$/.test(text)) fail('Campo numérico tar não suportado.');
+  return Number.parseInt(text, 8);
+}
+function field(header, start, end) {
+  const bytes = header.subarray(start, end); const nul = bytes.indexOf(0);
+  return bytes.subarray(0, nul < 0 ? bytes.length : nul).toString('utf8');
+}
+/**
+ * Two passes: validate every tar member before extraction, then validate again while
+ * extracting only regular hash-named files into a new private staging directory.
+ * No links, devices, PAX/GNU extensions, absolute paths, traversal or arbitrary modes.
+ */
+async function inspectArchive(file, kind, extractRoot = null) {
+  const stream = fs.createReadStream(file).pipe(createGunzip());
+  const iterator = stream[Symbol.asyncIterator]();
+  let pending = Buffer.alloc(0); let ended = false; let total = 0;
+  async function read(n, allowEnd = false) {
+    const chunks = []; let needed = n;
+    while (needed > 0) {
+      if (!pending.length) {
+        const next = await iterator.next();
+        if (next.done) { ended = true; if (allowEnd && needed === n) return null; fail('Archive tar truncado.'); }
+        pending = Buffer.from(next.value); total += pending.length;
+        if (total > MAX_ARCHIVE_BYTES) fail('Archive excede o limite operacional de 2 GiB descomprimidos.');
+      }
+      const length = Math.min(needed, pending.length);
+      chunks.push(pending.subarray(0, length)); pending = pending.subarray(length); needed -= length;
+    }
+    return chunks.length === 1 ? chunks[0] : Buffer.concat(chunks, n);
+  }
+  const seen = new Set();
+  try {
+    while (true) {
+      const header = await read(512, true);
+      if (header === null) fail('Archive tar sem terminador.');
+      if (header.every((b) => b === 0)) {
+        const second = await read(512);
+        if (!second.every((b) => b === 0)) fail('Terminador tar inválido.');
+        while (!ended) {
+          const padding = await read(512, true);
+          if (padding && !padding.every((b) => b === 0)) fail('Conteúdo após o terminador tar.');
+        }
+        break;
+      }
+      const expected = octal(header, 148, 156);
+      let sum = 0; for (let i = 0; i < 512; i++) sum += i >= 148 && i < 156 ? 32 : header[i];
+      if (sum !== expected || !field(header, 257, 263).startsWith('ustar')) fail('Cabeçalho tar inválido ou formato não suportado.');
+      const prefix = field(header, 345, 500); const name = `${prefix ? `${prefix}/` : ''}${field(header, 0, 100)}`;
+      const type = String.fromCharCode(header[156]); const size = octal(header, 124, 136);
+      const normalized = name.replace(/\/$/, '');
+      const relative = normalized.startsWith(`${kind}/`) ? normalized.slice(kind.length + 1) : '';
+      const isDir = type === '5';
+      if (field(header, 157, 257) || !['0', '\0', '5'].includes(type)) fail('Archive contém link ou tipo de entrada proibido.');
+      if (seen.has(normalized)) fail('Entrada tar duplicada.');
+      seen.add(normalized);
+      if (seen.size > 100000) fail('Archive excede o limite operacional de 100.000 entradas.');
+      const suffix = kind === PRIVATE ? '\\.bin' : '(?:\\.bin)?';
+      const filePattern = new RegExp(`^[a-f0-9]{2}/([a-f0-9]{64})${suffix}$`);
+      const match = relative.match(filePattern);
+      if (isDir) {
+        if (size !== 0 || !(normalized === kind || new RegExp(`^${kind}/[a-f0-9]{2}$`).test(normalized))) fail('Caminho de diretório tar proibido.');
+        if (extractRoot) fs.mkdirSync(path.join(extractRoot, normalized), { recursive: true, mode: 0o700 });
+        continue;
+      }
+      if (!match || relative.slice(0, 2) !== match[1].slice(0, 2)) fail('Caminho de objeto tar inválido.');
+      const max = kind === PRIVATE ? MAX_PRIVATE_BYTES : MAX_PUBLIC_BYTES;
+      if (!Number.isSafeInteger(size) || size < 1 || size > max) fail('Objeto tar fora do limite de tamanho.');
+      const bytes = await read(size);
+      if (hash(bytes) !== match[1]) fail('SHA-256 do objeto no archive não corresponde ao nome.');
+      if (extractRoot) {
+        const dest = path.join(extractRoot, normalized);
+        fs.mkdirSync(path.dirname(dest), { recursive: true, mode: 0o700 });
+        fs.writeFileSync(dest, bytes, { flag: 'wx', mode: 0o600 });
+      }
+      const padding = (512 - size % 512) % 512;
+      if (padding) await read(padding);
+    }
+  } finally { stream.destroy(); }
+}
+async function stageArchive(archive, kind, stage, required = false) {
+  fs.mkdirSync(path.join(stage, kind), { recursive: true, mode: 0o700 });
+  if (!fs.existsSync(archive)) { if (required) fail('Acervo investigativo obrigatório ausente: archive investigation-objects não encontrado.'); return false; }
+  await inspectArchive(archive, kind);
+  await inspectArchive(archive, kind, stage);
+  return true;
 }
 
-// Verify integrity of the snapshot immediately
-const checkDb = new DatabaseSync(dest, { readOnly: true });
-try {
-  const res = checkDb.prepare('PRAGMA integrity_check;').get();
-  if (!res || res.integrity_check !== 'ok') {
-    throw new Error(`Integrity check falhou no backup: ${JSON.stringify(res)}`);
-  }
-  const tables = checkDb
-    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-    .all();
-  const counts = {};
-  for (const t of tables) {
-    const row = checkDb.prepare(`SELECT COUNT(*) AS cnt FROM "${t.name}"`).get();
-    counts[t.name] = Number(row.cnt);
-  }
-  console.log(`Snapshot SQLite verificado (PRAGMA integrity_check=ok): ${JSON.stringify(counts)}`);
-} finally {
-  checkDb.close();
+async function backup() {
+  fs.mkdirSync(backupDir, { recursive: true, mode: 0o700 });
+  const dest = path.join(backupDir, `nexofis-${stamp}-${process.pid}.db`);
+  const stage = fs.mkdtempSync(path.join(backupDir, '.backup-stage-'));
+  try {
+    const stagedDb = path.join(stage, 'snapshot.db'); snapshot(dbPath, stagedDb);
+    const refs = artifactReferences(stagedDb);
+    fs.mkdirSync(path.join(stage, PRIVATE), { mode: 0o700 });
+    for (const [sha, size] of refs) {
+      const bytes = verifiedPrivateBytes(path.join(parent, PRIVATE), sha, size);
+      const file = path.join(stage, PRIVATE, sha.slice(0, 2), `${sha}.bin`);
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 }); fs.writeFileSync(file, bytes, { mode: 0o600 });
+    }
+    const privateArchive = path.join(stage, 'private.tar.gz');
+    archiveObjects(stage, PRIVATE, privateArchive); await inspectArchive(privateArchive, PRIVATE);
+    let publicArchive = null;
+    if (fs.existsSync(path.join(parent, PUBLIC))) {
+      publicArchive = path.join(stage, 'public.tar.gz');
+      archiveObjects(parent, PUBLIC, publicArchive); await inspectArchive(publicArchive, PUBLIC);
+    }
+    // Publish the DB last; an interrupted backup cannot expose a completed DB without its archives.
+    fs.renameSync(privateArchive, `${dest}.${PRIVATE}.tar.gz`);
+    if (publicArchive) fs.renameSync(publicArchive, `${dest}.objects.tar.gz`);
+    fs.renameSync(stagedDb, dest);
+    console.log(`Backup SQLite consistente salvo em: ${dest}`);
+    console.log(`Acervo investigativo preservado e verificado: ${refs.size} objeto(s). Mantenha os archives junto do .db.`);
+  } finally { fs.rmSync(stage, { recursive: true, force: true }); }
 }
-EOF
+async function restore() {
+  if (!targetArg || !fs.existsSync(targetArg)) fail('Informe o arquivo .db de backup válido.');
+  const target = path.resolve(targetArg);
+  if (target === dbPath) fail('O arquivo de backup e o destino devem ser distintos.');
+  fs.mkdirSync(parent, { recursive: true, mode: 0o700 });
+  console.log('Restauração requer a aplicação NEXOFIS PARADA. A troca de banco e objetos não é uma transação atômica entre arquivos.');
+  const stage = fs.mkdtempSync(path.join(parent, '.restore-stage-'));
+  let rollback = null;
+  const movedDirs = []; let databaseReplaced = false; let databaseMoved = false; let sidecarsMoved = false;
+  try {
+    const stagedDb = path.join(stage, 'snapshot.db'); fs.copyFileSync(target, stagedDb); verifyDatabase(stagedDb);
+    const refs = artifactReferences(stagedDb);
+    await stageArchive(`${target}.${PRIVATE}.tar.gz`, PRIVATE, stage, refs.size > 0);
+    const hasPublic = await stageArchive(`${target}.objects.tar.gz`, PUBLIC, stage);
+    verifyPrivateObjects(path.join(stage, PRIVATE), refs);
+    // All incoming data passed validation. Preserve the existing state before any replacement.
+    rollback = `${dbPath}.pre-restore-${stamp}-${process.pid}`;
+    fs.mkdirSync(rollback, { mode: 0o700 });
+    if (fs.existsSync(dbPath)) snapshot(dbPath, path.join(rollback, 'previous.db'));
+    for (const kind of [PRIVATE, ...(hasPublic ? [PUBLIC] : [])]) {
+      const current = path.join(parent, kind); const old = path.join(rollback, kind);
+      const existed = fs.existsSync(current);
+      if (existed) fs.renameSync(current, old);
+      movedDirs.push({ kind, existed });
+      fs.renameSync(path.join(stage, kind), current);
+    }
+    for (const suffix of ['-wal', '-shm']) if (fs.existsSync(dbPath + suffix)) {
+      fs.renameSync(dbPath + suffix, path.join(rollback, `original${suffix}`)); sidecarsMoved = true;
+    }
+    if (fs.existsSync(dbPath)) { fs.renameSync(dbPath, path.join(rollback, 'original.db')); databaseMoved = true; }
+    fs.renameSync(stagedDb, dbPath); databaseReplaced = true;
+    verifyDatabase(dbPath); verifyPrivateObjects(path.join(parent, PRIVATE), refs);
+    console.log(`Banco e acervo investigativo restaurados e verificados: ${dbPath}`);
+    console.log(`Estado anterior preservado para recuperação em: ${rollback}`);
+    console.log('Valide o caso e reinicie o NEXOFIS. Guarde a cópia anterior conforme a política de retenção.');
+  } catch (error) {
+    if (rollback) {
+      // Best-effort rollback on operational failure; the preserved state remains available for manual recovery after a crash.
+      if (databaseReplaced || databaseMoved || sidecarsMoved) {
+        for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
+        const previous = path.join(rollback, 'previous.db');
+        if (fs.existsSync(previous)) fs.copyFileSync(previous, dbPath);
+      }
+      for (const { kind, existed } of movedDirs.reverse()) {
+        fs.rmSync(path.join(parent, kind), { recursive: true, force: true });
+        if (existed) fs.renameSync(path.join(rollback, kind), path.join(parent, kind));
+      }
+    }
+    throw error;
+  } finally { fs.rmSync(stage, { recursive: true, force: true }); }
 }
-
-run_node_sqlite_verify() {
-  local dbfile="$1"
-  node --input-type=module - "$dbfile" <<'EOF'
-import { DatabaseSync } from 'node:sqlite';
-
-const [dbfile] = process.argv.slice(2);
-const db = new DatabaseSync(dbfile, { readOnly: true });
-try {
-  const res = db.prepare('PRAGMA integrity_check;').get();
-  if (!res || res.integrity_check !== 'ok') {
-    throw new Error(`Arquivo SQLite corrompido ou inválido: ${JSON.stringify(res)}`);
-  }
-  const tables = db
-    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-    .all();
-  const counts = {};
-  for (const t of tables) {
-    const row = db.prepare(`SELECT COUNT(*) AS cnt FROM "${t.name}"`).get();
-    counts[t.name] = Number(row.cnt);
-  }
-  console.log(`Integridade verificada (ok): ${JSON.stringify(counts)}`);
-} finally {
-  db.close();
-}
+try { if (action === 'backup-sqlite') await backup(); else await restore(); }
+catch (error) { console.error(`Falha de recuperação: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
 EOF
 }
 
 case "$ACTION" in
-  backup-sqlite)
-    SRC="${NEXOFIS_SQLITE_PATH:-data/nexofis.db}"
-    if [ ! -f "$SRC" ]; then
-      echo "Banco SQLite não encontrado em $SRC" >&2
-      exit 1
-    fi
-    DEST="$BACKUP_DIR/nexofis-$TIMESTAMP.db"
-    run_node_sqlite_backup "$SRC" "$DEST"
-
-    # Also archive durable original objects store if present alongside SQLite
-    OBJ_DIR="$(dirname "$SRC")/objects"
-    if [ -d "$OBJ_DIR" ] && [ -n "$(ls -A "$OBJ_DIR" 2>/dev/null || true)" ]; then
-      tar -czf "${DEST}.objects.tar.gz" -C "$(dirname "$SRC")" objects
-      echo "Arquivos originais (objects/) empacotados em: ${DEST}.objects.tar.gz"
-    fi
-    echo "Backup SQLite consistente salvo em: $DEST"
-    ;;
-
-  restore-sqlite)
-    if [ -z "$TARGET" ] || [ ! -f "$TARGET" ]; then
-      echo "Informe o arquivo .db de backup válido." >&2
-      exit 1
-    fi
-    DEST="${NEXOFIS_SQLITE_PATH:-data/nexofis.db}"
-    DEST_DIR="$(dirname "$DEST")"
-    mkdir -p "$DEST_DIR"
-
-    echo "Verificando integridade do backup antes da restauração..."
-    run_node_sqlite_verify "$TARGET"
-
-    # Stage restore atomically and preserve a pre-restore copy of the current DB
-    STAGED="${DEST}.restore-staged.$$"
-    cp "$TARGET" "$STAGED"
-    if [ -f "$DEST" ]; then
-      cp "$DEST" "${DEST}.pre-restore-${TIMESTAMP}.bak"
-    fi
-
-    # Remove old WAL/SHM sidecars ONLY together with replacing the database with the verified self-contained snapshot
-    rm -f "${DEST}-wal" "${DEST}-shm"
-    mv -f "$STAGED" "$DEST"
-
-    echo "Verificando banco restaurado..."
-    run_node_sqlite_verify "$DEST"
-
-    # Restore objects/ archive if present next to backup
-    if [ -f "${TARGET}.objects.tar.gz" ]; then
-      tar -xzf "${TARGET}.objects.tar.gz" -C "$DEST_DIR"
-      echo "Objetos originais (objects/) restaurados em: $DEST_DIR/objects"
-    fi
-    echo "Banco SQLite restaurado com sucesso em: $DEST (reinicie o servidor NEXOFIS se estiver em execução)."
+  backup-sqlite|restore-sqlite)
+    umask 077
+    run_node_sqlite_recovery
     ;;
 
   backup-postgres)

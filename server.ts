@@ -58,6 +58,7 @@ import { createDurableJobQueue } from './src/server/jobQueue';
 import { runEfficientOcrPipeline } from './src/server/ocrEngine';
 import { fetchPncpContractsByCnpj } from './src/server/pncpClient';
 import { createNexofisStore } from './src/server/storage';
+import { mountInvestigationRoutes } from './src/server/investigationRoutes';
 import type {
   ContractRecord,
   DocumentPage,
@@ -1098,6 +1099,15 @@ async function handleCnpjContractsLookup(req: express.Request, res: express.Resp
 
   const maxPages = Math.min(20, Math.max(1, Number(req.query.maxPages ?? 8)));
   const liveResult = await fetchPncpContractsByCnpj(cleanCnpj, { maxPages, pageSize: 50 });
+  store.upsertSyncCheckpoint({
+    scopeKey: `cnpj:${cleanCnpj}`,
+    sourceSystem: 'PNCP Search API',
+    lastSyncedAt: liveResult.retrievedAt,
+    status: liveResult.status,
+    totalDeclared: liveResult.pncpTotalDeclared,
+    totalFetched: liveResult.pncpFetchedCount,
+    detail: liveResult.message,
+  });
   for (const r of liveResult.records) {
     persistContract(r);
   }
@@ -1906,6 +1916,13 @@ function handleRiskDashboardSummary(req: express.Request, res: express.Response)
 
 app.get('/api/dashboard/risk-summary', handleRiskDashboardSummary);
 app.get('/api/dashboard/risks', handleRiskDashboardSummary);
+
+// Documentary relationships and private evidence never enter public contract responses.
+mountInvestigationRoutes(app, {
+  store,
+  getContract: (id) => contractStore.get(id),
+  getAllContracts,
+});
 
 // Ensure unmatched /api/* routes ALWAYS return JSON 404 (never SPA HTML fallback!)
 app.use('/api', (_req, res) => {
