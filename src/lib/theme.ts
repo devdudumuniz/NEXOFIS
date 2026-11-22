@@ -31,20 +31,38 @@ export function readStoredTheme(): ThemeMode {
 }
 
 export function applyThemeToDocument(theme: ThemeMode): void {
-  if (typeof document === 'undefined') return;
-  const root = document.documentElement;
-  if (theme === 'dark') {
-    root.classList.add('dark');
-    root.style.colorScheme = 'dark';
-  } else {
-    root.classList.remove('dark');
-    root.style.colorScheme = 'light';
+  if (typeof document !== 'undefined') {
+    const root = document.documentElement;
+    root.dataset.theme = theme;
+    if (theme === 'dark') {
+      root.classList.add('dark');
+      root.style.colorScheme = 'dark';
+      root.style.backgroundColor = '#061321';
+    } else {
+      root.classList.remove('dark');
+      root.style.colorScheme = 'light';
+      root.style.backgroundColor = '#FAF9F5';
+    }
   }
-  try {
-    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
-  } catch {
-    // Ignore restricted storage contexts
+  if (typeof window !== 'undefined') {
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch {
+      // Ignore restricted storage contexts
+    }
   }
+}
+
+export function subscribeToThemeStorage(onChange: (theme: ThemeMode) => void): () => void {
+  if (typeof window === 'undefined') return () => {};
+  const handler = (event: StorageEvent) => {
+    if (event.key !== THEME_STORAGE_KEY) return;
+    if (event.newValue === 'dark' || event.newValue === 'light') {
+      onChange(event.newValue);
+    }
+  };
+  window.addEventListener('storage', handler);
+  return () => window.removeEventListener('storage', handler);
 }
 
 export function readSidebarCollapsed(): boolean {

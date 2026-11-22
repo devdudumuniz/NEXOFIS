@@ -9,6 +9,7 @@ import {
   ExternalLink,
   FileCode2,
   FileDown,
+  FileJson,
   RefreshCw,
   RotateCcw,
   ShieldAlert,
@@ -34,6 +35,10 @@ import {
   formatDateBR,
   formatPercentageBR,
 } from '../lib/formatters';
+import {
+  buildDossierJsonFilename,
+  buildStructuredDossierJson,
+} from '../lib/dossierJsonExporter';
 import { buildAuditDossierMarkdown, mapContractToOCDS } from '../lib/ocdsMapper';
 import { downloadAuditReportPdf } from '../lib/pdfReportGenerator';
 import { getRiskToneClass, SeverityText } from './RiskText';
@@ -339,6 +344,28 @@ export function ContractDossierView({
     );
   };
 
+  const handleExportDossierJson = () => {
+    try {
+      const dossierPackage = buildStructuredDossierJson(contract, {
+        analystNote,
+        reviews: reviewHistory,
+        archivedSnapshot,
+      });
+      const filename = buildDossierJsonFilename(contract);
+      downloadTextFile(
+        filename,
+        JSON.stringify(dossierPackage, null, 2),
+        'application/json;charset=utf-8'
+      );
+      setSaveError(null);
+      setSavedFeedback(
+        `Dossiê JSON exportado (${filename}) · SHA-256 ${dossierPackage.integrity.contentSha256.slice(0, 12)}…`
+      );
+    } catch {
+      setSaveError('Não foi possível exportar o dossiê em JSON estruturado neste momento.');
+    }
+  };
+
   const handleSaveDossier = async (e: React.FormEvent) => {
     e.preventDefault();
     if (isSnapshotReadOnly) return;
@@ -487,6 +514,15 @@ export function ContractDossierView({
           >
             <Download className="w-3.5 h-3.5" aria-hidden="true" />
             Dossiê (.md)
+          </button>
+          <button
+            type="button"
+            data-testid="export-dossier-json-btn"
+            onClick={handleExportDossierJson}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#0B2540] dark:text-[#FAF9F5] bg-[#E8F1F6] dark:bg-[#102843] border border-[#0B2540]/20 dark:border-[#1D3A57] hover:bg-[#dce8f0] dark:hover:bg-[#163659] rounded-md transition-colors whitespace-nowrap"
+          >
+            <FileJson className="w-3.5 h-3.5 text-[#D95B35]" aria-hidden="true" />
+            Exportar Dossiê
           </button>
           <button
             type="button"

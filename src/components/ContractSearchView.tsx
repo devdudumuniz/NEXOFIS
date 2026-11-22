@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ArrowRight, FileUp, Info, Search, X } from 'lucide-react';
 import type { EvaluatedContract, Municipality } from '../types/audit';
 import { searchContracts, searchMunicipalities, type CnpjCoverageInfo } from '../lib/api';
@@ -18,6 +18,7 @@ export interface ContractSearchFilterState {
   query: string;
   ibgeFilter: string;
   municipalityInput: string;
+  entityFilter?: string;
   yearFilter: string;
   statusFilter: ContractLifecycleFilter;
   startDate: string;
@@ -43,6 +44,7 @@ export function ContractSearchView({
   const [municipalityInput, setMunicipalityInput] = useState(filterState?.municipalityInput ?? '');
   const [municipalitySuggestions, setMunicipalitySuggestions] = useState<Municipality[]>([]);
   const [showMunicipalityMenu, setShowMunicipalityMenu] = useState(false);
+  const [entityFilter, setEntityFilter] = useState(filterState?.entityFilter ?? '');
   const [yearFilter, setYearFilter] = useState(filterState?.yearFilter ?? '');
   const [statusFilter, setStatusFilter] = useState<ContractLifecycleFilter>(
     filterState?.statusFilter ?? ''
@@ -77,13 +79,24 @@ export function ContractSearchView({
       query,
       ibgeFilter,
       municipalityInput,
+      entityFilter,
       yearFilter,
       statusFilter,
       startDate,
       endDate,
       minRisk,
     });
-  }, [query, ibgeFilter, municipalityInput, yearFilter, statusFilter, startDate, endDate, minRisk]);
+  }, [
+    query,
+    ibgeFilter,
+    municipalityInput,
+    entityFilter,
+    yearFilter,
+    statusFilter,
+    startDate,
+    endDate,
+    minRisk,
+  ]);
 
   // Live IBGE autocomplete for all Brazilian municipalities
   useEffect(() => {
@@ -169,6 +182,7 @@ export function ContractSearchView({
   const handleResetFilters = () => {
     setQuery('');
     handleClearMunicipality();
+    setEntityFilter('');
     setYearFilter('');
     setStatusFilter('');
     setStartDate('');
@@ -184,6 +198,37 @@ export function ContractSearchView({
       minRisk: 0,
     });
   };
+
+  const secretariaOptions = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const c of [...results, ...relatedResults]) {
+      const name = (c.entityName || '').trim();
+      if (!name) continue;
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+    if (entityFilter && !counts.has(entityFilter)) {
+      counts.set(entityFilter, 0);
+    }
+    return Array.from(counts.entries())
+      .map(([name, count]) => ({ name, count }))
+      .sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+  }, [results, relatedResults, entityFilter]);
+
+  const visibleResults = useMemo(
+    () =>
+      entityFilter
+        ? results.filter((c) => (c.entityName || '').trim() === entityFilter)
+        : results,
+    [results, entityFilter]
+  );
+
+  const visibleRelatedResults = useMemo(
+    () =>
+      entityFilter
+        ? relatedResults.filter((c) => (c.entityName || '').trim() === entityFilter)
+        : relatedResults,
+    [relatedResults, entityFilter]
+  );
 
   const renderContractRow = (contract: EvaluatedContract) => {
     const valueOmitted = contract.originalValue === 0 && contract.updatedValue === 0;
@@ -436,7 +481,7 @@ export function ContractSearchView({
           </div>
 
           <div className="md:col-span-12 pt-3 border-t border-slate-100 dark:border-[#1D3A57] grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
-            <div className="lg:col-span-7">
+            <div className="lg:col-span-5">
               <DatePeriodControls
                 idPrefix="contract-search"
                 startDate={startDate}
@@ -446,7 +491,31 @@ export function ContractSearchView({
                 showPresets
               />
             </div>
-            <div className="lg:col-span-5 space-y-2">
+            <div className="lg:col-span-4">
+              <label
+                htmlFor="contract-secretaria"
+                className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1"
+              >
+                Secretaria / Órgão
+              </label>
+              <select
+                id="contract-secretaria"
+                data-testid="contract-secretaria-select"
+                value={entityFilter}
+                onChange={(e) => setEntityFilter(e.target.value)}
+                className="w-full h-10 px-3 text-sm bg-white dark:bg-[#061321] border border-slate-300 dark:border-[#1D3A57] rounded-md text-[#0B2540] dark:text-[#FAF9F5] focus:outline-none focus:ring-2 focus:ring-[#D95B35]"
+              >
+                <option value="">
+                  Todas as secretarias / órgãos ({results.length})
+                </option>
+                {secretariaOptions.map((opt) => (
+                  <option key={opt.name} value={opt.name}>
+                    {opt.name} ({opt.count})
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="lg:col-span-3 space-y-2">
               <div>
                 <label
                   htmlFor="contract-status"
@@ -492,7 +561,13 @@ export function ContractSearchView({
                     );
                   })}
                 </div>
-                {(query || ibgeFilter || yearFilter || statusFilter || startDate || endDate) && (
+                {(query ||
+                  ibgeFilter ||
+                  entityFilter ||
+                  yearFilter ||
+                  statusFilter ||
+                  startDate ||
+                  endDate) && (
                   <button
                     type="button"
                     onClick={handleResetFilters}
@@ -664,7 +739,7 @@ export function ContractSearchView({
       <section className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg overflow-hidden">
         <div className="px-5 py-4 border-b border-slate-200 dark:border-[#1D3A57] flex items-center justify-between gap-4">
           <h2 className="text-sm font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
-            Resultados Localizados ({results.length})
+            Resultados Localizados ({visibleResults.length})
           </h2>
           <span className="text-xs text-slate-500 dark:text-slate-400">
             SQLite local + consulta ao vivo na API do PNCP
@@ -675,7 +750,7 @@ export function ContractSearchView({
           <div className="p-8 text-center text-sm text-slate-500 dark:text-slate-400">
             Consultando repositório local e API oficial do PNCP...
           </div>
-        ) : results.length === 0 ? (
+        ) : visibleResults.length === 0 ? (
           <div className="p-8 text-center space-y-3">
             <p className="text-sm font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
               Nenhum contrato localizado para os critérios informados.
@@ -700,23 +775,23 @@ export function ContractSearchView({
           </div>
         ) : (
           <div className="divide-y divide-slate-200 dark:divide-[#1D3A57]">
-            {results.map(renderContractRow)}
+            {visibleResults.map(renderContractRow)}
           </div>
         )}
       </section>
 
-      {results.length === 0 && relatedResults.length > 0 && (
+      {visibleResults.length === 0 && visibleRelatedResults.length > 0 && (
         <section className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg overflow-hidden">
           <div className="px-5 py-4 border-b border-slate-200 dark:border-[#1D3A57]">
             <h2 className="text-sm font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
-              Processos com numeração relacionada ({relatedResults.length})
+              Processos com numeração relacionada ({visibleRelatedResults.length})
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
               Contratos ou compras do mesmo sequencial/ano em outras modalidades.
             </p>
           </div>
           <div className="divide-y divide-slate-200 dark:divide-[#1D3A57]">
-            {relatedResults.map(renderContractRow)}
+            {visibleRelatedResults.map(renderContractRow)}
           </div>
         </section>
       )}

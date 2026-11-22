@@ -634,8 +634,8 @@ export function RiskDashboardView({
           </button>
         </div>
 
-        <div className="pt-4 border-t border-slate-200 dark:border-[#1D3A57]">
-          <div className="max-w-xl">
+        <div className="pt-4 border-t border-slate-200 dark:border-[#1D3A57] grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
+          <div className="lg:col-span-7">
             <DatePeriodControls
               idPrefix="dashboard"
               startDate={startDate}
@@ -644,6 +644,38 @@ export function RiskDashboardView({
               onEndDateChange={(val) => onPeriodChange({ startDate, endDate: val })}
               showPresets
             />
+          </div>
+          <div className="lg:col-span-5">
+            <label
+              htmlFor="dashboard-secretaria-filter"
+              className="block text-xs font-medium text-slate-600 dark:text-slate-300 mb-1"
+            >
+              Secretaria / Órgão
+            </label>
+            <select
+              id="dashboard-secretaria-filter"
+              data-testid="dashboard-secretaria-select"
+              value={groupMode === 'entity' ? selectedGroupKey ?? '' : ''}
+              onChange={(e) => {
+                const nextKey = e.target.value;
+                setSelectedMunicipalityIbge(null);
+                setGroupMode('entity');
+                setSelectedGroupKey(nextKey || null);
+              }}
+              className="w-full h-10 px-3 text-sm bg-white dark:bg-[#061321] border border-slate-300 dark:border-[#1D3A57] rounded-md text-[#0B2540] dark:text-[#FAF9F5] focus:outline-none focus:ring-2 focus:ring-[#D95B35]"
+            >
+              <option value="">
+                Todas as secretarias / órgãos ({data?.summary.totalContracts ?? 0})
+              </option>
+              {[...(data?.summary.byEntity ?? [])]
+                .sort((a, b) => a.label.localeCompare(b.label, 'pt-BR'))
+                .map((ent) => (
+                  <option key={ent.key} value={ent.key}>
+                    {ent.label}
+                    {ent.municipalityLabel ? ` — ${ent.municipalityLabel}` : ''} ({ent.total})
+                  </option>
+                ))}
+            </select>
           </div>
         </div>
       </section>

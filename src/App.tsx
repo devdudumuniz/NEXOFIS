@@ -42,6 +42,7 @@ import {
   getNextTheme,
   readSidebarCollapsed,
   readStoredTheme,
+  subscribeToThemeStorage,
   writeSidebarCollapsed,
   type ThemeMode,
 } from './lib/theme';
@@ -176,10 +177,16 @@ export default function App() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [licenseModalOpen, setLicenseModalOpen] = useState(false);
 
-  // Sync theme to <html> class & localStorage
+  // Sync theme to <html> class & localStorage + listen for cross-tab changes
   useEffect(() => {
     applyThemeToDocument(theme);
   }, [theme]);
+
+  useEffect(() => {
+    return subscribeToThemeStorage((nextTheme) => {
+      setTheme(nextTheme);
+    });
+  }, []);
 
   const handleToggleTheme = () => {
     setTheme((prev) => getNextTheme(prev));
@@ -583,19 +590,6 @@ export default function App() {
               </button>
               <button
                 type="button"
-                onClick={handleToggleTheme}
-                aria-label={theme === 'dark' ? 'Ativar tema claro' : 'Ativar tema escuro'}
-                title={theme === 'dark' ? 'Tema Claro' : 'Tema Escuro'}
-                className="p-2 rounded-md text-slate-500 dark:text-slate-300 hover:bg-[#E8F1F6] dark:hover:bg-[#102843]"
-              >
-                {theme === 'dark' ? (
-                  <Sun className="w-4 h-4 text-amber-400" aria-hidden="true" />
-                ) : (
-                  <Moon className="w-4 h-4 text-[#0B2540]" aria-hidden="true" />
-                )}
-              </button>
-              <button
-                type="button"
                 onClick={() => setLicenseModalOpen(true)}
                 aria-label="Licença AGPL-3.0-only"
                 title="AGPL-3.0-only"
@@ -606,24 +600,6 @@ export default function App() {
             </div>
           ) : (
             <>
-              <button
-                type="button"
-                onClick={handleToggleTheme}
-                className="w-full px-3 py-2 rounded-md border border-slate-200 dark:border-[#1D3A57] bg-[#FAF9F5] dark:bg-[#061321] hover:bg-[#E8F1F6] dark:hover:bg-[#102843] text-xs font-medium text-[#0B2540] dark:text-[#FAF9F5] flex items-center justify-between transition-colors"
-              >
-                <span className="flex items-center gap-2">
-                  {theme === 'dark' ? (
-                    <Sun className="w-3.5 h-3.5 text-amber-400" aria-hidden="true" />
-                  ) : (
-                    <Moon className="w-3.5 h-3.5 text-[#0B2540]" aria-hidden="true" />
-                  )}
-                  <span>{theme === 'dark' ? 'Modo Escuro' : 'Modo Claro'}</span>
-                </span>
-                <span className="font-mono text-[10px] text-slate-500 dark:text-slate-400">
-                  Alternar
-                </span>
-              </button>
-
               <div className="text-[11px] text-slate-500 dark:text-slate-400 space-y-1 px-0.5">
                 <div className="font-semibold text-[#0B2540] dark:text-slate-200">
                   Fontes e persistência

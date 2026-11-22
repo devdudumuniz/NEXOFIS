@@ -22,15 +22,40 @@
       href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Manrope:wght@400;500;600;700;800&display=swap"
       rel="stylesheet"
     />
+    <style>
+      html,
+      body {
+        background-color: #faf9f5;
+        color: #0b2540;
+      }
+      html.dark,
+      html.dark body {
+        background-color: #061321;
+        color: #faf9f5;
+      }
+    </style>
     <script>
       (function () {
         try {
           var stored = localStorage.getItem('nexofis:theme');
           var prefersDark =
             window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-          if (stored === 'dark' || (!stored && prefersDark)) {
-            document.documentElement.classList.add('dark');
-            document.documentElement.style.colorScheme = 'dark';
+          var resolved =
+            stored === 'dark' || stored === 'light'
+              ? stored
+              : prefersDark
+                ? 'dark'
+                : 'light';
+          var root = document.documentElement;
+          root.dataset.theme = resolved;
+          if (resolved === 'dark') {
+            root.classList.add('dark');
+            root.style.colorScheme = 'dark';
+            root.style.backgroundColor = '#061321';
+          } else {
+            root.classList.remove('dark');
+            root.style.colorScheme = 'light';
+            root.style.backgroundColor = '#FAF9F5';
           }
         } catch (e) {}
       })();

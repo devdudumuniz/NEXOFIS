@@ -1,5 +1,13 @@
-import { useEffect, useState } from 'react';
-import { ArrowRight, Building2, Compass, Search, SlidersHorizontal } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import {
+  AlertCircle,
+  ArrowRight,
+  Building2,
+  CheckCircle2,
+  Compass,
+  Search,
+  SlidersHorizontal,
+} from 'lucide-react';
 import type { EvaluatedContract, Municipality } from '../types/audit';
 import {
   fetchMunicipalityContext,
@@ -13,6 +21,7 @@ import {
   formatPercentageBR,
 } from '../lib/formatters';
 import { validateDatePeriod } from '../lib/datePeriod';
+import { validateMunicipalityInput } from '../lib/municipalitySearch';
 import { DatePeriodControls } from './DatePeriodControls';
 import { RiskScoreInline } from './RiskText';
 
@@ -148,8 +157,16 @@ export function MunicipalityView({
     });
   }, [selectedEntityId, context]);
 
+  const inputValidation = useMemo(() => validateMunicipalityInput(query), [query]);
+  const isIbgeFormatError = inputValidation.status === 'invalid_ibge';
+  const isIbgeFormatValid = inputValidation.status === 'valid_ibge';
+
   // Live IBGE autocomplete across all 5,571 Brazilian municipalities
   useEffect(() => {
+    if (isIbgeFormatError) {
+      setSuggestions([]);
+      return;
+    }
     let cancelled = false;
     const timer = setTimeout(() => {
       searchMunicipalities(query)
@@ -165,19 +182,28 @@ export function MunicipalityView({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [query]);
+  }, [query, isIbgeFormatError]);
 
   const handleSubmitSearch = async (e: React.FormEvent) => {
     e.preventDefault();
     const trimmed = query.trim();
     if (!trimmed) return;
 
-    setError(null);
     setShowSuggestions(false);
 
-    const exactDigits = trimmed.replace(/\D/g, '');
-    if (/^\d{7}$/.test(exactDigits)) {
-      setActiveIbge(exactDigits);
+    const validation = validateMunicipalityInput(trimmed);
+    if (validation.status === 'invalid_ibge') {
+      setError(
+        validation.message ??
+          'Código IBGE inválido: informe exatamente 7 dígitos numéricos.'
+      );
+      return;
+    }
+
+    setError(null);
+
+    if (validation.status === 'valid_ibge' && validation.ibgeCode) {
+      setActiveIbge(validation.ibgeCode);
       return;
     }
 
@@ -203,7 +229,7 @@ export function MunicipalityView({
         setQuery(`${picked.name} (${picked.uf})`);
       } else {
         setError(
-          `Nenhum município localizado para "${trimmed}". Informe o nome completo ou o código IBGE de 7 dígitos.`
+          `Nenhum município localizado para "${trimmed}". Informe o nome do município (com ou sem UF) ou o código IBGE de 7 dígitos.`
         );
       }
     } catch (err) {
@@ -254,32 +280,61 @@ export function MunicipalityView({
           </p>
         </div>
 
-        <form onSubmit={handleSubmitSearch} className="relative max-w-2xl">
+        <form onSubmit={handleSubmitSearch} noValidate className="relative max-w-2xl">
           <label htmlFor="municipality-search" className="sr-only">
             Buscar município por nome ou código IBGE
           </label>
           <div className="flex flex-col sm:flex-row gap-2">
             <div className="relative flex-1">
               <Search
-                className="w-4 h-4 text-slate-400 dark:text-slate-500 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none"
+                className={`w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none ${
+                  isIbgeFormatError
+                    ? 'text-red-500 dark:text-red-400'
+                    : isIbgeFormatValid
+                      ? 'text-emerald-600 dark:text-emerald-400'
+                      : 'text-slate-400 dark:text-slate-500'
+                }`}
                 aria-hidden="true"
               />
               <input
                 id="municipality-search"
                 type="text"
                 value={query}
+                aria-invalid={isIbgeFormatError}
+                aria-describedby={
+                  inputValidation.message ? 'municipality-ibge-feedback' : undefined
+                }
                 onFocus={() => setShowSuggestions(true)}
                 onBlur={() => setTimeout(() => setShowSuggestions(false), 180)}
                 onChange={(e) => {
                   setQuery(e.target.value);
+                  setError(null);
                   setShowSuggestions(true);
                 }}
                 placeholder="Digite o nome do município ou código IBGE de 7 dígitos"
-                className="w-full h-11 pl-10 pr-4 text-sm bg-white dark:bg-[#061321] border border-slate-300 dark:border-[#1D3A57] rounded-md text-[#0B2540] dark:text-[#FAF9F5] placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:ring-2 focus:ring-[#D95B35] focus:border-[#D95B35]"
+                className={`w-full h-11 pl-10 pr-10 text-sm bg-white dark:bg-[#061321] border rounded-md text-[#0B2540] dark:text-[#FAF9F5] placeholder:text-slate-400 dark:placeholder:text-slate-500 focus:outline-none focus:ring-2 transition-colors ${
+                  isIbgeFormatError
+                    ? 'border-red-500 dark:border-red-500 focus:ring-red-500/30 focus:border-red-600'
+                    : isIbgeFormatValid
+                      ? 'border-emerald-500 dark:border-emerald-500 focus:ring-emerald-500/30 focus:border-emerald-600'
+                      : 'border-slate-300 dark:border-[#1D3A57] focus:ring-[#D95B35] focus:border-[#D95B35]'
+                }`}
                 autoComplete="off"
               />
+              {isIbgeFormatError && (
+                <AlertCircle
+                  className="w-4 h-4 text-red-500 dark:text-red-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none"
+                  aria-hidden="true"
+                />
+              )}
+              {isIbgeFormatValid && (
+                <CheckCircle2
+                  className="w-4 h-4 text-emerald-600 dark:text-emerald-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none"
+                  aria-hidden="true"
+                />
+              )}
 
-              {showSuggestions && suggestions.length > 0 && (
+              {showSuggestions && !isIbgeFormatError && suggestions.length > 0 && (
                 <ul
                   role="listbox"
                   aria-label="Municípios encontrados no IBGE"
@@ -309,12 +364,31 @@ export function MunicipalityView({
             </div>
             <button
               type="submit"
-              disabled={searchingSubmit}
-              className="h-11 px-5 text-sm font-semibold text-white bg-[#0B2540] hover:bg-[#102843] dark:bg-[#D95B35] dark:hover:bg-[#c04c29] disabled:opacity-60 rounded-md transition-colors whitespace-nowrap shrink-0 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#D95B35] focus-visible:ring-offset-2"
+              disabled={searchingSubmit || isIbgeFormatError}
+              className="h-11 px-5 text-sm font-semibold text-white bg-[#0B2540] hover:bg-[#102843] dark:bg-[#D95B35] dark:hover:bg-[#c04c29] disabled:opacity-50 disabled:cursor-not-allowed rounded-md transition-colors whitespace-nowrap shrink-0 focus:outline-none focus-visible:ring-2 focus-visible:ring-[#D95B35] focus-visible:ring-offset-2"
             >
               {searchingSubmit ? 'Consultando...' : 'Consultar Município'}
             </button>
           </div>
+
+          {inputValidation.message && (
+            <p
+              id="municipality-ibge-feedback"
+              role={isIbgeFormatError ? 'alert' : 'status'}
+              className={`mt-2 flex items-center gap-1.5 text-xs font-medium ${
+                isIbgeFormatError
+                  ? 'text-red-700 dark:text-red-400'
+                  : 'text-emerald-700 dark:text-emerald-400'
+              }`}
+            >
+              {isIbgeFormatError ? (
+                <AlertCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              ) : (
+                <CheckCircle2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              )}
+              <span>{inputValidation.message}</span>
+            </p>
+          )}
         </form>
 
         <div className="mt-4 pt-4 border-t border-slate-100 dark:border-[#1D3A57] flex flex-col sm:flex-row sm:items-end justify-between gap-4">
@@ -548,6 +622,30 @@ export function MunicipalityView({
               </div>
 
               <div className="flex flex-wrap items-center gap-3">
+                {context.entities.length > 0 && (
+                  <div>
+                    <label htmlFor="municipality-secretaria-filter" className="sr-only">
+                      Filtrar por secretaria ou órgão
+                    </label>
+                    <select
+                      id="municipality-secretaria-filter"
+                      data-testid="municipality-secretaria-select"
+                      value={selectedEntityId}
+                      onChange={(e) => setSelectedEntityId(e.target.value)}
+                      className="h-9 px-3 text-xs bg-white dark:bg-[#061321] border border-slate-300 dark:border-[#1D3A57] text-[#0B2540] dark:text-[#FAF9F5] rounded-md max-w-[260px] focus:outline-none focus:ring-2 focus:ring-[#D95B35]"
+                    >
+                      <option value="ALL">
+                        Todas as secretarias ({context.summary.contractCount})
+                      </option>
+                      {context.entities.map((ent) => (
+                        <option key={ent.id} value={ent.id}>
+                          {ent.shortName} ({ent.contractCount})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
                 <div className="relative">
                   <SlidersHorizontal
                     className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none"
