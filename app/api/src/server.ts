@@ -83,6 +83,7 @@ import {
   type SupplierQsaRecord,
 } from '@nexofis/shared/lib/partnerNetworkGraph';
 import { createNexofisStore, InvestigationVersionConflictError, type InvestigationActor } from '@nexofis/backend/storage';
+import { resolveContractsSupplierNames } from '@nexofis/backend/supplierResolver';
 import type {
   ContractRecord,
   DocumentPage,
@@ -281,6 +282,21 @@ function hasRealSupplier(contract: ContractRecord): boolean {
   return isCnpjFormat(cleanCnpj) && cleanCnpj !== '00000000000000' && isValidCnpj(cleanCnpj);
 }
 
+const PNCP_MUNICIPALITY_CACHE_TTL_MS = 2 * 60 * 1000;
+const pncpMunicipalityFetchCache = new Map<
+  string,
+  {
+    expiresAt: number;
+    result: {
+      records: ContractRecord[];
+      signedContractCount: number;
+      editalCount: number;
+      liveAvailable: boolean;
+      message: string;
+    };
+  }
+>();
+
 async function fetchLivePncpContratacoes(
   ibgeCode: string,
   municipalityName: string,
@@ -294,6 +310,11 @@ async function fetchLivePncpContratacoes(
   message: string;
 }> {
   const bounds = resolvePncpPeriodBounds(period, new Date().getFullYear());
+  const cacheKey = `${ibgeCode}:${bounds.dataInicial}:${bounds.dataFinal}`;
+  const cached = pncpMunicipalityFetchCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.result;
+  }
 
   try {
     const modalityResults = await Promise.all(
@@ -403,16 +424,20 @@ async function fetchLivePncpContratacoes(
       }
     }
 
-    // For homologated contratações (valorTotalHomologado > 0), recover real winning supplier from PNCP item results
+    // For homologated/adjudicated contratações, recover real winning supplier from PNCP item results
     const homologatedCandidates = items
-      .filter(
-        (item) =>
-          Number(item.valorTotalHomologado ?? 0) > 0 &&
-          Boolean(item.orgaoEntidade?.cnpj) &&
-          Boolean(item.anoCompra) &&
-          Boolean(item.sequencialCompra)
-      )
-      .slice(0, 6);
+      .filter((item) => {
+        if (!item.orgaoEntidade?.cnpj || !item.anoCompra || !item.sequencialCompra) return false;
+        const hasHomologatedVal = Number(item.valorTotalHomologado ?? 0) > 0;
+        const sit = (item.situacaoCompraNome ?? '').toLowerCase();
+        const isAwardedStatus =
+          sit.includes('homolog') ||
+          sit.includes('adjudic') ||
+          sit.includes('encerr') ||
+          sit.includes('conclu');
+        return hasHomologatedVal || isAwardedStatus;
+      })
+      .slice(0, 12);
 
     const winnerByPncpKey = new Map<
       string,
@@ -636,28 +661,40 @@ async function fetchLivePncpContratacoes(
       };
     });
 
-    const allPersisted = [...signedContracts, ...editalRecords];
+    const rawPersisted = [...signedContracts, ...editalRecords];
+    const resolvedBatch = await enrichContractsWithSecondarySupplierLookup(rawPersisted, 8);
+    const allPersisted = resolvedBatch.contracts;
     for (const r of allPersisted) {
       persistContract(r);
     }
 
     if (allPersisted.length === 0) {
-      return {
+      const emptyResult = {
         records: [],
         signedContractCount: 0,
         editalCount: 0,
         liveAvailable: true,
         message: `API PNCP consultada em tempo real — 0 contratos ou contratações retornados para o período (${bounds.dataInicial}..${bounds.dataFinal}).`,
       };
+      pncpMunicipalityFetchCache.set(cacheKey, {
+        expiresAt: Date.now() + PNCP_MUNICIPALITY_CACHE_TTL_MS,
+        result: emptyResult,
+      });
+      return emptyResult;
     }
 
-    return {
+    const okResult = {
       records: allPersisted,
       signedContractCount: signedContracts.length,
       editalCount: editalRecords.length,
       liveAvailable: true,
       message: `${signedContracts.length} contrato(s) assinado(s) e ${editalRecords.length} edital(is)/contratação(ões) sincronizado(s) via API oficial do PNCP.`,
     };
+    pncpMunicipalityFetchCache.set(cacheKey, {
+      expiresAt: Date.now() + PNCP_MUNICIPALITY_CACHE_TTL_MS,
+      result: okResult,
+    });
+    return okResult;
   } catch (err) {
     return {
       records: [],
@@ -1061,7 +1098,14 @@ app.get('/api/municipalities/:ibgeCode/context', async (req, res) => {
     }
   }
 
-  const evaluated = Array.from(dedupedContracts.values())
+  const secretariaParam = String(
+    req.query.secretaria ?? req.query.entityId ?? req.query.ent ?? ''
+  ).trim();
+
+  const dedupedList = Array.from(dedupedContracts.values());
+  const enrichedMunicipalityBatch = await enrichContractsWithSecondarySupplierLookup(dedupedList, 8);
+
+  const evaluatedAll = enrichedMunicipalityBatch.contracts
     .map((c) => evaluateWithContext(c))
     .sort((a, b) => {
       const aScore = a.assessment.coverageStatus !== 'INSUFFICIENT' ? a.assessment.score : -1;
@@ -1073,17 +1117,47 @@ app.get('/api/municipalities/:ibgeCode/context', async (req, res) => {
       return b.updatedValue - a.updatedValue;
     });
 
-  const entities = buildEntitiesForMunicipality(ibgeCode, evaluated);
+  const entities = buildEntitiesForMunicipality(ibgeCode, evaluatedAll);
+
+  // Refine contracts when a specific secretaria/entity filter is passed via URL query params
+  let resolvedSecretariaId: string | null = null;
+  let refinedContracts = evaluatedAll;
+  if (secretariaParam && secretariaParam !== 'ALL') {
+    const exactEntity = entities.find((e) => e.id === secretariaParam);
+    if (exactEntity) {
+      resolvedSecretariaId = exactEntity.id;
+      refinedContracts = evaluatedAll.filter((c) => c.entityId === exactEntity.id);
+    } else {
+      const normalizedNeedle = normalizePersonName(secretariaParam);
+      const matchedByName = entities.find(
+        (e) =>
+          normalizePersonName(e.shortName) === normalizedNeedle ||
+          normalizePersonName(e.name) === normalizedNeedle ||
+          normalizePersonName(e.shortName).includes(normalizedNeedle)
+      );
+      if (matchedByName) {
+        resolvedSecretariaId = matchedByName.id;
+        refinedContracts = evaluatedAll.filter((c) => c.entityId === matchedByName.id);
+      } else if (normalizedNeedle) {
+        resolvedSecretariaId = secretariaParam;
+        refinedContracts = evaluatedAll.filter((c) =>
+          normalizePersonName(c.entityName).includes(normalizedNeedle)
+        );
+      }
+    }
+  }
 
   res.json({
     municipality,
     entities,
-    contracts: evaluated,
+    contracts: refinedContracts,
     summary: {
-      contractCount: evaluated.length,
+      contractCount: refinedContracts.length,
+      totalMunicipalityContracts: evaluatedAll.length,
+      selectedSecretaria: resolvedSecretariaId,
       entityCount: entities.length,
-      totalValue: evaluated.reduce((sum, c) => sum + c.updatedValue, 0),
-      highRiskCount: evaluated.filter(
+      totalValue: refinedContracts.reduce((sum, c) => sum + c.updatedValue, 0),
+      highRiskCount: refinedContracts.filter(
         (c) => c.assessment.coverageStatus !== 'INSUFFICIENT' && c.assessment.score >= 50
       ).length,
       livePncpUsed: liveRes.liveAvailable,
@@ -1258,7 +1332,8 @@ app.get('/api/contracts/search', async (req, res) => {
     return true;
   });
 
-  const evaluated = matched
+  const enrichedSearchBatch = await enrichContractsWithSecondarySupplierLookup(matched, 6);
+  const evaluated = enrichedSearchBatch.contracts
     .map((c) => evaluateWithContext(c))
     .filter((c) => {
       if (!Number.isFinite(minRisk) || minRisk <= 0) return true;
@@ -1425,6 +1500,19 @@ async function fetchAndCacheSupplierQsa(
       error: `Consulta cadastral indisponível (${err instanceof Error ? err.message : 'erro de rede'}).`,
     };
   }
+}
+
+async function enrichContractsWithSecondarySupplierLookup(
+  records: ContractRecord[],
+  maxExternalLookups = 8
+) {
+  return resolveContractsSupplierNames(records, {
+    getLocalCompanyByCnpj: (cnpj) => store.getSupplierQsa(cnpj),
+    getKnownContracts: () => getAllContracts(),
+    fetchCompanyByCnpj: (cnpj) => fetchAndCacheSupplierQsa(cnpj, { timeoutMs: 4500 }),
+    onContractEnriched: (enriched) => persistContract(enriched),
+    maxExternalLookups,
+  });
 }
 
 app.get('/api/suppliers/:cnpj/live-check', async (req, res) => {
@@ -1743,14 +1831,15 @@ app.post('/api/network/partners/sync', requireAnalystAuth, async (req, res) => {
 // API ROUTES — CONTRACT DETAIL, OCDS & REVIEWS (A06 + A09)
 // ==========================================
 
-app.get('/api/contracts/:id', (req, res) => {
+app.get('/api/contracts/:id', async (req, res) => {
   const contract = contractStore.get(String(req.params.id));
   if (!contract) {
     res.status(404).json({ error: 'Contrato não encontrado na base de auditoria.' });
     return;
   }
 
-  const evaluated = evaluateWithContext(contract);
+  const enriched = await enrichContractsWithSecondarySupplierLookup([contract], 1);
+  const evaluated = evaluateWithContext(enriched.contracts[0] ?? contract);
   res.json(evaluated);
 });
 

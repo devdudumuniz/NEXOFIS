@@ -61,7 +61,14 @@ export function MunicipalityView({
   const [reloadToken, setReloadToken] = useState<number>(0);
   const [searchingSubmit, setSearchingSubmit] = useState(false);
   const [context, setContext] = useState<MunicipalityContextResponse | null>(null);
-  const [internalEntityId, setInternalEntityId] = useState<string>(controlledEntityId ?? 'ALL');
+  const [secretariaFilter, setSecretariaFilterState] = useState<string>(() => {
+    if (controlledEntityId && controlledEntityId !== 'ALL') return controlledEntityId;
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      return params.get('secretaria') || params.get('ent') || 'ALL';
+    }
+    return 'ALL';
+  });
   const [internalStartDate, setInternalStartDate] = useState<string>(controlledStartDate ?? '');
   const [internalEndDate, setInternalEndDate] = useState<string>(controlledEndDate ?? '');
   const [riskFilter, setRiskFilter] = useState<'ALL' | 'HIGH' | 'LOW' | 'UNVERIFIABLE'>('ALL');
@@ -70,9 +77,15 @@ export function MunicipalityView({
   const [loadingContext, setLoadingContext] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const selectedEntityId = controlledEntityId ?? internalEntityId;
+  const selectedEntityId = controlledEntityId ?? secretariaFilter;
   const startDate = controlledStartDate ?? internalStartDate;
   const endDate = controlledEndDate ?? internalEndDate;
+
+  useEffect(() => {
+    if (controlledEntityId !== undefined) {
+      setSecretariaFilterState(controlledEntityId);
+    }
+  }, [controlledEntityId]);
 
   const setPeriod = (nextStart: string, nextEnd: string) => {
     setInternalStartDate(nextStart);
@@ -80,8 +93,22 @@ export function MunicipalityView({
     onPeriodChange?.({ startDate: nextStart, endDate: nextEnd });
   };
   const setSelectedEntityId = (nextId: string) => {
-    setInternalEntityId(nextId);
-    onEntityChange?.(nextId);
+    const normalized = nextId || 'ALL';
+    setSecretariaFilterState(normalized);
+    if (typeof window !== 'undefined' && !onEntityChange) {
+      const params = new URLSearchParams(window.location.search);
+      if (normalized !== 'ALL') {
+        params.set('secretaria', normalized);
+        params.set('ent', normalized);
+      } else {
+        params.delete('secretaria');
+        params.delete('ent');
+      }
+      const qs = params.toString();
+      const nextUrl = qs ? `${window.location.pathname}?${qs}` : window.location.pathname;
+      window.history.replaceState(null, '', nextUrl);
+    }
+    onEntityChange?.(normalized);
   };
   const setActiveIbge = (nextIbge: string) => {
     setError(null);
@@ -97,7 +124,8 @@ export function MunicipalityView({
     setActiveIbgeState(initialIbgeCode);
   }, [initialIbgeCode]);
 
-  // Fetch municipality context ONLY when a valid 7-digit IBGE code is selected
+  // Fetch municipality context ONLY when a valid 7-digit IBGE code is selected,
+  // sending the active secretaria filter in the query URL to refine results on the server.
   useEffect(() => {
     if (!/^\d{7}$/.test(activeIbge)) {
       setContext(null);
@@ -119,6 +147,7 @@ export function MunicipalityView({
     fetchMunicipalityContext(activeIbge, {
       startDate: startDate || undefined,
       endDate: endDate || undefined,
+      secretaria: selectedEntityId !== 'ALL' ? selectedEntityId : undefined,
     })
       .then((data) => {
         if (cancelled) return;
@@ -126,9 +155,12 @@ export function MunicipalityView({
         setQuery((prev) =>
           prev.trim() ? prev : `${data.municipality.name} (${data.municipality.uf})`
         );
-        const preservedEnt = data.entities.find((e) => e.id === selectedEntityId);
+        const resolvedId = data.summary.selectedSecretaria ?? selectedEntityId;
+        const preservedEnt = data.entities.find((e) => e.id === resolvedId);
         if (!preservedEnt && selectedEntityId !== 'ALL') {
           setSelectedEntityId('ALL');
+        } else if (preservedEnt && preservedEnt.id !== selectedEntityId) {
+          setSelectedEntityId(preservedEnt.id);
         }
         onContextChange({
           municipality: data.municipality,
@@ -153,7 +185,7 @@ export function MunicipalityView({
     return () => {
       cancelled = true;
     };
-  }, [activeIbge, startDate, endDate, reloadToken]);
+  }, [activeIbge, startDate, endDate, selectedEntityId, reloadToken]);
 
   useEffect(() => {
     if (!context) return;
@@ -256,6 +288,12 @@ export function MunicipalityView({
     setQuery(`${m.name} (${m.uf})`);
     setShowSuggestions(false);
   };
+
+  const totalMunicipalityContracts =
+    context?.summary.totalMunicipalityContracts ??
+    context?.entities.reduce((sum, e) => sum + e.contractCount, 0) ??
+    context?.summary.contractCount ??
+    0;
 
   const filteredContracts = (context?.contracts ?? []).filter((c) => {
     if (selectedEntityId !== 'ALL' && c.entityId !== selectedEntityId) return false;
@@ -427,7 +465,7 @@ export function MunicipalityView({
                   className="w-full h-9 px-3 text-xs bg-white dark:bg-[#061321] border border-slate-300 dark:border-[#1D3A57] text-[#0B2540] dark:text-[#FAF9F5] rounded-md focus:outline-none focus:ring-2 focus:ring-[#D95B35]"
                 >
                   <option value="ALL">
-                    Todas as secretarias ({context.summary.contractCount})
+                    Todas as secretarias ({totalMunicipalityContracts})
                   </option>
                   {context.entities.map((ent) => (
                     <option key={ent.id} value={ent.id}>
@@ -472,8 +510,8 @@ export function MunicipalityView({
         </section>
       )}
 
-      {/* Loading Skeleton */}
-      {loadingContext && (
+      {/* Loading Skeleton (only on initial municipality load, not when refining secretaria) */}
+      {loadingContext && (!context || context.municipality.ibgeCode !== activeIbge) && (
         <div className="space-y-6" aria-busy="true" aria-label="Carregando contexto municipal">
           <div className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg p-6 animate-pulse">
             <div className="h-6 w-72 bg-slate-200 dark:bg-[#102843] rounded mb-3" />
@@ -491,8 +529,15 @@ export function MunicipalityView({
       )}
 
       {/* Resolved Municipal Context */}
-      {!loadingContext && context && (
-        <>
+      {context && context.municipality.ibgeCode === activeIbge && (
+        <div
+          className={
+            loadingContext
+              ? 'space-y-6 opacity-70 transition-opacity'
+              : 'space-y-6 transition-opacity'
+          }
+          aria-busy={loadingContext}
+        >
           <section className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg p-6">
             <div className="flex flex-col md:flex-row md:items-baseline justify-between gap-2 pb-5 border-b border-slate-200 dark:border-[#1D3A57]">
               <div>
@@ -588,7 +633,7 @@ export function MunicipalityView({
                     onClick={() => setSelectedEntityId('ALL')}
                     className="text-xs font-medium text-[#D95B35] hover:underline whitespace-nowrap"
                   >
-                    Exibir todos os órgãos ({context.summary.contractCount})
+                    Exibir todos os órgãos ({totalMunicipalityContracts})
                   </button>
                 )}
               </div>
@@ -675,7 +720,7 @@ export function MunicipalityView({
                       className="h-9 px-3 text-xs bg-white dark:bg-[#061321] border border-slate-300 dark:border-[#1D3A57] text-[#0B2540] dark:text-[#FAF9F5] rounded-md max-w-[260px] focus:outline-none focus:ring-2 focus:ring-[#D95B35]"
                     >
                       <option value="ALL">
-                        Todas as secretarias ({context.summary.contractCount})
+                        Todas as secretarias ({totalMunicipalityContracts})
                       </option>
                       {context.entities.map((ent) => (
                         <option key={ent.id} value={ent.id}>
@@ -875,7 +920,7 @@ export function MunicipalityView({
               </div>
             )}
           </section>
-        </>
+        </div>
       )}
     </div>
   );

@@ -104,7 +104,7 @@ function readUrlState(): UrlState {
       : 'municipio';
   const rawIbge = params.get('ibge') ?? '';
   const ibge = /^\d{7}$/.test(rawIbge) ? rawIbge : '';
-  const entityId = params.get('ent') || 'ALL';
+  const entityId = params.get('secretaria') || params.get('ent') || 'ALL';
   const q = params.get('q') ?? '';
   const rawMode = params.get('mode');
   const networkMode: PartnerNetworkQueryMode =
@@ -335,6 +335,7 @@ export default function App() {
       if (activeIbge) params.set('ibge', activeIbge);
       if (selectedEntityId && selectedEntityId !== 'ALL') {
         params.set('ent', selectedEntityId);
+        params.set('secretaria', selectedEntityId);
       }
       if (periodFilter.startDate) params.set('from', periodFilter.startDate);
       if (periodFilter.endDate) params.set('to', periodFilter.endDate);

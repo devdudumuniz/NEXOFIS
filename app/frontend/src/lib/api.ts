@@ -125,6 +125,8 @@ export interface MunicipalityContextResponse {
   contracts: EvaluatedContract[];
   summary: {
     contractCount: number;
+    totalMunicipalityContracts?: number;
+    selectedSecretaria?: string | null;
     entityCount: number;
     totalValue: number;
     highRiskCount: number;
@@ -272,11 +274,14 @@ export async function fetchRiskDashboardSummary(period?: {
 
 export async function fetchMunicipalityContext(
   ibgeCode: string,
-  period?: { startDate?: string; endDate?: string }
+  options?: { startDate?: string; endDate?: string; secretaria?: string }
 ): Promise<MunicipalityContextResponse> {
   const qs = new URLSearchParams();
-  if (period?.startDate) qs.set('startDate', period.startDate);
-  if (period?.endDate) qs.set('endDate', period.endDate);
+  if (options?.startDate) qs.set('startDate', options.startDate);
+  if (options?.endDate) qs.set('endDate', options.endDate);
+  if (options?.secretaria && options.secretaria !== 'ALL') {
+    qs.set('secretaria', options.secretaria);
+  }
   const suffix = qs.toString() ? `?${qs.toString()}` : '';
   const res = await fetch(`/api/municipalities/${encodeURIComponent(ibgeCode)}/context${suffix}`, {
     headers: buildAuthHeaders(),

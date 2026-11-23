@@ -476,21 +476,20 @@ export async function fetchPncpItemWinningSupplier(
     return null;
   }
 
-  const url = `https://pncp.gov.br/api/pncp/v1/orgaos/${encodeURIComponent(
-    cleanOrgao
-  )}/compras/${anoCompra}/${sequencialCompra}/itens/1/resultados`;
+  const headers = {
+    Accept: 'application/json',
+    'User-Agent': 'Nexofis/0.1.0 (https://github.com/devdudumuniz/NEXOFIS)',
+    Connection: 'close',
+  };
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      signal: controller.signal,
-      headers: {
-        Accept: 'application/json',
-        'User-Agent': 'Nexofis/0.1.0 (https://github.com/devdudumuniz/NEXOFIS)',
-        Connection: 'close',
-      },
-    });
+  const fetchItemResult = async (
+    itemNumber: number,
+    signal: AbortSignal
+  ): Promise<PncpWinningSupplierResult | null> => {
+    const url = `https://pncp.gov.br/api/pncp/v1/orgaos/${encodeURIComponent(
+      cleanOrgao
+    )}/compras/${anoCompra}/${sequencialCompra}/itens/${itemNumber}/resultados`;
+    const res = await fetch(url, { signal, headers });
     if (!res.ok || res.status === 204) return null;
     const raw = (await res.json()) as Array<{
       niFornecedor?: string;
@@ -516,6 +515,32 @@ export async function fetchPncpItemWinningSupplier(
       awardedValue,
       awardDate,
     };
+  };
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    // Fast path: check item 1 results directly
+    const item1Winner = await fetchItemResult(1, controller.signal);
+    if (item1Winner) return item1Winner;
+
+    // Fallback: inspect up to 5 items of the compra to find an item with temResultado=true
+    const itemsUrl = `https://pncp.gov.br/api/pncp/v1/orgaos/${encodeURIComponent(
+      cleanOrgao
+    )}/compras/${anoCompra}/${sequencialCompra}/itens?pagina=1&tamanhoPagina=5`;
+    const itemsRes = await fetch(itemsUrl, { signal: controller.signal, headers });
+    if (!itemsRes.ok || itemsRes.status === 204) return null;
+    const itemsList = (await itemsRes.json()) as Array<{
+      numeroItem?: number;
+      temResultado?: boolean;
+    }>;
+    if (!Array.isArray(itemsList) || itemsList.length === 0) return null;
+
+    const candidateItem = itemsList.find(
+      (it) => it.temResultado && Number.isInteger(it.numeroItem) && it.numeroItem !== 1
+    );
+    if (!candidateItem?.numeroItem) return null;
+    return await fetchItemResult(candidateItem.numeroItem, controller.signal);
   } catch {
     return null;
   } finally {
