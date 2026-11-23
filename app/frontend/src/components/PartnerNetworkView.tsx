@@ -29,6 +29,11 @@ import type {
   PartnerNetworkQueryMode,
   PartnerNetworkSuggestionsPayload,
 } from '@nexofis/shared/lib/partnerNetworkGraph';
+import {
+  computeCanvasWheelInteraction,
+  computeZoomAroundAnchor,
+  type CanvasTransform,
+} from '../lib/canvasNavigation';
 
 interface PartnerNetworkViewProps {
   initialQuery?: string;
@@ -107,10 +112,26 @@ export function PartnerNetworkView({
   const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
   const [showContractsLayer, setShowContractsLayer] = useState(true);
   const [showOrgansLayer, setShowOrgansLayer] = useState(true);
-  const [zoom, setZoom] = useState(1);
-  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [canvasTransform, setCanvasTransform] = useState<CanvasTransform>({
+    zoom: 1,
+    pan: { x: 0, y: 0 },
+  });
+  const zoom = canvasTransform.zoom;
+  const pan = canvasTransform.pan;
+  const [isCanvasFocused, setIsCanvasFocused] = useState(false);
+  const [isCanvasHovered, setIsCanvasHovered] = useState(false);
+  const isCanvasHoveredRef = useRef(false);
+  const isCanvasActive = isCanvasHovered || isCanvasFocused;
   const [isDragging, setIsDragging] = useState(false);
-  const dragOriginRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
+  const canvasViewportRef = useRef<HTMLDivElement | null>(null);
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const dragOriginRef = useRef<{
+    x: number;
+    y: number;
+    panX: number;
+    panY: number;
+    unitsPerPx: number;
+  } | null>(null);
   const lastInitialKeyRef = useRef<string>('');
   const requestSeqRef = useRef<number>(0);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -185,8 +206,7 @@ export function PartnerNetworkView({
       setError(null);
       setSelectedNodeId(null);
       setHoveredNodeId(null);
-      setZoom(1);
-      setPan({ x: 0, y: 0 });
+      setCanvasTransform({ zoom: 1, pan: { x: 0, y: 0 } });
 
       try {
         const shouldSync = Boolean(options?.triggerLiveSync) && canMutateSync;
@@ -415,18 +435,109 @@ export function PartnerNetworkView({
     }
   };
 
+  const getSvgUnitsPerCssPx = useCallback(() => {
+    const svgEl = svgRef.current;
+    const layoutHeight = payload?.layout.height ?? 580;
+    if (!svgEl) return 1;
+    const rect = svgEl.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return 1;
+    const uniformScale = Math.min(rect.width / effectiveWidth, rect.height / layoutHeight);
+    return uniformScale > 0 ? 1 / uniformScale : 1;
+  }, [effectiveWidth, payload?.layout.height]);
+
+  // Figma-style wheel interaction (Scroll = cursor zoom, Shift+Scroll = horizontal pan),
+  // active whenever the pointer is over the canvas (hover) or the canvas has focus.
+  useEffect(() => {
+    const viewportEl = canvasViewportRef.current;
+    if (!viewportEl) return;
+
+    const handleNativeWheel = (event: WheelEvent) => {
+      const active = document.activeElement;
+      const hasFocus = Boolean(active && (active === viewportEl || viewportEl.contains(active)));
+      const isPointerOver = isCanvasHoveredRef.current || viewportEl.matches(':hover');
+      if (!isPointerOver && !hasFocus) {
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      const svgEl = svgRef.current;
+      const layoutHeight = payload?.layout.height ?? 580;
+      const fallbackCenter = { x: effectiveWidth / 2, y: layoutHeight / 2 };
+      let anchorViewBoxPoint = fallbackCenter;
+      let svgUnitsPerCssPx = 1;
+
+      if (svgEl) {
+        const rect = svgEl.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) {
+          const uniformScale = Math.min(rect.width / effectiveWidth, rect.height / layoutHeight);
+          if (uniformScale > 0) {
+            svgUnitsPerCssPx = 1 / uniformScale;
+            const renderedWidth = effectiveWidth * uniformScale;
+            const renderedHeight = layoutHeight * uniformScale;
+            const offsetX = (rect.width - renderedWidth) / 2;
+            const offsetY = (rect.height - renderedHeight) / 2;
+            anchorViewBoxPoint = {
+              x: (event.clientX - rect.left - offsetX) / uniformScale,
+              y: (event.clientY - rect.top - offsetY) / uniformScale,
+            };
+          }
+        }
+      }
+
+      setCanvasTransform((prev) =>
+        computeCanvasWheelInteraction(
+          prev,
+          {
+            deltaX: event.deltaX,
+            deltaY: event.deltaY,
+            deltaMode: event.deltaMode,
+            shiftKey: event.shiftKey,
+            ctrlKey: event.ctrlKey,
+            metaKey: event.metaKey,
+            anchorViewBoxPoint,
+            svgUnitsPerCssPx,
+          },
+          fallbackCenter
+        )
+      );
+    };
+
+    viewportEl.addEventListener('wheel', handleNativeWheel, { passive: false });
+    return () => {
+      viewportEl.removeEventListener('wheel', handleNativeWheel);
+    };
+  }, [payload, effectiveWidth]);
+
   // Mouse drag pan handlers on SVG container
   const handlePointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
+    const viewportEl = canvasViewportRef.current;
+    if (viewportEl && !viewportEl.contains(document.activeElement)) {
+      viewportEl.focus({ preventScroll: true });
+    }
     if ((e.target as HTMLElement).closest('[data-graph-node="true"]')) return;
     setIsDragging(true);
-    dragOriginRef.current = { x: e.clientX, y: e.clientY, panX: pan.x, panY: pan.y };
+    dragOriginRef.current = {
+      x: e.clientX,
+      y: e.clientY,
+      panX: pan.x,
+      panY: pan.y,
+      unitsPerPx: getSvgUnitsPerCssPx(),
+    };
   };
 
   const handlePointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
     if (!isDragging || !dragOriginRef.current) return;
-    const dx = e.clientX - dragOriginRef.current.x;
-    const dy = e.clientY - dragOriginRef.current.y;
-    setPan({ x: dragOriginRef.current.panX + dx, y: dragOriginRef.current.panY + dy });
+    const dx = (e.clientX - dragOriginRef.current.x) * dragOriginRef.current.unitsPerPx;
+    const dy = (e.clientY - dragOriginRef.current.y) * dragOriginRef.current.unitsPerPx;
+    setCanvasTransform((prev) => ({
+      ...prev,
+      pan: {
+        x: Number((dragOriginRef.current!.panX + dx).toFixed(2)),
+        y: Number((dragOriginRef.current!.panY + dy).toFixed(2)),
+      },
+    }));
   };
 
   const handlePointerUp = () => {
@@ -989,19 +1100,36 @@ export function PartnerNetworkView({
                   <div className="flex items-center gap-1.5">
                     <button
                       type="button"
-                      onClick={() => setZoom((z) => Math.max(0.55, Number((z - 0.15).toFixed(2))))}
+                      onClick={() =>
+                        setCanvasTransform((prev) =>
+                          computeZoomAroundAnchor(prev, prev.zoom - 0.15, {
+                            x: effectiveWidth / 2,
+                            y: (payload?.layout.height ?? 580) / 2,
+                          })
+                        )
+                      }
                       aria-label="Reduzir zoom do mapa"
                       title="Reduzir zoom"
                       className="p-1.5 rounded border border-slate-200 dark:border-[#1D3A57] text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-[#102843]"
                     >
                       <ZoomOut className="w-3.5 h-3.5" aria-hidden="true" />
                     </button>
-                    <span className="font-mono text-xs tabular-nums text-slate-600 dark:text-slate-300 w-12 text-center">
+                    <span
+                      data-testid="partner-graph-zoom-label"
+                      className="font-mono text-xs tabular-nums text-slate-600 dark:text-slate-300 w-12 text-center"
+                    >
                       {Math.round(zoom * 100)}%
                     </span>
                     <button
                       type="button"
-                      onClick={() => setZoom((z) => Math.min(1.75, Number((z + 0.15).toFixed(2))))}
+                      onClick={() =>
+                        setCanvasTransform((prev) =>
+                          computeZoomAroundAnchor(prev, prev.zoom + 0.15, {
+                            x: effectiveWidth / 2,
+                            y: (payload?.layout.height ?? 580) / 2,
+                          })
+                        )
+                      }
                       aria-label="Ampliar zoom do mapa"
                       title="Ampliar zoom"
                       className="p-1.5 rounded border border-slate-200 dark:border-[#1D3A57] text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-[#102843]"
@@ -1011,8 +1139,7 @@ export function PartnerNetworkView({
                     <button
                       type="button"
                       onClick={() => {
-                        setZoom(1);
-                        setPan({ x: 0, y: 0 });
+                        setCanvasTransform({ zoom: 1, pan: { x: 0, y: 0 } });
                       }}
                       aria-label="Resetar visualização do mapa"
                       title="Resetar visualização"
@@ -1052,11 +1179,53 @@ export function PartnerNetworkView({
                           </span>
                         )}
                       </div>
-                      <span>Clique em qualquer nó para inspecionar · Arraste para mover</span>
+                      <span
+                        data-testid="partner-graph-focus-hint"
+                        className={
+                          isCanvasActive
+                            ? 'text-[#D95B35] font-medium'
+                            : 'text-slate-500 dark:text-slate-400'
+                        }
+                      >
+                        {isCanvasActive
+                          ? 'Canvas ativo · Scroll: vertical · Shift + Scroll: horizontal · Ctrl + Scroll: zoom'
+                          : 'Passe o mouse no canvas: Scroll (vertical) · Shift + Scroll (horizontal) · Ctrl + Scroll (zoom)'}
+                      </span>
                     </div>
 
-                    <div className="w-full h-[580px] overflow-hidden select-none">
+                    <div
+                      ref={canvasViewportRef}
+                      tabIndex={0}
+                      role="region"
+                      data-testid="partner-graph-canvas"
+                      data-canvas-focused={isCanvasActive ? 'true' : 'false'}
+                      aria-label="Canvas interativo do mapa de vínculos — passe o mouse para rolar na vertical com Scroll, na horizontal com Shift + Scroll ou dar zoom com Ctrl + Scroll"
+                      onPointerEnter={() => {
+                        isCanvasHoveredRef.current = true;
+                        setIsCanvasHovered(true);
+                      }}
+                      onPointerLeave={() => {
+                        isCanvasHoveredRef.current = false;
+                        setIsCanvasHovered(false);
+                      }}
+                      onFocus={() => setIsCanvasFocused(true)}
+                      onBlur={(e) => {
+                        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+                          setIsCanvasFocused(false);
+                        }
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Escape') {
+                          (document.activeElement as HTMLElement | null)?.blur?.();
+                          setIsCanvasFocused(false);
+                        }
+                      }}
+                      className={`w-full h-[580px] overflow-hidden select-none outline-none transition-shadow ${
+                        isCanvasActive ? 'ring-2 ring-inset ring-[#D95B35]/70' : ''
+                      }`}
+                    >
                       <svg
+                        ref={svgRef}
                         role="img"
                         aria-label={`Mapa de vínculos societários para ${payload.seedLabel || payload.query}`}
                         viewBox={`0 0 ${effectiveWidth} ${payload.layout.height}`}
@@ -1091,8 +1260,8 @@ export function PartnerNetworkView({
                         />
 
                         <g
+                          data-testid="partner-graph-transform-group"
                           transform={`translate(${pan.x}, ${pan.y}) scale(${zoom})`}
-                          style={{ transformOrigin: 'center center' }}
                         >
                           {/* Subtle Column Guide Labels */}
                           <text
