@@ -285,6 +285,7 @@ export interface InvestigationCasePayload {
   events: InvestigationEventRecord[];
   chainVerification: {
     valid: boolean;
+    integrityStatus?: 'valid' | 'invalid' | 'insufficient';
     eventCount: number;
     brokenAtSeq: number | null;
     factsDigestMatchesLedger?: boolean;
@@ -305,5 +306,18 @@ export interface InvestigationExportPackage {
   reviews: InvestigationReviewRecord[];
   events: InvestigationEventRecord[];
   evaluation: InvestigationEvaluation;
+  reproducibilityContext?: {
+    factsVersion: number;
+    factSetDigestSha256: string;
+    integrityStatus: 'valid' | 'invalid' | 'insufficient';
+    generalLimitations: string[];
+    diligencesSummary: Array<{
+      trailCode: InvestigationTrailCode;
+      findingId: string;
+      status: InvestigationFindingStatus;
+      limitations: string[];
+      suggestedDiligences: string[];
+    }>;
+  };
   packageDigestSha256: string;
 }

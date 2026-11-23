@@ -91,12 +91,18 @@ function sleep(ms: number): Promise<void> {
 async function fetchJsonWithRetry(
   url: string,
   retries = 4,
-  timeoutMs = 8000
+  timeoutMs = 8000,
+  externalSignal?: AbortSignal
 ): Promise<{ status: number; ok: boolean; body?: { items?: PncpSearchItem[]; total?: number }; networkError?: string }> {
   let lastError = '';
   for (let attempt = 0; attempt <= retries; attempt++) {
+    if (externalSignal?.aborted) {
+      return { status: 0, ok: false, networkError: 'Consulta cancelada.' };
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const onAbort = () => controller.abort();
+    externalSignal?.addEventListener('abort', onAbort, { once: true });
     try {
       const res = await fetch(url, {
         signal: controller.signal,
@@ -107,6 +113,7 @@ async function fetchJsonWithRetry(
         },
       });
       clearTimeout(timer);
+      externalSignal?.removeEventListener('abort', onAbort);
       if (res.status === 429) {
         return { status: 429, ok: false };
       }
@@ -121,6 +128,10 @@ async function fetchJsonWithRetry(
       return { status: res.status, ok: true, body };
     } catch (err) {
       clearTimeout(timer);
+      externalSignal?.removeEventListener('abort', onAbort);
+      if (externalSignal?.aborted) {
+        return { status: 0, ok: false, networkError: 'Consulta cancelada.' };
+      }
       lastError = err instanceof Error ? err.message : 'Falha de rede';
       if (attempt < retries) {
         await sleep(450 * (attempt + 1));
@@ -342,12 +353,20 @@ export function mapPncpSearchItemToContract(
  */
 export async function fetchPncpContractsByCnpj(
   rawCnpj: string,
-  options?: { maxPages?: number; pageSize?: number }
+  options?: {
+    maxPages?: number;
+    pageSize?: number;
+    timeoutMs?: number;
+    retries?: number;
+    signal?: AbortSignal;
+  }
 ): Promise<PncpCnpjSearchResult> {
   const cnpj = normalizeCnpj(rawCnpj);
   const retrievedAt = new Date().toISOString();
   const maxPages = Math.min(Math.max(options?.maxPages ?? 5, 1), 10);
   const pageSize = Math.min(Math.max(options?.pageSize ?? 50, 10), 100);
+  const timeoutMs = Math.min(Math.max(options?.timeoutMs ?? 8000, 1000), 15000);
+  const retries = Math.min(Math.max(options?.retries ?? 4, 0), 4);
 
   if (!isCnpjFormat(cnpj)) {
     return {
@@ -380,7 +399,7 @@ export async function fetchPncpContractsByCnpj(
     url.searchParams.set('pagina', String(page));
     url.searchParams.set('tam_pagina', String(pageSize));
 
-    const res = await fetchJsonWithRetry(url.toString());
+    const res = await fetchJsonWithRetry(url.toString(), retries, timeoutMs, options?.signal);
     if (res.status === 429) {
       status = pagesFetched > 0 ? 'partial' : 'rate_limited';
       errorDetail = 'A API pública do PNCP retornou HTTP 429 (limite de taxa).';
@@ -454,16 +473,118 @@ export async function fetchPncpContractsByCnpj(
   };
 }
 
+export interface PncpRawItemResult {
+  niFornecedor?: string;
+  nomeRazaoSocialFornecedor?: string;
+  valorTotalHomologado?: number;
+  dataResultado?: string;
+  situacaoCompraItemResultadoId?: number;
+  situacaoCompraItemResultadoNome?: string;
+  indicadorSubcontratacao?: boolean;
+  ordemClassificacaoSrp?: number;
+}
+
 export interface PncpWinningSupplierResult {
   supplierCnpj: string;
   supplierName: string;
   awardedValue: number;
   awardDate: string;
+  itemNumber: number;
+  totalCompraItems: number | null;
+  attributionScope: 'full_purchase_verified' | 'single_item_only' | 'item_scope_unverified';
+  excludedCanceledCount: number;
+  attributionNote: string;
+}
+
+const CANCELED_RESULT_REGEX =
+  /(cancelad|anulad|revogad|desclassificad|inabilitad|fracassad|desert|suspens|sem\s+efeito)/i;
+
+/**
+ * Pure selector for PNCP item results:
+ * - Excludes canceled, annulled, revoked, or disqualified results (never treats canceled results as active winners).
+ * - Preserves item scope so multi-item compras NEVER attribute the total purchase value to a single item's winner.
+ */
+export function selectActivePncpItemWinningSupplier(
+  results: ReadonlyArray<PncpRawItemResult>,
+  options?: { itemNumber?: number; totalCompraItems?: number | null }
+): PncpWinningSupplierResult | null {
+  if (!Array.isArray(results) || results.length === 0) return null;
+
+  let excludedCanceledCount = 0;
+  const activeResults = results.filter((entry) => {
+    const statusName = String(entry.situacaoCompraItemResultadoNome ?? '').trim();
+    const statusId = entry.situacaoCompraItemResultadoId;
+    const isCanceledById = typeof statusId === 'number' && statusId !== 1;
+    const isCanceledByName = statusName.length > 0 && CANCELED_RESULT_REGEX.test(statusName);
+    if (isCanceledById || isCanceledByName) {
+      excludedCanceledCount += 1;
+      return false;
+    }
+    return true;
+  });
+
+  if (activeResults.length === 0) {
+    return null;
+  }
+
+  // Prefer active result with highest SRP rank (1) and both legal name + CNPJ
+  const sorted = [...activeResults].sort((a, b) => {
+    const aRank = typeof a.ordemClassificacaoSrp === 'number' ? a.ordemClassificacaoSrp : 999;
+    const bRank = typeof b.ordemClassificacaoSrp === 'number' ? b.ordemClassificacaoSrp : 999;
+    if (aRank !== bRank) return aRank - bRank;
+    const aComplete = a.nomeRazaoSocialFornecedor && a.niFornecedor ? 1 : 0;
+    const bComplete = b.nomeRazaoSocialFornecedor && b.niFornecedor ? 1 : 0;
+    return bComplete - aComplete;
+  });
+
+  const winner = sorted[0];
+  const supplierName = String(winner.nomeRazaoSocialFornecedor ?? '').trim();
+  const supplierCnpj = normalizeCnpj(winner.niFornecedor) || '';
+  if (!supplierName && !supplierCnpj) return null;
+
+  const awardedValue =
+    typeof winner.valorTotalHomologado === 'number' && Number.isFinite(winner.valorTotalHomologado)
+      ? winner.valorTotalHomologado
+      : 0;
+  const awardDate = parseIsoDateStrict(winner.dataResultado);
+  const itemNumber = options?.itemNumber ?? 1;
+  const totalCompraItems =
+    typeof options?.totalCompraItems === 'number' && options.totalCompraItems > 0
+      ? options.totalCompraItems
+      : null;
+
+  const attributionScope: PncpWinningSupplierResult['attributionScope'] =
+    totalCompraItems === 1
+      ? 'full_purchase_verified'
+      : totalCompraItems !== null && totalCompraItems > 1
+        ? 'single_item_only'
+        : 'item_scope_unverified';
+
+  const attributionNote =
+    attributionScope === 'full_purchase_verified'
+      ? `Fornecedor vencedor ativo do item único (${itemNumber}/1) da compra.`
+      : attributionScope === 'single_item_only'
+        ? `Fornecedor vencedor ativo apenas do item ${itemNumber} de ${totalCompraItems} itens da compra; vedada atribuição do valor global da compra a este fornecedor isolado.`
+        : `Fornecedor vencedor ativo do item ${itemNumber} (total de itens da compra não verificado); valor limitado estritamente ao resultado homologado do item.`;
+
+  return {
+    supplierCnpj,
+    supplierName: supplierName || `Fornecedor CNPJ ${supplierCnpj}`,
+    awardedValue,
+    awardDate,
+    itemNumber,
+    totalCompraItems,
+    attributionScope,
+    excludedCanceledCount,
+    attributionNote,
+  };
 }
 
 /**
  * Queries PNCP item results endpoint for a homologated compra to recover the winning supplier's
- * real legal name, CNPJ, and homologated value when published by the municipality.
+ * real legal name, CNPJ, and item-scoped homologated value when published by the municipality.
+ * Excludes canceled results and checks total item count so multi-item purchases never attribute
+ * full purchase value to a single item's supplier.
  */
 export async function fetchPncpItemWinningSupplier(
   orgaoCnpj: string,
@@ -484,6 +605,7 @@ export async function fetchPncpItemWinningSupplier(
 
   const fetchItemResult = async (
     itemNumber: number,
+    totalCompraItems: number | null,
     signal: AbortSignal
   ): Promise<PncpWinningSupplierResult | null> => {
     const url = `https://pncp.gov.br/api/pncp/v1/orgaos/${encodeURIComponent(
@@ -491,60 +613,61 @@ export async function fetchPncpItemWinningSupplier(
     )}/compras/${anoCompra}/${sequencialCompra}/itens/${itemNumber}/resultados`;
     const res = await fetch(url, { signal, headers });
     if (!res.ok || res.status === 204) return null;
-    const raw = (await res.json()) as Array<{
-      niFornecedor?: string;
-      nomeRazaoSocialFornecedor?: string;
-      valorTotalHomologado?: number;
-      dataResultado?: string;
-      situacaoCompraItemResultadoNome?: string;
-    }>;
-    if (!Array.isArray(raw) || raw.length === 0) return null;
-    const winner =
-      raw.find((item) => item.nomeRazaoSocialFornecedor && item.niFornecedor) ?? raw[0];
-    const supplierName = String(winner.nomeRazaoSocialFornecedor ?? '').trim();
-    const supplierCnpj = normalizeCnpj(winner.niFornecedor) || '';
-    if (!supplierName && !supplierCnpj) return null;
-    const awardedValue =
-      typeof winner.valorTotalHomologado === 'number' && Number.isFinite(winner.valorTotalHomologado)
-        ? winner.valorTotalHomologado
-        : 0;
-    const awardDate = parseIsoDateStrict(winner.dataResultado);
-    return {
-      supplierCnpj,
-      supplierName: supplierName || `Fornecedor CNPJ ${supplierCnpj}`,
-      awardedValue,
-      awardDate,
-    };
+    const raw = (await res.json()) as PncpRawItemResult[];
+    return selectActivePncpItemWinningSupplier(raw, { itemNumber, totalCompraItems });
   };
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    // Fast path: check item 1 results directly
-    const item1Winner = await fetchItemResult(1, controller.signal);
-    if (item1Winner) return item1Winner;
-
-    // Fallback: inspect up to 5 items of the compra to find an item with temResultado=true
+    // Query items list first to know total item count and avoid attributing full purchase to a single item
+    let totalCompraItems: number | null = null;
+    let itemsList: Array<{ numeroItem?: number; temResultado?: boolean }> = [];
     const itemsUrl = `https://pncp.gov.br/api/pncp/v1/orgaos/${encodeURIComponent(
       cleanOrgao
     )}/compras/${anoCompra}/${sequencialCompra}/itens?pagina=1&tamanhoPagina=5`;
     const itemsRes = await fetch(itemsUrl, { signal: controller.signal, headers });
-    if (!itemsRes.ok || itemsRes.status === 204) return null;
-    const itemsList = (await itemsRes.json()) as Array<{
-      numeroItem?: number;
-      temResultado?: boolean;
-    }>;
-    if (!Array.isArray(itemsList) || itemsList.length === 0) return null;
+    if (itemsRes.ok && itemsRes.status !== 204) {
+      const parsedItems = (await itemsRes.json()) as Array<{
+        numeroItem?: number;
+        temResultado?: boolean;
+      }>;
+      if (Array.isArray(parsedItems) && parsedItems.length > 0) {
+        itemsList = parsedItems;
+        totalCompraItems = parsedItems.length;
+      }
+    }
 
-    const candidateItem = itemsList.find(
-      (it) => it.temResultado && Number.isInteger(it.numeroItem) && it.numeroItem !== 1
+    const firstCandidateNumber =
+      itemsList.find((it) => it.temResultado && Number.isInteger(it.numeroItem))?.numeroItem ?? 1;
+    const primaryWinner = await fetchItemResult(
+      firstCandidateNumber,
+      totalCompraItems,
+      controller.signal
     );
-    if (!candidateItem?.numeroItem) return null;
-    return await fetchItemResult(candidateItem.numeroItem, controller.signal);
+    if (primaryWinner) return primaryWinner;
+
+    // Fallback to another item with temResultado=true if primary had only canceled results
+    for (const candidate of itemsList) {
+      if (
+        candidate.temResultado &&
+        Number.isInteger(candidate.numeroItem) &&
+        candidate.numeroItem !== firstCandidateNumber
+      ) {
+        const alt = await fetchItemResult(
+          candidate.numeroItem!,
+          totalCompraItems,
+          controller.signal
+        );
+        if (alt) return alt;
+      }
+    }
+    return null;
   } catch {
     return null;
   } finally {
     clearTimeout(timer);
   }
 }
+
 

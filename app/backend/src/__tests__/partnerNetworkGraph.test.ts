@@ -402,7 +402,7 @@ describe('Mapa de Vínculos Societários — Motor de Grafo (partnerNetworkGraph
 
     try {
       const store1 = createNexofisStore(dbPath);
-      assert.equal(store1.getSchemaVersion(), 4);
+      assert.equal(store1.getSchemaVersion(), 5);
       store1.upsertSupplierQsa(qsaDataset[0]);
       store1.upsertSupplierQsa(qsaDataset[1]);
       store1.close();
@@ -599,5 +599,265 @@ describe('Mapa de Vínculos Societários — Motor de Grafo (partnerNetworkGraph
     });
     assert.equal(broadGraph.summary.totalMatchingCompanies, 16);
     assert.equal(broadGraph.summary.visualCompaniesTruncated, true);
+  });
+
+  it('reconstrói CNPJ Matriz a partir de raiz RFB de 8 dígitos e escala árvore recursiva de Holdings PJ + sócios + contratos externos', async () => {
+    const { deriveMatrizCnpjFromRoot, resolveCorporatePartnerCnpj } = await import(
+      '@nexofis/shared/lib/cnpj'
+    );
+
+    // Real-world case from screenshot: GWM HOLDING LTDA returned as 8-digit root "54926804"
+    assert.equal(deriveMatrizCnpjFromRoot('54926804'), '54926804000145');
+    assert.equal(
+      resolveCorporatePartnerCnpj({ maskedDocument: '54926804' }),
+      '54926804000145'
+    );
+    // Must NEVER mistake a masked CPF for a corporate partner
+    assert.equal(resolveCorporatePartnerCnpj({ maskedDocument: '***097255**' }), null);
+    assert.equal(
+      resolveCorporatePartnerCnpj({ maskedDocument: '54926804', partnerType: 'PF' }),
+      null
+    );
+
+    const corporateQsa: SupplierQsaRecord[] = [
+      {
+        cnpj: '10562589000175',
+        legalName: 'WM APOIO A GESTAO DE SAUDE LTDA',
+        registrationStatus: 'ATIVA',
+        openingDate: '2008-12-10',
+        primaryCnaeCode: '8211300',
+        primaryCnaeDescription: 'Serviços combinados de escritório',
+        municipality: 'VITORIA DA CONQUISTA',
+        uf: 'BA',
+        shareCapital: 500000,
+        shareholders: [
+          {
+            name: 'GWM HOLDING LTDA',
+            role: 'Sócio',
+            entryDate: '2024-06-01',
+            maskedDocument: '54926804', // 8-digit CNPJ Básico (RFB/BrasilAPI)
+            partnerType: 'PJ',
+          },
+          {
+            name: 'MARIANA AMARAL ALMEIDA',
+            role: 'Sócio-Administrador',
+            entryDate: '2018-01-01',
+            maskedDocument: '***097255**',
+            partnerType: 'PF',
+          },
+        ],
+        sourceProvider: 'BrasilAPI CNPJ',
+        fetchedAt: '2026-11-22T10:00:00.000Z',
+      },
+      {
+        cnpj: '54926804000145',
+        legalName: 'GWM HOLDING LTDA',
+        registrationStatus: 'ATIVA',
+        openingDate: '2024-04-29',
+        primaryCnaeCode: '6462000',
+        primaryCnaeDescription: 'Holdings de instituições não-financeiras',
+        municipality: 'VITORIA DA CONQUISTA',
+        uf: 'BA',
+        shareCapital: 100000,
+        shareholders: [
+          {
+            name: 'HOLDING TOP PARTICIPACOES S/A',
+            role: 'Sócio PJ',
+            entryDate: '2024-05-01',
+            maskedDocument: '11222333000181',
+            partnerType: 'PJ',
+          },
+          {
+            name: 'WASHINGTON WILLIAN COSTA FERREIRA',
+            role: 'Sócio-Administrador',
+            entryDate: '2024-04-29',
+            maskedDocument: '***996795**',
+            partnerType: 'PF',
+          },
+        ],
+        sourceProvider: 'BrasilAPI CNPJ',
+        fetchedAt: '2026-11-22T10:00:00.000Z',
+      },
+      {
+        cnpj: '11222333000181',
+        legalName: 'HOLDING TOP PARTICIPACOES S/A',
+        registrationStatus: 'ATIVA',
+        openingDate: '2020-01-01',
+        primaryCnaeCode: '6462000',
+        primaryCnaeDescription: 'Holdings',
+        municipality: 'SALVADOR',
+        uf: 'BA',
+        shareCapital: 2000000,
+        shareholders: [
+          {
+            name: 'MARIA CONTROLADORA',
+            role: 'Diretor',
+            entryDate: '2020-01-01',
+            maskedDocument: '***555666**',
+            partnerType: 'PF',
+          },
+        ],
+        sourceProvider: 'BrasilAPI CNPJ',
+        fetchedAt: '2026-11-22T10:00:00.000Z',
+      },
+      {
+        // Sister company also owned by GWM HOLDING LTDA with external contracts
+        cnpj: '22333444000181',
+        legalName: 'CLINICA COLIGADA GWM LTDA',
+        registrationStatus: 'ATIVA',
+        openingDate: '2021-03-01',
+        primaryCnaeCode: '8630503',
+        primaryCnaeDescription: 'Atividade médica ambulatorial',
+        municipality: 'ILHEUS',
+        uf: 'BA',
+        shareCapital: 300000,
+        shareholders: [
+          {
+            name: 'GWM HOLDING LTDA',
+            role: 'Sócio',
+            entryDate: '2024-07-01',
+            maskedDocument: '54926804',
+            partnerType: 'PJ',
+          },
+        ],
+        sourceProvider: 'BrasilAPI CNPJ',
+        fetchedAt: '2026-11-22T10:00:00.000Z',
+      },
+    ];
+
+    const corporateContracts: ContractRecord[] = [
+      makeContract({
+        id: 'C-WM-1',
+        contractNumber: '010/2025',
+        cnpj: '10562589000175',
+        companyName: 'WM APOIO A GESTAO DE SAUDE LTDA',
+        entityName: 'Prefeitura de Barra do Choça',
+        municipalityName: 'Barra do Choça',
+        municipalityIbge: '2902906',
+        value: 500000,
+      }),
+      makeContract({
+        id: 'C-HOLDING-1',
+        contractNumber: '020/2025',
+        cnpj: '54926804000145',
+        companyName: 'GWM HOLDING LTDA',
+        entityName: 'Secretaria Estadual de Saúde',
+        municipalityName: 'Salvador',
+        municipalityIbge: '2927408',
+        value: 300000,
+      }),
+      makeContract({
+        id: 'C-SISTER-1',
+        contractNumber: '030/2025',
+        cnpj: '22333444000181',
+        companyName: 'CLINICA COLIGADA GWM LTDA',
+        entityName: 'Prefeitura de Ilhéus',
+        municipalityName: 'Ilhéus',
+        municipalityIbge: '2913606',
+        value: 450000,
+      }),
+    ];
+
+    const graph = buildPartnerNetworkGraph({
+      query: '10562589000175',
+      mode: 'company',
+      contracts: corporateContracts,
+      qsaRecords: corporateQsa,
+    });
+
+    // Must discover all 4 companies: seed (WM), Holding L1 (GWM), Holding L2 (TOP), and Sister (CLINICA COLIGADA)
+    assert.equal(graph.summary.companyCount, 4);
+    assert.equal(graph.summary.corporateShareholderCount, 2);
+    assert.equal(graph.summary.maxOwnershipDepth, 2);
+    // Must discover all 3 PF partners across the whole holding hierarchy (Mariana, Washington, Maria Controladora)
+    assert.equal(graph.summary.partnerCount, 3);
+    // Must aggregate contracts from seed + holding + sister company
+    assert.equal(graph.summary.contractCount, 3);
+    assert.equal(graph.summary.totalContractValue, 1250000);
+
+    // GWM HOLDING must NOT appear as a leaf PF partner; it must be a first-class company node with depth 1
+    assert.equal(
+      graph.partners.some((p) => p.normalizedName.includes('GWM HOLDING')),
+      false
+    );
+    const gwm = graph.companies.find((c) => c.cnpj === '54926804000145');
+    assert.ok(gwm);
+    assert.equal(gwm.isCorporateShareholder, true);
+    assert.equal(gwm.ownershipDepth, 1);
+    assert.equal(gwm.corporateShareholderOf.length, 2);
+    assert.equal(gwm.corporateShareholders.length, 1);
+
+    const topHolding = graph.companies.find((c) => c.cnpj === '11222333000181');
+    assert.ok(topHolding);
+    assert.equal(topHolding.ownershipDepth, 2);
+
+    // SOCIO_PJ_DE edges must connect Top -> GWM, GWM -> WM, and GWM -> Sister
+    const pjEdges = graph.edges.filter((e) => e.relation === 'SOCIO_PJ_DE');
+    assert.equal(pjEdges.length, 3);
+
+    // Dynamic layout columns must place Holdings (Nível 2) -> Holdings (Nível 1) -> Empresas -> Contratos -> Órgãos
+    const holdingCols = graph.layout.columns.filter((c) => c.kind === 'corporate_layer');
+    assert.equal(holdingCols.length, 2);
+    assert.ok(holdingCols[0].x < holdingCols[1].x);
+  });
+
+  it('protege contra ciclo societário circular entre PJs (Empresa A sócia de B e B sócia de A) sem loop infinito', () => {
+    const cyclicQsa: SupplierQsaRecord[] = [
+      {
+        cnpj: '11222333000181',
+        legalName: 'CICLO A LTDA',
+        registrationStatus: 'ATIVA',
+        openingDate: '2020-01-01',
+        primaryCnaeCode: '6462000',
+        primaryCnaeDescription: 'Holdings',
+        municipality: 'SALVADOR',
+        uf: 'BA',
+        shareCapital: 100000,
+        shareholders: [
+          {
+            name: 'CICLO B LTDA',
+            role: 'Sócio PJ',
+            entryDate: '2020-01-01',
+            maskedDocument: '22333444000181',
+            partnerType: 'PJ',
+          },
+        ],
+        sourceProvider: 'BrasilAPI CNPJ',
+        fetchedAt: '2026-11-22T10:00:00.000Z',
+      },
+      {
+        cnpj: '22333444000181',
+        legalName: 'CICLO B LTDA',
+        registrationStatus: 'ATIVA',
+        openingDate: '2020-01-01',
+        primaryCnaeCode: '6462000',
+        primaryCnaeDescription: 'Holdings',
+        municipality: 'SALVADOR',
+        uf: 'BA',
+        shareCapital: 100000,
+        shareholders: [
+          {
+            name: 'CICLO A LTDA',
+            role: 'Sócio PJ',
+            entryDate: '2020-01-01',
+            maskedDocument: '11222333000181',
+            partnerType: 'PJ',
+          },
+        ],
+        sourceProvider: 'BrasilAPI CNPJ',
+        fetchedAt: '2026-11-22T10:00:00.000Z',
+      },
+    ];
+
+    const graph = buildPartnerNetworkGraph({
+      query: '11222333000181',
+      mode: 'company',
+      contracts: [],
+      qsaRecords: cyclicQsa,
+    });
+
+    assert.equal(graph.summary.companyCount, 2);
+    assert.ok(graph.summary.maxOwnershipDepth <= 6);
+    assert.equal(graph.edges.filter((e) => e.relation === 'SOCIO_PJ_DE').length, 2);
   });
 });

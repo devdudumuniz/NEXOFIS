@@ -191,6 +191,7 @@ export function verifyCaseLedgerIntegrity(params: {
   events: ReadonlyArray<InvestigationEventRecord>;
 }): {
   valid: boolean;
+  integrityStatus: 'valid' | 'invalid' | 'insufficient';
   eventCount: number;
   brokenAtSeq: number | null;
   factsDigestMatchesLedger: boolean;
@@ -200,8 +201,21 @@ export function verifyCaseLedgerIntegrity(params: {
   if (!chain.valid) {
     return {
       ...chain,
+      integrityStatus: 'invalid',
       factsDigestMatchesLedger: false,
       integrityReason: `Cadeia de eventos corrompida na sequência #${chain.brokenAtSeq}.`,
+    };
+  }
+
+  if (params.events.length === 0) {
+    return {
+      valid: false,
+      integrityStatus: 'insufficient',
+      eventCount: 0,
+      brokenAtSeq: null,
+      factsDigestMatchesLedger: false,
+      integrityReason:
+        'Livro-razão de eventos ausente ou vazio: integridade insuficiente (validação não presumida).',
     };
   }
 
@@ -211,31 +225,46 @@ export function verifyCaseLedgerIntegrity(params: {
     if (ev.eventType === 'CASE_INITIALIZED' || ev.eventType === 'FACTS_UPDATED') {
       try {
         const parsed = JSON.parse(ev.payloadJson || '{}') as { factsSnapshotDigest?: unknown };
-        if (typeof parsed.factsSnapshotDigest === 'string' && parsed.factsSnapshotDigest.length === 64) {
-          latestFactsDigest = parsed.factsSnapshotDigest;
+        if (
+          typeof parsed.factsSnapshotDigest === 'string' &&
+          /^[a-f0-9]{64}$/i.test(parsed.factsSnapshotDigest)
+        ) {
+          latestFactsDigest = parsed.factsSnapshotDigest.toLowerCase();
           latestFactsVersion = ev.factsVersion;
         }
       } catch {
-        // Ignore unparseable legacy payload
+        // Unparseable payload cannot supply an expected digest
       }
     }
   }
 
-  if (latestFactsDigest !== null) {
-    const actualDigest = computeFactSetDigest(params.factSet);
-    if (params.factSet.version !== latestFactsVersion || actualDigest !== latestFactsDigest) {
-      return {
-        valid: false,
-        eventCount: chain.eventCount,
-        brokenAtSeq: null,
-        factsDigestMatchesLedger: false,
-        integrityReason: `Digest SHA-256 do conjunto de fatos atual (v${params.factSet.version}, ${actualDigest.slice(0, 12)}…) diverge do último evento registrado no livro-razão (v${latestFactsVersion}, ${latestFactsDigest.slice(0, 12)}…).`,
-      };
-    }
+  if (latestFactsDigest === null || latestFactsVersion === null || !Number.isInteger(params.factSet.version)) {
+    return {
+      valid: false,
+      integrityStatus: 'insufficient',
+      eventCount: chain.eventCount,
+      brokenAtSeq: null,
+      factsDigestMatchesLedger: false,
+      integrityReason:
+        'Ausência de digest SHA-256 esperado ou versão de fatos registrada no livro-razão: estado explícito de insuficiência (validação não presumida).',
+    };
+  }
+
+  const actualDigest = computeFactSetDigest(params.factSet);
+  if (params.factSet.version !== latestFactsVersion || actualDigest !== latestFactsDigest) {
+    return {
+      valid: false,
+      integrityStatus: 'invalid',
+      eventCount: chain.eventCount,
+      brokenAtSeq: null,
+      factsDigestMatchesLedger: false,
+      integrityReason: `Digest SHA-256 do conjunto de fatos atual (v${params.factSet.version}, ${actualDigest.slice(0, 12)}…) diverge do último evento registrado no livro-razão (v${latestFactsVersion}, ${latestFactsDigest.slice(0, 12)}…).`,
+    };
   }
 
   return {
     valid: true,
+    integrityStatus: 'valid',
     eventCount: chain.eventCount,
     brokenAtSeq: null,
     factsDigestMatchesLedger: true,
@@ -1740,6 +1769,10 @@ export function buildInvestigationExportPackage(input: {
   evaluation: InvestigationEvaluation;
   exportedAt?: string;
 }): InvestigationExportPackage {
+  const ledgerCheck = verifyCaseLedgerIntegrity({
+    factSet: input.factSet,
+    events: input.events,
+  });
   const base = {
     schemaVersion: 'nexofis-investigation-pkg/1.0' as const,
     exportedAt: input.exportedAt ?? new Date().toISOString(),
@@ -1752,6 +1785,19 @@ export function buildInvestigationExportPackage(input: {
     reviews: input.reviews,
     events: input.events,
     evaluation: input.evaluation,
+    reproducibilityContext: {
+      factsVersion: input.factSet.version,
+      factSetDigestSha256: computeFactSetDigest(input.factSet),
+      integrityStatus: ledgerCheck.integrityStatus,
+      generalLimitations: input.evaluation.generalLimitations,
+      diligencesSummary: input.evaluation.findings.map((f) => ({
+        trailCode: f.trailCode,
+        findingId: f.findingId,
+        status: f.status,
+        limitations: f.limitations,
+        suggestedDiligences: f.suggestedDiligences,
+      })),
+    },
   };
   return {
     ...base,
@@ -1812,6 +1858,9 @@ export function verifyInvestigationPackage(
   }
 
   const p = pkg as Partial<InvestigationExportPackage>;
+  const packageDigestMissing =
+    typeof p.packageDigestSha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(p.packageDigestSha256.trim());
+
   const schemaValid =
     p.schemaVersion === 'nexofis-investigation-pkg/1.0' &&
     Boolean(p.contractSnapshot) &&
@@ -1820,8 +1869,7 @@ export function verifyInvestigationPackage(
     Array.isArray(p.privateEvidence) &&
     Array.isArray(p.reviews) &&
     Array.isArray(p.events) &&
-    Boolean(p.evaluation) &&
-    typeof p.packageDigestSha256 === 'string';
+    Boolean(p.evaluation);
 
   if (!schemaValid) {
     errors.push('Estrutura do pacote não corresponde ao schema nexofis-investigation-pkg/1.0.');
@@ -1844,13 +1892,20 @@ export function verifyInvestigationPackage(
     };
   }
 
-  const { packageDigestSha256, ...withoutDigest } = p as InvestigationExportPackage;
-  const expectedDigest = computeCanonicalSha256(withoutDigest);
-  const packageDigestValid = expectedDigest === packageDigestSha256;
-  if (!packageDigestValid) {
-    errors.push(
-      `Digest SHA-256 do pacote divergente (esperado ${expectedDigest.slice(0, 16)}…, encontrado ${packageDigestSha256.slice(0, 16)}…).`
+  let packageDigestValid = false;
+  if (packageDigestMissing) {
+    warnings.push(
+      'Hash SHA-256 esperado do pacote ausente ou incompleto: estado explícito de insuficiência (validação não presumida).'
     );
+  } else {
+    const { packageDigestSha256, ...withoutDigest } = p as InvestigationExportPackage;
+    const expectedDigest = computeCanonicalSha256(withoutDigest);
+    packageDigestValid = expectedDigest === packageDigestSha256;
+    if (!packageDigestValid) {
+      errors.push(
+        `Digest SHA-256 do pacote divergente (esperado ${expectedDigest.slice(0, 16)}…, encontrado ${packageDigestSha256.slice(0, 16)}…).`
+      );
+    }
   }
 
   // F01: Verify BOTH event hash chain AND facts_json snapshot digest binding
@@ -1858,11 +1913,16 @@ export function verifyInvestigationPackage(
     factSet: p.factSet!,
     events: p.events!,
   });
-  const chainValid = ledger.brokenAtSeq === null && (ledger.valid || !ledger.factsDigestMatchesLedger);
+  const chainValid = ledger.brokenAtSeq === null && ledger.eventCount > 0;
   if (ledger.brokenAtSeq !== null) {
     errors.push(`Cadeia de eventos corrompida na sequência #${ledger.brokenAtSeq}.`);
   }
-  if (!ledger.factsDigestMatchesLedger) {
+  if (ledger.integrityStatus === 'insufficient') {
+    warnings.push(
+      ledger.integrityReason ??
+        'Ausência de digest SHA-256 ou versão no livro-razão: estado explícito de insuficiência.'
+    );
+  } else if (!ledger.factsDigestMatchesLedger) {
     errors.push(
       ledger.integrityReason ??
         'Conjunto de fatos (factSet) diverge do digest registrado no livro-razão append-only.'
@@ -1973,7 +2033,12 @@ export function verifyInvestigationPackage(
   }
 
   const hasFatal = errors.length > 0;
-  const isIncomplete = !hasFatal && (!engineVersionMatches || originalsMissing > 0);
+  const isIncomplete =
+    !hasFatal &&
+    (!engineVersionMatches ||
+      originalsMissing > 0 ||
+      packageDigestMissing ||
+      ledger.integrityStatus === 'insufficient');
   const exitCode: 0 | 1 | 2 = hasFatal ? 1 : isIncomplete ? 2 : 0;
   const status: PackageVerificationResult['status'] =
     exitCode === 0 ? 'VALID' : exitCode === 1 ? 'INVALID' : 'INCOMPLETE';

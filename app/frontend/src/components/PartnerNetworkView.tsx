@@ -2,10 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Building2,
+  Check,
+  Copy,
   Database,
   ExternalLink,
   FileText,
   Landmark,
+  Layers,
   Network,
   RefreshCw,
   RotateCcw,
@@ -17,6 +20,7 @@ import {
 import type { EvaluatedContract } from '@nexofis/shared/types/audit';
 import {
   enrichPartnerNetworkIndex,
+  fetchForensicCypherProjection,
   fetchPartnerNetwork,
   fetchPartnerNetworkSuggestions,
   syncPartnerNetwork,
@@ -24,6 +28,7 @@ import {
 } from '../lib/api';
 import { formatCnpj, formatCurrencyBRL, formatDateBR } from '@nexofis/shared/lib/formatters';
 import type {
+  PartnerNetworkLayoutColumn,
   PartnerNetworkNode,
   PartnerNetworkPayload,
   PartnerNetworkQueryMode,
@@ -34,6 +39,10 @@ import {
   computeZoomAroundAnchor,
   type CanvasTransform,
 } from '../lib/canvasNavigation';
+import {
+  copyTextToClipboard,
+  formatFlowchartCardCopyText,
+} from '../lib/flowchartCardCopy';
 
 interface PartnerNetworkViewProps {
   initialQuery?: string;
@@ -76,8 +85,30 @@ function getRiskAccent(score: number | undefined): {
   };
 }
 
-function buildCurvedPath(x1: number, y1: number, x2: number, y2: number): string {
-  const dx = Math.max(40, Math.abs(x2 - x1) * 0.45);
+function buildCurvedPath(
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  layoutHeight = 520
+): string {
+  const spanX = x2 - x1;
+  if (spanX < 0) {
+    // Defensive arc for cyclic or reverse-column corporate links
+    const midX = (x1 + x2) / 2;
+    const arcY = Math.min(y1, y2) - 58;
+    return `M ${x1} ${y1} Q ${midX} ${arcY}, ${x2} ${y2}`;
+  }
+  // When an edge skips an intermediate column (e.g. Sócio PF -> Empresa skipping over Holding PJ),
+  // route a subtle vertical arc around the middle lane so it never passes straight behind a card.
+  if (spanX > 420) {
+    const midX = (x1 + x2) / 2;
+    const isUpper = y1 <= layoutHeight / 2;
+    const arcOffset = isUpper ? -86 : 86;
+    const controlY = (y1 + y2) / 2 + arcOffset;
+    return `M ${x1} ${y1} Q ${midX} ${controlY}, ${x2} ${y2}`;
+  }
+  const dx = Math.max(40, Math.min(260, spanX * 0.45));
   return `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
 }
 
@@ -133,10 +164,15 @@ export function PartnerNetworkView({
     unitsPerPx: number;
   } | null>(null);
   const lastInitialKeyRef = useRef<string>('');
+  const autoExpandedHoldingKeyRef = useRef<string>('');
   const requestSeqRef = useRef<number>(0);
   const abortControllerRef = useRef<AbortController | null>(null);
   const prevAuthScopeRef = useRef<string>(authScopeKey);
   const [detailTab, setDetailTab] = useState<DetailTab>('companies');
+  const [copiedNodeId, setCopiedNodeId] = useState<string | null>(null);
+  const [cypherCopied, setCypherCopied] = useState(false);
+  const [cypherLoading, setCypherLoading] = useState(false);
+  const copyTimerRef = useRef<number | null>(null);
 
   const loadSuggestions = useCallback(async (signal?: AbortSignal) => {
     setSuggestionsLoading(true);
@@ -178,14 +214,30 @@ export function PartnerNetworkView({
   useEffect(() => {
     return () => {
       abortControllerRef.current?.abort();
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
     };
+  }, []);
+
+  const handleCancelRequest = useCallback(() => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setLoading(false);
+    setEnrichNotice('Sincronização cancelada pelo usuário. Os dados já carregados permanecem visíveis.');
   }, []);
 
   const executeSearch = useCallback(
     async (
       rawQuery: string,
       searchMode: PartnerNetworkQueryMode,
-      options?: { triggerLiveSync?: boolean }
+      options?: {
+        triggerLiveSync?: boolean;
+        preserveView?: boolean;
+        maxCompanies?: number;
+        maxDepth?: number;
+        page?: number;
+      }
     ) => {
       const clean = rawQuery.trim();
       if (clean.length < 2) {
@@ -204,9 +256,11 @@ export function PartnerNetworkView({
       lastInitialKeyRef.current = `${clean}::${searchMode}`;
       setLoading(true);
       setError(null);
-      setSelectedNodeId(null);
-      setHoveredNodeId(null);
-      setCanvasTransform({ zoom: 1, pan: { x: 0, y: 0 } });
+      if (!options?.preserveView) {
+        setSelectedNodeId(null);
+        setHoveredNodeId(null);
+        setCanvasTransform({ zoom: 1, pan: { x: 0, y: 0 } });
+      }
 
       try {
         const shouldSync = Boolean(options?.triggerLiveSync) && canMutateSync;
@@ -217,6 +271,9 @@ export function PartnerNetworkView({
                 mode: searchMode,
                 syncPncp: true,
                 syncSecondaryCompanies: true,
+                maxCompanies: options?.maxCompanies ?? 6,
+                maxDepth: options?.maxDepth ?? 4,
+                page: options?.page ?? 1,
               },
               controller.signal
             )
@@ -227,9 +284,11 @@ export function PartnerNetworkView({
         setPayload(result);
         onQueryStateChange?.(clean, searchMode);
 
-        // Auto-select seed node for immediate inspector context
-        const seedNode = result.nodes.find((n) => n.isSeed) ?? result.nodes[0] ?? null;
-        setSelectedNodeId(seedNode?.id ?? null);
+        // Auto-select seed node only when not preserving current view/selection
+        if (!options?.preserveView) {
+          const seedNode = result.nodes.find((n) => n.isSeed) ?? result.nodes[0] ?? null;
+          setSelectedNodeId(seedNode?.id ?? null);
+        }
 
         // Refresh coverage stats after live QSA enrichment
         if ((result.indexCoverage?.liveEnrichedCnpjs?.length ?? 0) > 0) {
@@ -237,7 +296,9 @@ export function PartnerNetworkView({
         }
       } catch (err) {
         if (controller.signal.aborted || requestSeqRef.current !== seq) return;
-        setPayload(null);
+        if (!options?.preserveView) {
+          setPayload(null);
+        }
         setError(
           err instanceof Error
             ? err.message
@@ -263,6 +324,19 @@ export function PartnerNetworkView({
       void executeSearch(trimmed, initialMode, { triggerLiveSync: false });
     }
   }, [initialQuery, initialMode, executeSearch]);
+
+  // Auto-expand unsynced corporate shareholders (Holdings / Sócios PJ) once per query when analyst sync is allowed
+  useEffect(() => {
+    if (loading || !payload || !canMutateSync) return;
+    const hasUnsyncedHolding = payload.companies.some(
+      (c) => c.isCorporateShareholder && c.qsaSource === 'none'
+    );
+    if (!hasUnsyncedHolding) return;
+    const expandKey = `${payload.query}::${mode}`;
+    if (autoExpandedHoldingKeyRef.current === expandKey) return;
+    autoExpandedHoldingKeyRef.current = expandKey;
+    void executeSearch(payload.query, mode, { triggerLiveSync: true, preserveView: true });
+  }, [loading, payload, canMutateSync, mode, executeSearch]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -307,90 +381,131 @@ export function PartnerNetworkView({
     }
   };
 
-  // Compute visible nodes and edges respecting layer toggles & non-empty columns
-  const { visibleNodes, visibleEdges, effectiveWidth, renderContractsCol, renderOrgansCol } =
-    useMemo(() => {
-      if (!payload) {
-        return {
-          visibleNodes: [],
-          visibleEdges: [],
-          effectiveWidth: 1240,
-          renderContractsCol: false,
-          renderOrgansCol: false,
-        };
+  // Compute visible columns, nodes, and edges respecting dynamic multi-level Holding/PJ tiers & layer toggles
+  const { visibleColumns, visibleNodes, visibleEdges, effectiveWidth } = useMemo(() => {
+    if (!payload) {
+      return {
+        visibleColumns: [] as PartnerNetworkLayoutColumn[],
+        visibleNodes: [] as PartnerNetworkNode[],
+        visibleEdges: [],
+        effectiveWidth: 1240,
+      };
+    }
+
+    const hasAnyContracts = payload.nodes.some((n) => n.type === 'contract');
+    const hasAnyOrgans = payload.nodes.some((n) => n.type === 'organ');
+    const showContracts = showContractsLayer && hasAnyContracts;
+    const showOrgans = showOrgansLayer && hasAnyOrgans;
+
+    const rawColumns: PartnerNetworkLayoutColumn[] =
+      payload.layout.columns && payload.layout.columns.length > 0
+        ? payload.layout.columns
+        : [
+            {
+              id: 'col:partners',
+              kind: 'partners',
+              title: 'Sócios PF',
+              x: 150,
+              count: payload.nodes.filter((n) => n.type === 'partner').length,
+              totalCount: payload.partners.length,
+            },
+            {
+              id: 'col:companies',
+              kind: 'companies',
+              title: 'Empresas',
+              x: 465,
+              count: payload.nodes.filter((n) => n.type === 'company').length,
+              totalCount: payload.companies.length,
+            },
+            {
+              id: 'col:contracts',
+              kind: 'contracts',
+              title: 'Contratos',
+              x: 780,
+              count: payload.nodes.filter((n) => n.type === 'contract').length,
+              totalCount: payload.contracts.length,
+            },
+            {
+              id: 'col:organs',
+              kind: 'organs',
+              title: 'Órgãos',
+              x: 1095,
+              count: payload.nodes.filter((n) => n.type === 'organ').length,
+              totalCount: payload.summary.distinctOrganCount,
+            },
+          ];
+
+    const COL_START_X = 150;
+    const COL_PITCH_X = 315;
+    const xRemap = new Map<number, number>();
+    const activeCols: PartnerNetworkLayoutColumn[] = [];
+
+    for (const col of rawColumns) {
+      if (col.kind === 'contracts' && !showContracts) continue;
+      if (col.kind === 'organs' && !showOrgans) continue;
+      const compactedX = COL_START_X + activeCols.length * COL_PITCH_X;
+      xRemap.set(col.x, compactedX);
+      activeCols.push({ ...col, x: compactedX });
+    }
+
+    const filteredNodes = payload.nodes.filter((n) => {
+      if (n.type === 'contract' && !showContracts) return false;
+      if (n.type === 'organ' && !showOrgans) return false;
+      return true;
+    });
+
+    const repositionedNodes = filteredNodes.map((n) => {
+      const mappedX = xRemap.get(n.x);
+      return mappedX !== undefined ? { ...n, x: mappedX } : n;
+    });
+
+    const nodeIdSet = new Set(repositionedNodes.map((n) => n.id));
+    let filteredEdges = payload.edges.filter(
+      (e) => nodeIdSet.has(e.source) && nodeIdSet.has(e.target)
+    );
+
+    // When contracts are hidden but organs are shown, synthesize direct Company -> Organ edges
+    if (!showContracts && showOrgans) {
+      const directSeen = new Set<string>();
+      const contractToCompany = new Map<string, string>();
+      for (const e of payload.edges) {
+        if (e.relation === 'CONTRATO_EMPRESA') {
+          contractToCompany.set(e.target, e.source);
+        }
       }
-
-      const hasAnyContracts = payload.nodes.some((n) => n.type === 'contract');
-      const hasAnyOrgans = payload.nodes.some((n) => n.type === 'organ');
-      const showContracts = showContractsLayer && hasAnyContracts;
-      const showOrgans = showOrgansLayer && hasAnyOrgans;
-
-      const filteredNodes = payload.nodes.filter((n) => {
-        if (n.type === 'contract' && !showContracts) return false;
-        if (n.type === 'organ' && !showOrgans) return false;
-        return true;
-      });
-
-      // Reposition organ column closer when contracts layer is hidden so the graph stays compact
-      const repositionedNodes = filteredNodes.map((n) => {
-        if (n.type === 'organ' && !showContracts) {
-          return { ...n, x: 790 };
-        }
-        return n;
-      });
-
-      const nodeIdSet = new Set(repositionedNodes.map((n) => n.id));
-      let filteredEdges = payload.edges.filter(
-        (e) => nodeIdSet.has(e.source) && nodeIdSet.has(e.target)
-      );
-
-      // When contracts are hidden but organs are shown, synthesize direct Company -> Organ edges
-      if (!showContracts && showOrgans) {
-        const directSeen = new Set<string>();
-        const contractToCompany = new Map<string, string>();
-        for (const e of payload.edges) {
-          if (e.relation === 'CONTRATO_EMPRESA') {
-            contractToCompany.set(e.target, e.source);
-          }
-        }
-        for (const e of payload.edges) {
-          if (e.relation === 'CONTRATADO_POR' && nodeIdSet.has(e.target)) {
-            const companyNodeId = contractToCompany.get(e.source);
-            if (companyNodeId && nodeIdSet.has(companyNodeId)) {
-              const key = `${companyNodeId}->${e.target}`;
-              if (!directSeen.has(key)) {
-                directSeen.add(key);
-                filteredEdges = [
-                  ...filteredEdges,
-                  {
-                    id: `direct:${key}`,
-                    source: companyNodeId,
-                    target: e.target,
-                    relation: 'CONTRATADO_POR',
-                    label: 'Contratou',
-                  },
-                ];
-              }
+      for (const e of payload.edges) {
+        if (e.relation === 'CONTRATADO_POR' && nodeIdSet.has(e.target)) {
+          const companyNodeId = contractToCompany.get(e.source);
+          if (companyNodeId && nodeIdSet.has(companyNodeId)) {
+            const key = `${companyNodeId}->${e.target}`;
+            if (!directSeen.has(key)) {
+              directSeen.add(key);
+              filteredEdges = [
+                ...filteredEdges,
+                {
+                  id: `direct:${key}`,
+                  source: companyNodeId,
+                  target: e.target,
+                  relation: 'CONTRATADO_POR',
+                  label: 'Contratou',
+                },
+              ];
             }
           }
         }
       }
+    }
 
-      const width =
-        showContracts && showOrgans
-          ? 1260
-          : showContracts || showOrgans
-            ? 950
-            : 640;
+    const lastColX = activeCols.length > 0 ? activeCols[activeCols.length - 1].x : 465;
+    const width = Math.max(640, lastColX + 165);
 
-      return {
-        visibleNodes: repositionedNodes,
-        visibleEdges: filteredEdges,
-        effectiveWidth: width,
-        renderContractsCol: showContracts,
-        renderOrgansCol: showOrgans,
-      };
-    }, [payload, showContractsLayer, showOrgansLayer]);
+    return {
+      visibleColumns: activeCols,
+      visibleNodes: repositionedNodes,
+      visibleEdges: filteredEdges,
+      effectiveWidth: width,
+    };
+  }, [payload, showContractsLayer, showOrgansLayer]);
 
   const nodeById = useMemo(() => {
     const map = new Map<string, PartnerNetworkNode>();
@@ -560,6 +675,57 @@ export function PartnerNetworkView({
     return payload.contracts.find((c) => c.contractId === selectedNode.contractId) ?? null;
   }, [selectedNode, payload]);
 
+  const handleCopyCard = useCallback(
+    async (node: PartnerNetworkNode) => {
+      if (!payload) return;
+      const partner =
+        node.type === 'partner' ? payload.partners.find((p) => p.id === node.id) ?? null : null;
+      const company =
+        node.type === 'company' ? payload.companies.find((c) => c.cnpj === node.cnpj) ?? null : null;
+      const contract =
+        node.type === 'contract'
+          ? payload.contracts.find((c) => c.contractId === node.contractId) ?? null
+          : null;
+
+      const text = formatFlowchartCardCopyText({ node, partner, company, contract });
+      await copyTextToClipboard(text);
+      setCopiedNodeId(node.id);
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+      copyTimerRef.current = window.setTimeout(() => {
+        setCopiedNodeId((curr) => (curr === node.id ? null : curr));
+      }, 2000);
+    },
+    [payload]
+  );
+
+  const handleCopyCypher = useCallback(async () => {
+    setCypherLoading(true);
+    try {
+      const targetCnpj = payload?.companies[0]?.cnpj;
+      const proj = await fetchForensicCypherProjection({
+        targetCnpj,
+        onlyDocumented: false,
+      });
+      const fullBundle = [
+        proj.cypherScript,
+        '',
+        '// === CONSULTAS FORENSES PRONTAS ===',
+        proj.queries.kinshipOfficeContractOverlap,
+        '',
+        proj.queries.hiddenMultiHopCorporateNetwork,
+      ].join('\n');
+      await copyTextToClipboard(fullBundle);
+      setCypherCopied(true);
+      window.setTimeout(() => setCypherCopied(false), 2500);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Falha ao exportar script Cypher.');
+    } finally {
+      setCypherLoading(false);
+    }
+  }, [payload]);
+
   return (
     <div className="space-y-6">
       {/* Header + Search Bar */}
@@ -644,11 +810,11 @@ export function PartnerNetworkView({
             })}
           </div>
 
-          <div className="lg:col-span-2">
+          <div className="lg:col-span-2 flex gap-1.5">
             <button
               type="submit"
               disabled={loading}
-              className="w-full h-11 inline-flex items-center justify-center gap-2 px-4 text-sm font-semibold text-white bg-[#0B2540] hover:bg-[#102843] dark:bg-[#D95B35] dark:hover:bg-[#c04c29] disabled:opacity-60 rounded-md transition-colors whitespace-nowrap"
+              className="flex-1 h-11 inline-flex items-center justify-center gap-2 px-3 text-sm font-semibold text-white bg-[#0B2540] hover:bg-[#102843] dark:bg-[#D95B35] dark:hover:bg-[#c04c29] disabled:opacity-60 rounded-md transition-colors whitespace-nowrap"
             >
               {loading ? (
                 <RefreshCw className="w-4 h-4 animate-spin" aria-hidden="true" />
@@ -657,6 +823,16 @@ export function PartnerNetworkView({
               )}
               {loading ? 'Mapeando...' : 'Mapear Vínculos'}
             </button>
+            {loading && (
+              <button
+                type="button"
+                onClick={handleCancelRequest}
+                aria-label="Cancelar sincronização em andamento"
+                className="h-11 px-3 text-xs font-semibold text-red-700 dark:text-red-300 border border-red-300 dark:border-red-700/70 bg-red-50 dark:bg-red-950/40 hover:bg-red-100 dark:hover:bg-red-950/70 rounded-md transition-colors"
+              >
+                Cancelar
+              </button>
+            )}
           </div>
         </form>
 
@@ -889,14 +1065,14 @@ export function PartnerNetworkView({
                       {payload.seedLabel || payload.query}
                     </h2>
                   </div>
-                  <div className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums whitespace-nowrap">
+                  <div className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums break-words">
                     {payload.summary.multiCompanyPartnerCount} sócio(s) multiempresa ·{' '}
                     {payload.summary.distinctOrganCount} órgão(s) contratante(s)
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 lg:grid-cols-5 divide-y lg:divide-y-0 lg:divide-x divide-slate-200 dark:divide-[#1D3A57]">
-                  <div className="p-5">
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 divide-y lg:divide-y-0 lg:divide-x divide-slate-200 dark:divide-[#1D3A57]">
+                  <div className="p-4 sm:p-5 min-w-0">
                     <div className="text-xs text-slate-500 dark:text-slate-400">
                       Empresas na rede
                     </div>
@@ -904,11 +1080,13 @@ export function PartnerNetworkView({
                       {payload.summary.companyCount}
                     </div>
                     <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
-                      CNPJs vinculados
+                      {(payload.summary.corporateShareholderCount ?? 0) > 0
+                        ? `${payload.summary.corporateShareholderCount} holding(s) / sócia(s) PJ`
+                        : 'CNPJs vinculados'}
                     </div>
                   </div>
 
-                  <div className="p-5">
+                  <div className="p-4 sm:p-5 min-w-0">
                     <div className="text-xs text-slate-500 dark:text-slate-400">
                       Sócios mapeados
                     </div>
@@ -922,7 +1100,7 @@ export function PartnerNetworkView({
                     </div>
                   </div>
 
-                  <div className="p-5">
+                  <div className="p-4 sm:p-5 min-w-0">
                     <div className="text-xs text-slate-500 dark:text-slate-400">
                       Contratos na rede
                     </div>
@@ -934,11 +1112,11 @@ export function PartnerNetworkView({
                     </div>
                   </div>
 
-                  <div className="p-5">
+                  <div className="p-4 sm:p-5 min-w-0">
                     <div className="text-xs text-slate-500 dark:text-slate-400">
                       Valor contratual agregado
                     </div>
-                    <div className="mt-1 text-xl font-bold font-mono tabular-nums text-[#0B2540] dark:text-[#FAF9F5] whitespace-nowrap">
+                    <div className="mt-1 text-lg sm:text-xl font-bold font-mono tabular-nums text-[#0B2540] dark:text-[#FAF9F5] break-words">
                       {formatCurrencyBRL(payload.summary.totalContractValue)}
                     </div>
                     <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
@@ -946,7 +1124,7 @@ export function PartnerNetworkView({
                     </div>
                   </div>
 
-                  <div className="p-5 col-span-2 lg:col-span-1">
+                  <div className="p-4 sm:p-5 sm:col-span-2 lg:col-span-1 min-w-0">
                     <div className="text-xs text-slate-500 dark:text-slate-400">
                       Órgãos em comum
                     </div>
@@ -1006,6 +1184,92 @@ export function PartnerNetworkView({
                     </ul>
                   </section>
                 )}
+
+              {/* Expansion Control & Incremental Limits Notice */}
+              {payload.expansionControl && (
+                <section
+                  data-testid="partner-expansion-control"
+                  className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg px-4 py-3 text-xs flex flex-wrap items-center justify-between gap-3"
+                >
+                  <div className="space-y-0.5 text-slate-600 dark:text-slate-300">
+                    <div className="font-mono text-[11px]">
+                      Expansão incremental: {payload.expansionControl.requestsUsed}/
+                      {payload.expansionControl.maxRequests} req · prof. máx.{' '}
+                      {payload.expansionControl.maxDepth} · {payload.expansionControl.elapsedMs} ms
+                      {payload.expansionControl.truncated ? ' · lote limitado' : ''}
+                    </div>
+                    {payload.expansionControl.truncationReasons.length > 0 && (
+                      <div className="text-[11px] text-amber-700 dark:text-amber-300">
+                        {payload.expansionControl.truncationReasons.join(' ')}
+                      </div>
+                    )}
+                  </div>
+                  {canMutateSync && payload.expansionControl.hasMore && (
+                    <button
+                      type="button"
+                      disabled={loading}
+                      onClick={() =>
+                        void executeSearch(payload.query, mode, {
+                          triggerLiveSync: true,
+                          preserveView: true,
+                          maxCompanies: Math.min(16, (payload.expansionControl?.maxCompanies ?? 6) + 4),
+                          page: (payload.expansionControl?.page ?? 1) + 1,
+                        })
+                      }
+                      className="px-3 py-1.5 rounded border border-slate-300 dark:border-[#1D3A57] text-[#0B2540] dark:text-slate-100 hover:bg-slate-50 dark:hover:bg-[#102843] font-semibold transition-colors disabled:opacity-50"
+                    >
+                      Expandir próximo lote (preserva posição)
+                    </button>
+                  )}
+                </section>
+              )}
+
+              {/* Name Disambiguation Candidates Panel (Section 2) */}
+              {payload.disambiguation && payload.disambiguation.candidateCount > 0 && (
+                <section
+                  data-testid="partner-disambiguation-panel"
+                  className="bg-amber-50/70 dark:bg-amber-950/20 border border-amber-300 dark:border-amber-700/60 rounded-lg p-4 space-y-2.5 text-xs"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="font-semibold text-amber-900 dark:text-amber-200">
+                      Desambiguação nominal necessária ({payload.disambiguation.candidateCount}{' '}
+                      candidato(s) no índice reverso)
+                    </div>
+                    <span className="font-mono text-[11px] text-amber-800 dark:text-amber-300">
+                      {payload.disambiguation.snapshotCoverageDeclaration}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                    {payload.disambiguation.candidates.slice(0, 6).map((cand) => (
+                      <div
+                        key={cand.candidateId}
+                        className="p-2.5 rounded bg-white/80 dark:bg-[#0B1D31] border border-amber-200 dark:border-amber-800/60 flex items-center justify-between gap-2"
+                      >
+                        <div className="min-w-0">
+                          <div className="font-semibold text-[#0B2540] dark:text-[#FAF9F5] truncate">
+                            {cand.displayName}
+                          </div>
+                          <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400">
+                            {cand.maskedDocuments.length > 0
+                              ? `CPF parcial: ${cand.maskedDocuments.join(', ')}`
+                              : 'Sem CPF mascarado'}{' '}
+                            · {cand.relatedCompanyCnpjs.length} empresa(s)
+                          </div>
+                        </div>
+                        {cand.relatedCompanyCnpjs[0] && (
+                          <button
+                            type="button"
+                            onClick={() => handleQuickQuery(cand.relatedCompanyCnpjs[0], 'company', false)}
+                            className="px-2.5 py-1 text-[11px] font-semibold text-[#0B2540] dark:text-sky-300 border border-slate-300 dark:border-[#1D3A57] rounded hover:bg-slate-50 dark:hover:bg-[#102843] shrink-0"
+                          >
+                            Selecionar CNPJ
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </section>
+              )}
 
               {/* Shared Organ Cross-Company Alert (when detected) */}
               {payload.sharedOrgans.length > 0 && (
@@ -1148,6 +1412,21 @@ export function PartnerNetworkView({
                       <RotateCcw className="w-3 h-3" aria-hidden="true" />
                       <span>Resetar</span>
                     </button>
+                    <button
+                      type="button"
+                      data-testid="partner-export-cypher-btn"
+                      onClick={handleCopyCypher}
+                      disabled={cypherLoading}
+                      title="Copiar script Cypher (Neo4j) e consultas forenses desta rede"
+                      className="inline-flex items-center gap-1 px-2 py-1.5 text-xs rounded border border-slate-200 dark:border-[#1D3A57] text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-[#102843] disabled:opacity-60"
+                    >
+                      {cypherCopied ? (
+                        <Check className="w-3 h-3 text-emerald-600" aria-hidden="true" />
+                      ) : (
+                        <Copy className="w-3 h-3" aria-hidden="true" />
+                      )}
+                      <span>{cypherCopied ? 'Cypher copiado' : 'Cypher (Neo4j)'}</span>
+                    </button>
                   </div>
                 </div>
 
@@ -1160,8 +1439,14 @@ export function PartnerNetworkView({
                       <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
                         <span className="inline-flex items-center gap-1.5">
                           <span className="w-2.5 h-2.5 rounded-sm bg-[#D95B35]" />
-                          Sócio / Empresário
+                          Sócio PF
                         </span>
+                        {(payload.summary.corporateShareholderCount ?? 0) > 0 && (
+                          <span className="inline-flex items-center gap-1.5">
+                            <span className="w-2.5 h-2.5 rounded-sm bg-[#7C3AED]" />
+                            Holding / Sócio PJ
+                          </span>
+                        )}
                         <span className="inline-flex items-center gap-1.5">
                           <span className="w-2.5 h-2.5 rounded-sm bg-[#0B2540] dark:bg-[#38BDF8]" />
                           Empresa (CNPJ)
@@ -1178,6 +1463,18 @@ export function PartnerNetworkView({
                             Órgão Contratante
                           </span>
                         )}
+                        <span className="inline-flex items-center gap-1.5 pl-2 border-l border-slate-200 dark:border-[#1D3A57]">
+                          <span className="w-4 h-0.5 bg-[#7C3AED] inline-block" />
+                          Documentado
+                        </span>
+                        <span className="inline-flex items-center gap-1.5">
+                          <span className="w-4 h-0.5 border-t-2 border-dashed border-amber-600 inline-block" />
+                          Candidato
+                        </span>
+                        <span className="inline-flex items-center gap-1.5">
+                          <span className="w-4 h-0.5 border-t-2 border-dotted border-red-600 inline-block" />
+                          Contestado
+                        </span>
                       </div>
                       <span
                         data-testid="partner-graph-focus-hint"
@@ -1263,51 +1560,19 @@ export function PartnerNetworkView({
                           data-testid="partner-graph-transform-group"
                           transform={`translate(${pan.x}, ${pan.y}) scale(${zoom})`}
                         >
-                          {/* Subtle Column Guide Labels */}
-                          <text
-                            x={150}
-                            y={28}
-                            textAnchor="middle"
-                            className="fill-slate-400 dark:fill-slate-500 text-[12px] font-mono uppercase tracking-wider"
-                          >
-                            Sócios ({Math.min(payload.partners.length, 8)}
-                            {payload.summary.visualPartnersTruncated
-                              ? `/${payload.partners.length}`
-                              : ''}
-                            )
-                          </text>
-                          <text
-                            x={465}
-                            y={28}
-                            textAnchor="middle"
-                            className="fill-slate-400 dark:fill-slate-500 text-[12px] font-mono uppercase tracking-wider"
-                          >
-                            Empresas ({payload.companies.length})
-                          </text>
-                          {renderContractsCol && (
+                          {/* Dynamic Column Guide Labels (supports multi-level Holdings / Sócios PJ) */}
+                          {visibleColumns.map((col) => (
                             <text
-                              x={790}
+                              key={col.id}
+                              x={col.x}
                               y={28}
                               textAnchor="middle"
                               className="fill-slate-400 dark:fill-slate-500 text-[12px] font-mono uppercase tracking-wider"
                             >
-                              Contratos ({Math.min(payload.contracts.length, 8)}
-                              {payload.summary.visualContractsTruncated
-                                ? `/${payload.contracts.length}`
-                                : ''}
-                              )
+                              {col.title} ({col.count}
+                              {col.totalCount > col.count ? `/${col.totalCount}` : ''})
                             </text>
-                          )}
-                          {renderOrgansCol && (
-                            <text
-                              x={renderContractsCol ? 1100 : 790}
-                              y={28}
-                              textAnchor="middle"
-                              className="fill-slate-400 dark:fill-slate-500 text-[12px] font-mono uppercase tracking-wider"
-                            >
-                              Órgãos ({payload.summary.distinctOrganCount})
-                            </text>
-                          )}
+                          ))}
 
                           {/* Edges */}
                           {visibleEdges.map((edge) => {
@@ -1324,24 +1589,40 @@ export function PartnerNetworkView({
                             const isEmphasized =
                               Boolean(focusNodeId) && highlightedEdgeIds.has(edge.id);
 
+                            const assertionState =
+                              edge.assertionState ?? (edge.dashed ? 'candidate' : 'documented');
                             const strokeColor =
-                              edge.relation === 'SOCIO_DE'
-                                ? edge.dashed
-                                  ? '#D97706'
-                                  : '#D95B35'
-                                : edge.relation === 'CONTRATADO_POR'
-                                  ? '#64748B'
-                                  : '#3B82F6';
+                              assertionState === 'contested'
+                                ? '#DC2626'
+                                : edge.relation === 'SOCIO_PJ_DE'
+                                  ? '#7C3AED'
+                                  : edge.relation === 'SOCIO_DE'
+                                    ? assertionState === 'candidate'
+                                      ? '#D97706'
+                                      : '#D95B35'
+                                    : edge.relation === 'CONTRATADO_POR'
+                                      ? '#64748B'
+                                      : '#3B82F6';
+
+                            const strokeDasharray =
+                              assertionState === 'contested'
+                                ? '2 4'
+                                : assertionState === 'candidate' || edge.dashed
+                                  ? '6 4'
+                                  : undefined;
+
+                            const baseStrokeWidth = edge.relation === 'SOCIO_PJ_DE' ? 1.9 : 1.4;
 
                             return (
                               <path
                                 key={edge.id}
-                                d={buildCurvedPath(x1, y1, x2, y2)}
+                                data-assertion-state={assertionState}
+                                d={buildCurvedPath(x1, y1, x2, y2, payload.layout.height)}
                                 fill="none"
                                 stroke={strokeColor}
-                                strokeWidth={isEmphasized ? 2.2 : 1.4}
-                                strokeDasharray={edge.dashed ? '6 4' : undefined}
-                                opacity={isHoverDimmed ? 0.16 : isEmphasized ? 0.92 : 0.62}
+                                strokeWidth={isEmphasized ? baseStrokeWidth + 0.8 : baseStrokeWidth}
+                                strokeDasharray={strokeDasharray}
+                                opacity={isHoverDimmed ? 0.16 : isEmphasized ? 0.94 : 0.68}
                                 className="transition-opacity duration-150"
                               />
                             );
@@ -1350,6 +1631,7 @@ export function PartnerNetworkView({
                           {/* Nodes */}
                           {visibleNodes.map((node) => {
                             const isSelected = selectedNodeId === node.id;
+                            const isCopied = copiedNodeId === node.id;
                             const isDimmed =
                               Boolean(hoveredNodeId) && !highlightedNodeIds.has(node.id);
                             const left = node.x - NODE_WIDTH / 2;
@@ -1362,17 +1644,26 @@ export function PartnerNetworkView({
                                   ? '#D97706'
                                   : '#D95B35';
                             } else if (node.type === 'company') {
-                              accentBarColor = node.isSeed ? '#D95B35' : '#1D4ED8';
+                              accentBarColor = node.isSeed
+                                ? '#D95B35'
+                                : node.isCorporateShareholder
+                                  ? '#7C3AED'
+                                  : '#1D4ED8';
                             } else if (node.type === 'contract') {
                               accentBarColor = getRiskAccent(node.riskScore).stroke;
                             } else if (node.type === 'organ') {
                               accentBarColor = node.isSharedOrgan ? '#D97706' : '#475569';
                             }
 
+                            const displayLabel =
+                              node.label.length > 22 ? `${node.label.slice(0, 21)}…` : node.label;
+
                             return (
                               <g
                                 key={node.id}
                                 data-graph-node="true"
+                                data-node-id={node.id}
+                                data-node-type={node.type}
                                 role="button"
                                 tabIndex={0}
                                 aria-pressed={isSelected}
@@ -1416,17 +1707,83 @@ export function PartnerNetworkView({
                                   y="24"
                                   className="fill-[#0B2540] dark:fill-[#FAF9F5] text-[11.5px] font-semibold"
                                 >
-                                  {node.label}
+                                  {displayLabel}
                                 </text>
                                 <text
                                   x="11"
                                   y="42"
                                   className="fill-slate-500 dark:fill-slate-400 text-[10px] font-mono"
                                 >
-                                  {node.subtitle.length > 34
-                                    ? `${node.subtitle.slice(0, 33)}…`
+                                  {node.subtitle.length > 32
+                                    ? `${node.subtitle.slice(0, 31)}…`
                                     : node.subtitle}
                                 </text>
+
+                                {/* Inline Copy Info Button on Flowchart Card */}
+                                <g
+                                  data-graph-copy-btn="true"
+                                  data-copied={isCopied ? 'true' : 'false'}
+                                  role="button"
+                                  tabIndex={0}
+                                  aria-label={`Copiar informações de ${node.label}`}
+                                  transform="translate(215, 9)"
+                                  onPointerDown={(e) => {
+                                    e.stopPropagation();
+                                  }}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    void handleCopyCard(node);
+                                  }}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter' || e.key === ' ') {
+                                      e.preventDefault();
+                                      e.stopPropagation();
+                                      void handleCopyCard(node);
+                                    }
+                                  }}
+                                  className="cursor-pointer"
+                                >
+                                  <title>
+                                    {isCopied
+                                      ? 'Informações copiadas!'
+                                      : 'Copiar informações do card'}
+                                  </title>
+                                  <rect
+                                    x="0"
+                                    y="0"
+                                    width="21"
+                                    height="21"
+                                    rx="4"
+                                    className={
+                                      isCopied
+                                        ? 'fill-emerald-50 dark:fill-emerald-950/80 stroke-emerald-500'
+                                        : 'fill-slate-100/90 dark:fill-[#102843] stroke-slate-300 dark:stroke-[#274B70] hover:fill-slate-200 dark:hover:fill-[#18385C]'
+                                    }
+                                    strokeWidth="1"
+                                  />
+                                  {isCopied ? (
+                                    <path
+                                      d="M 5.5 11 L 9 14.5 L 15.5 7.5"
+                                      fill="none"
+                                      stroke="#10B981"
+                                      strokeWidth="2"
+                                      strokeLinecap="round"
+                                      strokeLinejoin="round"
+                                    />
+                                  ) : (
+                                    <g
+                                      fill="none"
+                                      stroke="currentColor"
+                                      strokeWidth="1.4"
+                                      strokeLinecap="round"
+                                      strokeLinejoin="round"
+                                      className="text-slate-600 dark:text-slate-300"
+                                    >
+                                      <rect x="8.5" y="7.5" width="7" height="8.5" rx="1.2" />
+                                      <path d="M 6.5 13 H 6 A 1 1 0 0 1 5 12 V 6 A 1 1 0 0 1 6 5 H 11.5 A 1 1 0 0 1 12.5 6 V 6.5" />
+                                    </g>
+                                  )}
+                                </g>
                               </g>
                             );
                           })}
@@ -1439,8 +1796,8 @@ export function PartnerNetworkView({
                       (payload.summary.visualContractsTruncated && showContractsLayer) ||
                       (payload.summary.visualOrgansTruncated && showOrgansLayer)) && (
                       <div className="px-4 py-2 border-t border-slate-200 dark:border-[#1D3A57] text-[11px] text-slate-500 dark:text-slate-400">
-                        Para manter a legibilidade do diagrama, exibimos até 8 nós principais por
-                        coluna. A relação completa de {payload.partners.length} sócio(s),{' '}
+                        Para manter a legibilidade do diagrama, exibimos os nós principais por
+                        camada. A relação completa de {payload.partners.length} sócio(s),{' '}
                         {payload.companies.length} empresa(s), {payload.contracts.length}{' '}
                         contrato(s) e {payload.summary.distinctOrganCount} órgão(s) está disponível
                         nas tabelas abaixo.
@@ -1466,32 +1823,74 @@ export function PartnerNetworkView({
                       </div>
                     ) : (
                       <div className="space-y-4">
-                        <div className="pb-3 border-b border-slate-200 dark:border-[#1D3A57] space-y-1">
-                          <div className="flex items-center gap-1.5 text-[11px] font-mono uppercase tracking-wider text-[#D95B35] font-semibold">
-                            {selectedNode.type === 'partner' && (
-                              <>
-                                <User className="w-3.5 h-3.5" aria-hidden="true" />
-                                <span>Sócio / Empresário</span>
-                              </>
-                            )}
-                            {selectedNode.type === 'company' && (
-                              <>
-                                <Building2 className="w-3.5 h-3.5" aria-hidden="true" />
-                                <span>Empresa (Pessoa Jurídica)</span>
-                              </>
-                            )}
-                            {selectedNode.type === 'contract' && (
-                              <>
-                                <FileText className="w-3.5 h-3.5" aria-hidden="true" />
-                                <span>Contrato Público</span>
-                              </>
-                            )}
-                            {selectedNode.type === 'organ' && (
-                              <>
-                                <Landmark className="w-3.5 h-3.5" aria-hidden="true" />
-                                <span>Órgão Contratante</span>
-                              </>
-                            )}
+                        <div className="pb-3 border-b border-slate-200 dark:border-[#1D3A57] space-y-1.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <div
+                              className={`flex items-center gap-1.5 text-[11px] font-mono uppercase tracking-wider font-semibold ${
+                                selectedNode.type === 'company' && selectedNode.isCorporateShareholder
+                                  ? 'text-violet-600 dark:text-violet-400'
+                                  : 'text-[#D95B35]'
+                              }`}
+                            >
+                              {selectedNode.type === 'partner' && (
+                                <>
+                                  <User className="w-3.5 h-3.5" aria-hidden="true" />
+                                  <span>Sócio / Empresário</span>
+                                </>
+                              )}
+                              {selectedNode.type === 'company' &&
+                                (selectedNode.isCorporateShareholder ? (
+                                  <>
+                                    <Layers className="w-3.5 h-3.5" aria-hidden="true" />
+                                    <span>
+                                      Holding / Sócio PJ
+                                      {(selectedNode.ownershipDepth ?? 0) > 1
+                                        ? ` (Nível ${selectedNode.ownershipDepth})`
+                                        : ''}
+                                    </span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Building2 className="w-3.5 h-3.5" aria-hidden="true" />
+                                    <span>Empresa (Pessoa Jurídica)</span>
+                                  </>
+                                ))}
+                              {selectedNode.type === 'contract' && (
+                                <>
+                                  <FileText className="w-3.5 h-3.5" aria-hidden="true" />
+                                  <span>Contrato Público</span>
+                                </>
+                              )}
+                              {selectedNode.type === 'organ' && (
+                                <>
+                                  <Landmark className="w-3.5 h-3.5" aria-hidden="true" />
+                                  <span>Órgão Contratante</span>
+                                </>
+                              )}
+                            </div>
+
+                            <button
+                              type="button"
+                              data-testid="copy-selected-card-btn"
+                              onClick={() => void handleCopyCard(selectedNode)}
+                              className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-semibold rounded border transition-colors shrink-0 ${
+                                copiedNodeId === selectedNode.id
+                                  ? 'bg-emerald-50 dark:bg-emerald-950/50 border-emerald-300 dark:border-emerald-700 text-emerald-700 dark:text-emerald-300'
+                                  : 'bg-slate-50 dark:bg-[#061321] border-slate-200 dark:border-[#1D3A57] text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#102843]'
+                              }`}
+                            >
+                              {copiedNodeId === selectedNode.id ? (
+                                <>
+                                  <Check className="w-3.5 h-3.5" aria-hidden="true" />
+                                  <span>Copiado</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="w-3.5 h-3.5" aria-hidden="true" />
+                                  <span>Copiar card</span>
+                                </>
+                              )}
+                            </button>
                           </div>
                           <h3 className="text-sm font-bold text-[#0B2540] dark:text-[#FAF9F5] break-words">
                             {selectedPartnerDetail?.displayName ||
@@ -1643,6 +2042,57 @@ export function PartnerNetworkView({
                                   {formatCurrencyBRL(selectedCompanyDetail.totalContractValue)}
                                 </dd>
                               </div>
+                              {selectedCompanyDetail.corporateShareholderOf.length > 0 && (
+                                <div className="col-span-2 space-y-1">
+                                  <dt className="text-slate-500 dark:text-slate-400">
+                                    Participação societária (Sócia PJ de)
+                                  </dt>
+                                  <dd className="space-y-1">
+                                    {selectedCompanyDetail.corporateShareholderOf.map((link) => (
+                                      <button
+                                        key={link.cnpj}
+                                        type="button"
+                                        onClick={() => setSelectedNodeId(`company:${link.cnpj}`)}
+                                        className="w-full text-left p-2 rounded bg-violet-50/70 dark:bg-violet-950/30 border border-violet-200 dark:border-violet-800/60 hover:border-violet-400 transition-colors"
+                                      >
+                                        <div className="font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
+                                          {link.legalName}
+                                        </div>
+                                        <div className="font-mono text-[11px] text-violet-700 dark:text-violet-300">
+                                          {link.formattedCnpj} · {link.role}
+                                        </div>
+                                      </button>
+                                    ))}
+                                  </dd>
+                                </div>
+                              )}
+                              {selectedCompanyDetail.corporateShareholders.length > 0 && (
+                                <div className="col-span-2 space-y-1">
+                                  <dt className="text-slate-500 dark:text-slate-400">
+                                    Sócios PJ (Holdings controladoras)
+                                  </dt>
+                                  <dd className="space-y-1">
+                                    {selectedCompanyDetail.corporateShareholders.map((link) => (
+                                      <button
+                                        key={link.cnpj}
+                                        type="button"
+                                        onClick={() => setSelectedNodeId(`company:${link.cnpj}`)}
+                                        className="w-full text-left p-2 rounded bg-violet-50/70 dark:bg-violet-950/30 border border-violet-200 dark:border-violet-800/60 hover:border-violet-400 transition-colors"
+                                      >
+                                        <div className="font-semibold text-[#0B2540] dark:text-[#FAF9F5]">
+                                          {link.legalName}
+                                        </div>
+                                        <div className="font-mono text-[11px] text-violet-700 dark:text-violet-300">
+                                          {link.formattedCnpj} · {link.role}
+                                          {link.legalRepresentativeName
+                                            ? ` · Rep.: ${link.legalRepresentativeName}`
+                                            : ''}
+                                        </div>
+                                      </button>
+                                    ))}
+                                  </dd>
+                                </div>
+                              )}
                               {selectedCompanyDetail.viaPartners.length > 0 && (
                                 <div className="col-span-2">
                                   <dt className="text-slate-500 dark:text-slate-400">

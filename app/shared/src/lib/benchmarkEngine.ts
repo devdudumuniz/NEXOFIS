@@ -331,3 +331,243 @@ export function evaluateHorizontalBenchmark(params: {
     peers: normalizedPeers,
   };
 }
+
+export type PriceItemKind = 'insumo' | 'composicao' | 'servico' | 'produto';
+
+export interface PriceComparabilityProfile {
+  specification: string;
+  unitLabel: string;
+  quantity: number;
+  uf: string;
+  municipality?: string;
+  competencia: string; // YYYY-MM or YYYY
+  deliveryCondition: string;
+  includesFreight: boolean;
+  includesInstallationOrService: boolean;
+  includesTaxesAndCharges: boolean;
+  itemKind: PriceItemKind;
+  referenceSource: string;
+  referenceVersion: string;
+}
+
+export interface ComparablePricePeerInput extends BenchmarkPeer {
+  profile: PriceComparabilityProfile;
+}
+
+export interface PriceComparabilityEvaluation {
+  benchmark: HorizontalBenchmarkResult;
+  /** Strictly separates 3 tiers: never auto-quantifies legal damage */
+  priceClassification:
+    | 'nao_comparavel_ou_amostra_insuficiente'
+    | 'dentro_da_faixa_observada'
+    | 'divergencia_de_preco'
+    | 'hipotese_de_sobrepreco_requer_diligencia';
+  damageQuantificationAutomatic: false;
+  damageQuantificationNote: string;
+  includedPeers: Array<{ contractNumber: string; source: string; unitPrice: number }>;
+  excludedPeers: Array<{ contractNumber: string; source: string; reasons: string[] }>;
+  sensitivityAnalysis: {
+    leaveOneOutMinMedian: number | null;
+    leaveOneOutMaxMedian: number | null;
+    leaveOneOutMinRatio: number | null;
+    leaveOneOutMaxRatio: number | null;
+  };
+  validationChecksApplied: string[];
+}
+
+function normComp(s: string): string {
+  return s
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim();
+}
+
+/**
+ * Reuses the existing evaluateHorizontalBenchmark engine after enforcing strict pre-calculation
+ * comparability checks: specification, unit & conversion, quantity/scale, location & competência,
+ * delivery conditions, freight/service/taxes bundling, insumo vs composição, and reference/version.
+ * Blocks misleading ratios on missing/zero/incompatible units and never auto-quantifies damage.
+ */
+export function evaluateInvestigativePriceComparison(params: {
+  serviceClass: string;
+  subjectNominalPrice: number;
+  subjectYear: number;
+  subjectProfile: PriceComparabilityProfile;
+  inflationIndexLabel: string;
+  peers: ComparablePricePeerInput[];
+  mode?: 'same_supplier' | 'market';
+  maxScopeDistance?: number;
+  maxQuantityRatio?: number;
+  subjectContractKey?: string;
+}): PriceComparabilityEvaluation {
+  const maxQuantityRatio = params.maxQuantityRatio ?? 5.0;
+  const subj = params.subjectProfile;
+  const subjUnit = normalizeUnit(subj.unitLabel);
+  const includedPeers: PriceComparabilityEvaluation['includedPeers'] = [];
+  const excludedPeers: PriceComparabilityEvaluation['excludedPeers'] = [];
+
+  const filteredBenchmarkPeers: BenchmarkPeer[] = params.peers.map((peer) => {
+    const reasons: string[] = [];
+    const p = peer.profile;
+
+    if (!Number.isFinite(peer.nominalUnitPrice) || peer.nominalUnitPrice <= 0) {
+      reasons.push('Preço unitário ausente, zero ou inválido (razão bloqueada).');
+    }
+    if (!subjUnit || !normalizeUnit(p.unitLabel)) {
+      reasons.push('Unidade de medida ausente no item analisado ou no comparável.');
+    } else if (
+      normalizeUnit(p.unitLabel) !== subjUnit &&
+      !(typeof peer.conversionFactor === 'number' && Number.isFinite(peer.conversionFactor) && peer.conversionFactor > 0)
+    ) {
+      reasons.push(
+        `Unidade incompatível (${p.unitLabel} ≠ ${subj.unitLabel}) sem fator de conversão documentado.`
+      );
+    }
+    if (p.itemKind !== subj.itemKind) {
+      reasons.push(
+        `Natureza incompatível (${p.itemKind} ≠ ${subj.itemKind}; vedada comparação direta insumo vs composição).`
+      );
+    }
+    if (p.includesFreight !== subj.includesFreight) {
+      reasons.push(
+        'Condição de frete incompatível (item com frete embutido não pode ser comparado diretamente com preço sem frete).'
+      );
+    }
+    if (p.includesInstallationOrService !== subj.includesInstallationOrService) {
+      reasons.push(
+        'Condição de serviço/instalação embutida incompatível (escopo agregado vs fornecimento puro).'
+      );
+    }
+    if (p.includesTaxesAndCharges !== subj.includesTaxesAndCharges) {
+      reasons.push('Regime de encargos/tributos (desonerado vs não desonerado/BDI) incompatível.');
+    }
+    if (normComp(p.deliveryCondition) !== normComp(subj.deliveryCondition)) {
+      reasons.push(
+        `Condição de entrega divergente ("${p.deliveryCondition}" ≠ "${subj.deliveryCondition}").`
+      );
+    }
+    if (
+      Number.isFinite(subj.quantity) &&
+      subj.quantity > 0 &&
+      Number.isFinite(p.quantity) &&
+      p.quantity > 0
+    ) {
+      const qtyRatio = Math.max(subj.quantity / p.quantity, p.quantity / subj.quantity);
+      if (qtyRatio > maxQuantityRatio) {
+        reasons.push(
+          `Escala de quantidade não comparável (razão ${qtyRatio.toFixed(1)}× excede limite de ${maxQuantityRatio}×).`
+        );
+      }
+    }
+    if (!p.referenceSource.trim() || !p.referenceVersion.trim()) {
+      reasons.push('Fonte de referência ou versão/competência da tabela ausente.');
+    }
+
+    if (reasons.length > 0) {
+      excludedPeers.push({
+        contractNumber: peer.contractNumber,
+        source: `${p.referenceSource} (${p.referenceVersion})`,
+        reasons,
+      });
+      return {
+        ...peer,
+        included: false,
+        exclusionReason: reasons.join(' '),
+      };
+    }
+
+    return peer;
+  });
+
+  const benchmark = evaluateHorizontalBenchmark({
+    serviceClass: params.serviceClass,
+    unitLabel: subj.unitLabel,
+    subjectNominalPrice: params.subjectNominalPrice,
+    subjectYear: params.subjectYear,
+    inflationIndexLabel: params.inflationIndexLabel,
+    peers: filteredBenchmarkPeers,
+    maxScopeDistance: params.maxScopeDistance,
+    mode: params.mode,
+    subjectContractKey: params.subjectContractKey,
+  });
+
+  // Collect final included vs excluded peers (combining pre-validation + benchmarkEngine exclusions)
+  const excludedSet = new Set(excludedPeers.map((e) => e.contractNumber));
+  for (const p of benchmark.peers) {
+    const matchInput = params.peers.find((orig) => orig.contractNumber === p.contractNumber);
+    const sourceLabel = matchInput
+      ? `${matchInput.profile.referenceSource} (${matchInput.profile.referenceVersion})`
+      : 'Peer';
+    if (p.included) {
+      includedPeers.push({
+        contractNumber: p.contractNumber,
+        source: sourceLabel,
+        unitPrice: p.inflationAdjustedPrice,
+      });
+    } else if (!excludedSet.has(p.contractNumber)) {
+      excludedPeers.push({
+        contractNumber: p.contractNumber,
+        source: sourceLabel,
+        reasons: [p.exclusionReason || 'Excluído por critérios de comparabilidade do motor de benchmark.'],
+      });
+    }
+  }
+
+  // Leave-one-out sensitivity analysis over included prices
+  let leaveOneOutMinMedian: number | null = null;
+  let leaveOneOutMaxMedian: number | null = null;
+  let leaveOneOutMinRatio: number | null = null;
+  let leaveOneOutMaxRatio: number | null = null;
+  const incPrices = includedPeers.map((p) => p.unitPrice);
+  if (incPrices.length >= 4 && benchmark.subjectAdjustedPrice > 0) {
+    const looMedians: number[] = [];
+    for (let i = 0; i < incPrices.length; i++) {
+      const subset = incPrices.filter((_, idx) => idx !== i);
+      looMedians.push(Number(computeMedian(subset).toFixed(2)));
+    }
+    leaveOneOutMinMedian = Math.min(...looMedians);
+    leaveOneOutMaxMedian = Math.max(...looMedians);
+    if (leaveOneOutMaxMedian > 0 && leaveOneOutMinMedian > 0) {
+      leaveOneOutMinRatio = Number((benchmark.subjectAdjustedPrice / leaveOneOutMaxMedian).toFixed(2));
+      leaveOneOutMaxRatio = Number((benchmark.subjectAdjustedPrice / leaveOneOutMinMedian).toFixed(2));
+    }
+  }
+
+  let priceClassification: PriceComparabilityEvaluation['priceClassification'];
+  if (benchmark.state === 'NOT_VERIFIABLE' || benchmark.peerRatio === null) {
+    priceClassification = 'nao_comparavel_ou_amostra_insuficiente';
+  } else if (benchmark.peerRatio >= 2.0 && (benchmark.madZero || Math.abs(benchmark.robustZ ?? 0) >= 3.0)) {
+    priceClassification = 'hipotese_de_sobrepreco_requer_diligencia';
+  } else if (benchmark.peerRatio >= 1.5 && (benchmark.madZero || Math.abs(benchmark.robustZ ?? 0) >= 2.0)) {
+    priceClassification = 'divergencia_de_preco';
+  } else {
+    priceClassification = 'dentro_da_faixa_observada';
+  }
+
+  return {
+    benchmark,
+    priceClassification,
+    damageQuantificationAutomatic: false,
+    damageQuantificationNote:
+      'Divergência de preço e hipótese de sobrepreço são triagens estatísticas distintas da quantificação de dano ao erário, que exige contraditório, perícia técnica de composição de custos/BDI e prova de pagamento efetivo.',
+    includedPeers,
+    excludedPeers,
+    sensitivityAnalysis: {
+      leaveOneOutMinMedian,
+      leaveOneOutMaxMedian,
+      leaveOneOutMinRatio,
+      leaveOneOutMaxRatio,
+    },
+    validationChecksApplied: [
+      'especificação e classe de serviço',
+      'unidade e fator de conversão documentado',
+      'quantidade e escala comparável',
+      'localidade (UF) e competência',
+      'condições de entrega, frete, serviço embutido e tributos/encargos',
+      'separação insumo vs composição',
+      'fonte de referência e versão da tabela',
+    ],
+  };
+}
+

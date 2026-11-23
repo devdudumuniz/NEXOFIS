@@ -619,9 +619,12 @@ export function ContractDossierView({
       )}
 
       {/* Primary Forensic Header Panel */}
-      <section className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg p-6">
-        <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-5 pb-5 border-b border-slate-200 dark:border-[#1D3A57]">
-          <div className="space-y-2 max-w-3xl">
+      <section
+        data-testid="dossier-header-card"
+        className="bg-white dark:bg-[#0B1D31] border border-slate-200 dark:border-[#1D3A57] rounded-lg p-4 sm:p-6 overflow-hidden"
+      >
+        <div className="grid grid-cols-1 xl:grid-cols-12 gap-5 pb-5 border-b border-slate-200 dark:border-[#1D3A57]">
+          <div className="xl:col-span-8 min-w-0 space-y-2.5">
             <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500 dark:text-slate-400">
               <span className="font-mono font-semibold text-slate-800 dark:text-[#FAF9F5]">
                 Contrato {contract.contractNumber}
@@ -632,25 +635,28 @@ export function ContractDossierView({
                 <span className="font-mono tabular-nums">{contract.municipalityIbge || '—'}</span>)
               </span>
               <span aria-hidden="true">·</span>
-              <span>{contract.entityName}</span>
+              <span className="break-words">{contract.entityName}</span>
             </div>
 
             <h1
-              className={`font-bold text-slate-900 dark:text-[#FAF9F5] leading-snug ${
-                contract.object.length > 140 ? 'text-base lg:text-lg' : 'text-xl lg:text-2xl'
+              data-testid="dossier-contract-object"
+              className={`font-bold text-slate-900 dark:text-[#FAF9F5] leading-snug break-words ${
+                contract.object.length > 140 ? 'text-base sm:text-lg' : 'text-lg sm:text-xl lg:text-2xl'
               }`}
             >
               {contract.object}
             </h1>
 
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-600 dark:text-slate-300 pt-0.5">
-              <span>
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs text-slate-600 dark:text-slate-300 pt-0.5">
+              <span className="break-all sm:break-normal">
                 Controle PNCP:{' '}
                 <span className="font-mono text-slate-800 dark:text-slate-200">
                   {contract.pncpControlNumber || 'Não informado'}
                 </span>
               </span>
-              <span aria-hidden="true">·</span>
+              <span aria-hidden="true" className="hidden sm:inline">
+                ·
+              </span>
               <span>
                 Modalidade:{' '}
                 <span className="text-slate-800 dark:text-slate-100 font-medium">
@@ -662,7 +668,9 @@ export function ContractDossierView({
                   : 'participantes não informados pela fonte'}
                 )
               </span>
-              <span aria-hidden="true">·</span>
+              <span aria-hidden="true" className="hidden sm:inline">
+                ·
+              </span>
               <span>
                 Vigência:{' '}
                 {contract.startDate || contract.endDate
@@ -674,7 +682,7 @@ export function ContractDossierView({
             {/* Legal Time Travel Metadata Line */}
             <div
               data-testid="legal-ruleset-banner"
-              className="text-xs text-slate-600 dark:text-slate-300 pt-1"
+              className="text-xs text-slate-600 dark:text-slate-300 pt-1 break-words"
             >
               <span className="font-semibold text-slate-800 dark:text-slate-100">
                 Norma vigente na assinatura:
@@ -689,21 +697,21 @@ export function ContractDossierView({
             </div>
           </div>
 
-          {/* Risk Headline Block */}
-          <div className="lg:text-right shrink-0 space-y-1">
+          {/* Risk Headline Block — bounded width so long coverage headlines wrap cleanly without squeezing title */}
+          <div className="xl:col-span-4 min-w-0 xl:text-right flex flex-col justify-start space-y-1.5 rounded-md bg-slate-50/80 dark:bg-[#061321]/70 xl:bg-transparent xl:dark:bg-transparent border border-slate-200/80 dark:border-[#1D3A57]/80 xl:border-0 p-3.5 xl:p-0 xl:pl-4 xl:border-l xl:border-slate-200/70 dark:xl:border-[#1D3A57]/70">
             <div
               data-testid="risk-headline"
-              className={`font-mono tabular-nums text-lg font-bold tracking-tight ${getRiskToneClass(
+              className={`font-mono tabular-nums text-sm sm:text-base font-bold tracking-tight leading-snug break-words ${getRiskToneClass(
                 displayScore,
                 assessment.coverageStatus
               )}`}
             >
               {displayHeadline}
             </div>
-            <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400">
+            <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400 break-words">
               Cobertura: {assessment.coverageStatus ?? 'ADEQUATE'} · Motor {assessment.engineVersion}
             </div>
-            <p className="text-xs text-slate-500 dark:text-slate-400 max-w-xs lg:ml-auto">
+            <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed xl:max-w-xs xl:ml-auto">
               Achados objetivos e reproduzíveis para auditoria humana; não constituem conclusão
               jurídica ou prova automática de fraude.
             </p>
@@ -713,8 +721,8 @@ export function ContractDossierView({
         {/* Strict Separation: Level 1 Contracted Obligation vs Level 2 Proven Execution */}
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 pt-5">
           {/* Level 1: Obrigação Contratada */}
-          <div className="lg:col-span-6 space-y-3 lg:pr-6 lg:border-r lg:border-slate-200 dark:lg:border-[#1D3A57]">
-            <div className="flex items-center justify-between text-xs">
+          <div className="lg:col-span-6 min-w-0 space-y-3 lg:pr-6 lg:border-r lg:border-slate-200 dark:lg:border-[#1D3A57]">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
               <span className="font-semibold text-slate-800 dark:text-slate-100">
                 Nível 1 · Obrigação Contratada
               </span>
@@ -723,30 +731,30 @@ export function ContractDossierView({
               </span>
             </div>
 
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-2 2xl:grid-cols-3 gap-4">
               {contract.originalValue === 0 && contract.updatedValue === 0 ? (
                 <>
-                  <div>
+                  <div className="min-w-0">
                     <div className="text-xs text-slate-500 dark:text-slate-400">Valor original</div>
-                    <div className="mt-1 text-base font-semibold text-amber-800 dark:text-amber-400 whitespace-nowrap">
+                    <div className="mt-1 text-base font-semibold text-amber-800 dark:text-amber-400">
                       Não divulgado
                     </div>
                     <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
                       Omitido na origem / ausente no PNCP
                     </div>
                   </div>
-                  <div>
+                  <div className="min-w-0">
                     <div className="text-xs text-slate-500 dark:text-slate-400">Valor atualizado</div>
-                    <div className="mt-1 text-base font-semibold text-amber-800 dark:text-amber-400 whitespace-nowrap">
+                    <div className="mt-1 text-base font-semibold text-amber-800 dark:text-amber-400">
                       Não divulgado
                     </div>
                     <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
                       Requer íntegra contratual
                     </div>
                   </div>
-                  <div className="col-span-2 sm:col-span-1">
+                  <div className="min-w-0">
                     <div className="text-xs text-slate-500 dark:text-slate-400">Estimativa mensal</div>
-                    <div className="mt-1 text-base font-semibold font-mono text-slate-500 dark:text-slate-400 whitespace-nowrap">
+                    <div className="mt-1 text-base font-semibold font-mono text-slate-500 dark:text-slate-400">
                       Não verificável
                     </div>
                     <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
@@ -758,18 +766,18 @@ export function ContractDossierView({
                 </>
               ) : (
                 <>
-                  <div>
+                  <div className="min-w-0">
                     <div className="text-xs text-slate-500 dark:text-slate-400">Valor original</div>
-                    <div className="mt-1 text-base font-semibold font-mono tabular-nums text-slate-900 dark:text-[#FAF9F5] whitespace-nowrap">
+                    <div className="mt-1 text-sm sm:text-base font-semibold font-mono tabular-nums text-slate-900 dark:text-[#FAF9F5] whitespace-nowrap">
                       {formatCurrencyBRL(contract.originalValue)}
                     </div>
                     <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
                       {contract.amendments.length} aditivo(s)
                     </div>
                   </div>
-                  <div>
+                  <div className="min-w-0">
                     <div className="text-xs text-slate-500 dark:text-slate-400">Valor atualizado</div>
-                    <div className="mt-1 text-base font-semibold font-mono tabular-nums text-slate-900 dark:text-[#FAF9F5] whitespace-nowrap">
+                    <div className="mt-1 text-sm sm:text-base font-semibold font-mono tabular-nums text-slate-900 dark:text-[#FAF9F5] whitespace-nowrap">
                       {formatCurrencyBRL(contract.updatedValue)}
                     </div>
                     <div
@@ -784,9 +792,9 @@ export function ContractDossierView({
                       {formatPercentageBR(assessment.variationPct, true)} (teto 25%)
                     </div>
                   </div>
-                  <div className="col-span-2 sm:col-span-1">
+                  <div className="min-w-0">
                     <div className="text-xs text-slate-500 dark:text-slate-400">Estimativa mensal</div>
-                    <div className="mt-1 text-base font-semibold font-mono tabular-nums text-slate-700 dark:text-slate-200 whitespace-nowrap">
+                    <div className="mt-1 text-sm sm:text-base font-semibold font-mono tabular-nums text-slate-700 dark:text-slate-200 whitespace-nowrap">
                       {executionChain.estimatedMonthlyContractValue > 0
                         ? formatCurrencyBRL(executionChain.estimatedMonthlyContractValue)
                         : 'Não verificável'}
@@ -803,7 +811,7 @@ export function ContractDossierView({
           </div>
 
           {/* Level 2: Execução Financeira Comprovada */}
-          <div className="lg:col-span-6 space-y-3">
+          <div className="lg:col-span-6 min-w-0 space-y-3">
             <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
               <span className="font-semibold text-slate-800 dark:text-slate-100">
                 Nível 2 · Execução Financeira Comprovada
@@ -819,37 +827,37 @@ export function ContractDossierView({
                 <div className="font-semibold text-slate-800 dark:text-slate-100">
                   Não verificado (sem execução financeira coletada)
                 </div>
-                <p className="mt-1 text-slate-500 dark:text-slate-400">
+                <p className="mt-1 text-slate-500 dark:text-slate-400 leading-relaxed">
                   Não há notas de empenho, liquidações ou ordens bancárias indexadas para este
                   contrato. A ausência de coleta não equivale a pagamento zerado (R$ 0,00).
                 </p>
               </div>
             ) : (
-              <div className="grid grid-cols-3 gap-4">
-                <div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div className="min-w-0">
                   <div className="text-xs text-slate-500 dark:text-slate-400">Empenhado</div>
-                  <div className="mt-1 text-base font-semibold font-mono tabular-nums text-slate-900 dark:text-[#FAF9F5] whitespace-nowrap">
+                  <div className="mt-1 text-base font-semibold font-mono tabular-nums text-slate-900 dark:text-[#FAF9F5] break-words">
                     {formatCurrencyBRL(executionChain.committedTotal)}
                   </div>
                   <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
                     Nota de empenho
                   </div>
                 </div>
-                <div>
+                <div className="min-w-0">
                   <div className="text-xs text-slate-500 dark:text-slate-400">Liquidado</div>
-                  <div className="mt-1 text-base font-semibold font-mono tabular-nums text-slate-900 dark:text-[#FAF9F5] whitespace-nowrap">
+                  <div className="mt-1 text-base font-semibold font-mono tabular-nums text-slate-900 dark:text-[#FAF9F5] break-words">
                     {formatCurrencyBRL(executionChain.liquidatedTotal)}
                   </div>
                   <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
                     Atesto / medição
                   </div>
                 </div>
-                <div>
+                <div className="min-w-0">
                   <div className="text-xs text-slate-500 dark:text-slate-400">Pago comprovado</div>
-                  <div className="mt-1 text-base font-semibold font-mono tabular-nums text-slate-900 dark:text-[#FAF9F5] whitespace-nowrap">
+                  <div className="mt-1 text-base font-semibold font-mono tabular-nums text-slate-900 dark:text-[#FAF9F5] break-words">
                     {formatCurrencyBRL(executionChain.netPaidTotal ?? executionChain.paidTotal)}
                   </div>
-                  <div className="text-[11px] text-slate-500 dark:text-slate-400 font-mono tabular-nums mt-0.5">
+                  <div className="text-[11px] text-slate-500 dark:text-slate-400 font-mono tabular-nums mt-0.5 break-words">
                     {contract.updatedValue > 0
                       ? `${formatPercentageBR(((executionChain.netPaidTotal ?? executionChain.paidTotal) / contract.updatedValue) * 100)} do contrato`
                       : '—'}

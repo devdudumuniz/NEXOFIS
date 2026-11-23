@@ -13,6 +13,7 @@ import {
   isCnpjFormat,
   isValidCnpj,
   normalizeCnpj,
+  resolveCorporatePartnerCnpj,
 } from '@nexofis/shared/lib/cnpj';
 import {
   matchesContractLifecycleFilter,
@@ -59,10 +60,12 @@ import { runEfficientOcrPipeline } from '@nexofis/backend/ocrEngine';
 import {
   fetchPncpContractsByCnpj,
   fetchPncpItemWinningSupplier,
+  type PncpWinningSupplierResult,
 } from '@nexofis/backend/pncpClient';
 import {
   buildInvestigationExportPackage,
   evaluateForensicInvestigation,
+  INVESTIGATION_ENGINE_VERSION,
   MAX_PRIVATE_EVIDENCE_BYTES,
   normalizeOrganKey,
   validateFactSetPayload,
@@ -82,6 +85,43 @@ import {
   type PartnerNetworkSourceCoverageItem,
   type SupplierQsaRecord,
 } from '@nexofis/shared/lib/partnerNetworkGraph';
+import {
+  buildReverseParticipationIndex,
+  classifyPartnerGraphAssertionState,
+  disambiguatePersonQuery,
+} from '@nexofis/shared/lib/temporalIdentityGraph';
+import {
+  evaluateAppointmentNepotismTrail,
+  evaluateContractConflictTrail,
+  evaluateDocumentedKinshipTrail,
+  evaluateRoleLegalRequirementsTrail,
+  parseCamaraDailyPersonnelSnapshot,
+} from '@nexofis/shared/lib/publicIntegrityTrails';
+import {
+  computePairedDidEffect,
+  evaluateOutcomeClaim,
+  importInepPublicExport,
+  importSiapsPublicExport,
+  reconcileSiconfiExecution,
+} from '@nexofis/shared/lib/outcomesEvaluationEngine';
+import { evaluateInvestigativePriceComparison } from '@nexofis/shared/lib/benchmarkEngine';
+import {
+  auditEditalCommunicationChannels,
+  evaluateParticipationChannels,
+} from '@nexofis/shared/lib/participationChannelEvaluator';
+import {
+  executeKinshipOfficeContractQuery,
+  executeMultiHopCorporateNetworkQuery,
+  FORENSIC_GRAPH_CYPHER_CONSTRAINTS,
+  FORENSIC_GRAPH_CYPHER_QUERIES,
+  generateForensicCypherScript,
+  type ForensicGraphSnapshot,
+} from '@nexofis/shared/lib/forensicGraphCypher';
+import { importSinapiOfficialFile } from '@nexofis/backend/connectors/sinapiImporter';
+import {
+  createObservabilityRegistry,
+  sanitizeLogPayload,
+} from '@nexofis/backend/securityGuards';
 import { createNexofisStore, InvestigationVersionConflictError, type InvestigationActor } from '@nexofis/backend/storage';
 import { resolveContractsSupplierNames } from '@nexofis/backend/supplierResolver';
 import type {
@@ -102,11 +142,19 @@ import type {
   ObservedHistorySnapshot,
 } from '@nexofis/shared/types/investigation';
 
+const observability = createObservabilityRegistry();
+
 // A09: Fail-closed boot check for production auth configuration
 validateProductionAuthConfig();
 
 const app = express();
-const PORT = Number(process.env.PORT ?? 3000);
+const rawPort =
+  process.env.NEXOFIS_PORT ||
+  (process.env.NODE_ENV !== 'production' ||
+  (process.env.NGINX_PORT && process.env.PORT === process.env.NGINX_PORT)
+    ? process.env.DEFAULT_APP_PORT || '3000'
+    : process.env.PORT || '3000');
+const PORT = Number(rawPort) || 3000;
 const STARTED_AT = Date.now();
 
 app.use(express.json({ limit: '10mb' }));
@@ -439,10 +487,7 @@ async function fetchLivePncpContratacoes(
       })
       .slice(0, 12);
 
-    const winnerByPncpKey = new Map<
-      string,
-      { supplierCnpj: string; supplierName: string; awardedValue: number; awardDate: string }
-    >();
+    const winnerByPncpKey = new Map<string, PncpWinningSupplierResult>();
 
     if (homologatedCandidates.length > 0) {
       const winnerResults = await Promise.all(
@@ -493,11 +538,26 @@ async function fetchLivePncpContratacoes(
         `${entityCnpj || ibgeCode}-${item.numeroCompra ?? ''}-${item.anoCompra ?? ''}`;
       const winner = winnerByPncpKey.get(winnerKey);
 
-      const valor =
-        Number.isFinite(homologadoNum) && homologadoNum > 0
-          ? homologadoNum
-          : winner && winner.awardedValue > 0
+      // Guardrail: NEVER attribute the total value of a multi-item purchase to a supplier who won only one item.
+      const isFullPurchaseWinner = winner?.attributionScope === 'full_purchase_verified';
+      const canAttributeItemValue = Boolean(winner && winner.awardedValue > 0);
+
+      const valor = isFullPurchaseWinner
+        ? winner && winner.awardedValue > 0
+          ? winner.awardedValue
+          : Number.isFinite(homologadoNum) && homologadoNum > 0
+            ? homologadoNum
+            : 0
+        : winner && !isFullPurchaseWinner
+          ? canAttributeItemValue
             ? winner.awardedValue
+            : Number.isFinite(homologadoNum) && homologadoNum > 0
+              ? homologadoNum
+              : Number.isFinite(estimadoNum) && estimadoNum > 0
+                ? estimadoNum
+                : 0
+          : Number.isFinite(homologadoNum) && homologadoNum > 0
+            ? homologadoNum
             : Number.isFinite(estimadoNum) && estimadoNum > 0
               ? estimadoNum
               : 0;
@@ -530,9 +590,15 @@ async function fetchLivePncpContratacoes(
       const docSha = crypto.createHash('sha256').update(pncpId + JSON.stringify(item)).digest('hex');
       const sourceUrl = `https://pncp.gov.br/app/editais?q=${encodeURIComponent(pncpId)}`;
 
-      const supplierCnpj = winner?.supplierCnpj ?? '';
-      const supplierLegalName =
-        winner?.supplierName ?? 'Edital publicado — fornecedor ainda não homologado no PNCP';
+      const supplierCnpj =
+        isFullPurchaseWinner || canAttributeItemValue ? (winner?.supplierCnpj ?? '') : '';
+      const supplierLegalName = isFullPurchaseWinner
+        ? winner!.supplierName
+        : winner && canAttributeItemValue
+          ? `${winner.supplierName} (Item ${winner.itemNumber}${winner.totalCompraItems ? `/${winner.totalCompraItems}` : ''})`
+          : winner
+            ? 'Compra multi-itens — vedada atribuição do valor total a vencedor de item isolado'
+            : 'Edital publicado — fornecedor ainda não homologado no PNCP';
 
       return {
         id: `PNCP-LIVE-${pncpId.replace(/[^a-zA-Z0-9-]/g, '_')}`,
@@ -573,7 +639,7 @@ async function fetchLivePncpContratacoes(
           priorMunicipalContracts: 0,
           simultaneousActiveContracts: 1,
           dataProvenance: winner
-            ? 'PNCP API Oficial (Resultado Homologado)'
+            ? `PNCP API Oficial (${winner.attributionNote})`
             : 'PNCP API Oficial (Publicação de Contratação)',
         },
         items:
@@ -1480,13 +1546,37 @@ async function fetchAndCacheSupplierQsa(
         : 0,
       shareholders: (data.qsa ?? [])
         .filter((p) => Boolean(p.nome_socio && p.nome_socio.trim()))
-        .map((p) => ({
-          name: String(p.nome_socio ?? '').trim(),
-          role: String(p.qualificacao_socio ?? 'Sócio').trim(),
-          entryDate: String(p.data_entrada_sociedade ?? '').trim(),
-          maskedDocument: minimizeMaskedDocument(p.cnpj_cpf_do_socio) || undefined,
-          ageRange: p.faixa_etaria ? String(p.faixa_etaria).trim() : undefined,
-        })),
+        .map((p) => {
+          const partnerType =
+            p.identificador_de_socio === 1
+              ? ('PJ' as const)
+              : p.identificador_de_socio === 2
+                ? ('PF' as const)
+                : p.identificador_de_socio === 3
+                  ? ('EXTERIOR' as const)
+                  : undefined;
+          const maskedDoc = minimizeMaskedDocument(p.cnpj_cpf_do_socio) || undefined;
+          const partnerCnpj =
+            resolveCorporatePartnerCnpj({
+              maskedDocument: p.cnpj_cpf_do_socio ?? maskedDoc,
+              partnerType,
+            }) ?? undefined;
+          return {
+            name: String(p.nome_socio ?? '').trim(),
+            role: String(p.qualificacao_socio ?? 'Sócio').trim(),
+            entryDate: String(p.data_entrada_sociedade ?? '').trim(),
+            maskedDocument: maskedDoc,
+            ageRange: p.faixa_etaria ? String(p.faixa_etaria).trim() : undefined,
+            partnerType,
+            partnerCnpj,
+            legalRepresentativeName: p.nome_representante_legal
+              ? String(p.nome_representante_legal).trim()
+              : undefined,
+            legalRepresentativeRole: p.qualificacao_representante_legal
+              ? String(p.qualificacao_representante_legal).trim()
+              : undefined,
+          };
+        }),
       sourceProvider: 'BrasilAPI CNPJ (intermediário — dados Receita Federal)',
       fetchedAt: new Date().toISOString(),
     };
@@ -1570,6 +1660,20 @@ function buildPartnerNetworkResponsePayload(params: {
   mode: PartnerNetworkQueryMode;
   liveEnrichedCnpjs: string[];
   sourceCoverage?: PartnerNetworkSourceCoverageItem[];
+  expansionControl?: {
+    truncated: boolean;
+    truncationReasons: string[];
+    cancelled: boolean;
+    elapsedMs: number;
+    requestsUsed: number;
+    maxRequests: number;
+    maxDurationMs: number;
+    maxDepth: number;
+    maxCompanies: number;
+    page: number;
+    pageSize: number;
+    hasMore: boolean;
+  };
 }) {
   const allContracts = getAllContracts();
   const evaluatedAll = allContracts.map((c) => evaluateWithContext(c));
@@ -1581,6 +1685,52 @@ function buildPartnerNetworkResponsePayload(params: {
     contracts: evaluatedAll,
     qsaRecords,
   });
+
+  // Annotate every edge with explicit assertionState (documented vs candidate vs contested)
+  const annotatedEdges = graph.edges.map((edge) => ({
+    ...edge,
+    assertionState: classifyPartnerGraphAssertionState(edge),
+  }));
+
+  const cleanCnpj = normalizeCnpj(params.query);
+  const isCnpjLookup = isCnpjFormat(cleanCnpj) && isValidCnpj(cleanCnpj);
+  let disambiguation:
+    | {
+        requiresDisambiguation: boolean;
+        candidateCount: number;
+        snapshotCoverageDeclaration: string;
+        candidates: Array<{
+          candidateId: string;
+          displayName: string;
+          maskedDocuments: string[];
+          relatedCompanyCnpjs: string[];
+          relatedCompanyNames: string[];
+          matchConfidence: 'candidate_masked_cpf_and_name' | 'candidate_nominal_only';
+          disambiguationReason: string;
+        }>;
+      }
+    | undefined;
+
+  if (!isCnpjLookup) {
+    const revIndex = buildReverseParticipationIndex(qsaRecords);
+    const dis = disambiguatePersonQuery(params.query, revIndex);
+    if (dis.candidateCount > 0) {
+      disambiguation = {
+        requiresDisambiguation: dis.requiresDisambiguation,
+        candidateCount: dis.candidateCount,
+        snapshotCoverageDeclaration: dis.snapshotCoverage.declaration,
+        candidates: dis.candidates.slice(0, 12).map((c) => ({
+          candidateId: c.candidateId,
+          displayName: c.displayName,
+          maskedDocuments: c.maskedDocuments,
+          relatedCompanyCnpjs: c.relatedCompanyCnpjs,
+          relatedCompanyNames: c.relatedCompanyNames,
+          matchConfidence: c.matchConfidence,
+          disambiguationReason: c.disambiguationReason,
+        })),
+      };
+    }
+  }
 
   const contractIdSet = new Set(graph.contracts.map((c) => c.contractId));
   const evaluatedContracts = evaluatedAll.filter((c) => contractIdSet.has(c.id));
@@ -1597,6 +1747,7 @@ function buildPartnerNetworkResponsePayload(params: {
 
   return {
     ...graph,
+    edges: annotatedEdges,
     evaluatedContracts,
     indexCoverage: {
       totalUniqueSuppliers: uniqueSuppliers.size,
@@ -1605,6 +1756,8 @@ function buildPartnerNetworkResponsePayload(params: {
       liveEnrichedCnpjs: params.liveEnrichedCnpjs,
       sourceCoverage: params.sourceCoverage,
     },
+    ...(params.expansionControl ? { expansionControl: params.expansionControl } : {}),
+    ...(disambiguation ? { disambiguation } : {}),
   };
 }
 
@@ -1695,136 +1848,343 @@ app.get('/api/network/partners', requireViewerOrAbove, (req, res) => {
   );
 });
 
-// Explicit state-changing sync endpoint (F06 + M02 + M05): fetches BrasilAPI QSA & PNCP contracts
-// for seed AND up to 4 discovered secondary companies, recording explicit per-CNPJ coverage.
-app.post('/api/network/partners/sync', requireAnalystAuth, async (req, res) => {
+app.get('/api/network/partners/disambiguate', requireViewerOrAbove, (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
-  const body = (req.body ?? {}) as {
-    query?: string;
-    mode?: string;
-    syncPncp?: boolean;
-    syncSecondaryCompanies?: boolean;
-  };
-  const q = String(body.query ?? '').trim();
-  const rawMode = String(body.mode ?? 'auto').trim().toLowerCase();
-  const mode: PartnerNetworkQueryMode =
-    rawMode === 'company' || rawMode === 'partner' ? rawMode : 'auto';
-  const syncPncp = body.syncPncp !== false;
-  const syncSecondaryCompanies = body.syncSecondaryCompanies !== false;
-
+  const q = String(req.query.q ?? '').trim();
   if (q.length < 2) {
-    res.status(400).json({
-      error: 'Informe um CNPJ (14 dígitos), razão social da empresa ou nome do empresário/sócio.',
-    });
+    res.status(400).json({ error: 'Informe ao menos 2 caracteres para consulta nominal.' });
     return;
   }
+  const index = buildReverseParticipationIndex(store.listAllSupplierQsa());
+  res.json(disambiguatePersonQuery(q, index));
+});
 
-  const liveEnrichedCnpjs: string[] = [];
-  const coverageMap = new Map<string, PartnerNetworkSourceCoverageItem>();
+// Explicit state-changing sync endpoint (F06 + M02 + M05 + Incremental Expansion Guardrails):
+// Enforces overall time budget, request budget, depth/company limits, pagination, and AbortSignal
+// disconnect cancellation so slow upstream APIs NEVER cause gateway HTML timeouts.
+app.post('/api/network/partners/sync', requireAnalystAuth, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const startedAt = Date.now();
+  const syncAbort = new AbortController();
+  const onClientClose = () => {
+    if (!res.writableEnded) {
+      syncAbort.abort();
+    }
+  };
+  req.on('close', onClientClose);
 
-  const syncSingleCompany = async (cnpj: string, maxPncpPages: number) => {
-    const clean = normalizeCnpj(cnpj);
-    if (!isCnpjFormat(clean) || !isValidCnpj(clean)) return;
-    if (coverageMap.has(clean)) return;
+  try {
+    const body = (req.body ?? {}) as {
+      query?: string;
+      mode?: string;
+      syncPncp?: boolean;
+      syncSecondaryCompanies?: boolean;
+      maxDepth?: number;
+      maxCompanies?: number;
+      maxRequests?: number;
+      maxDurationMs?: number;
+      page?: number;
+      pageSize?: number;
+    };
+    const q = String(body.query ?? '').trim();
+    const rawMode = String(body.mode ?? 'auto').trim().toLowerCase();
+    const mode: PartnerNetworkQueryMode =
+      rawMode === 'company' || rawMode === 'partner' ? rawMode : 'auto';
+    const syncPncp = body.syncPncp !== false;
+    const syncSecondaryCompanies = body.syncSecondaryCompanies !== false;
 
-    const item: PartnerNetworkSourceCoverageItem = {
-      cnpj: clean,
-      qsaStatus: 'skipped',
-      pncpStatus: 'not_queried',
-      pagesFetched: 0,
-      totalDeclared: 0,
+    const MAX_SYNC_COMPANIES = Math.max(1, Math.min(Number(body.maxCompanies) || 6, 16));
+    const MAX_RECURSION_DEPTH = Math.max(1, Math.min(Number(body.maxDepth) || 4, 6));
+    const MAX_REQUESTS = Math.max(2, Math.min(Number(body.maxRequests) || 12, 24));
+    const MAX_DURATION_MS = Math.max(2000, Math.min(Number(body.maxDurationMs) || 10_000, 22_000));
+    const page = Math.max(1, Math.floor(Number(body.page) || 1));
+    const pageSize = Math.max(5, Math.min(Math.floor(Number(body.pageSize) || 25), 100));
+
+    if (q.length < 2) {
+      res.status(400).json({
+        error: 'Informe um CNPJ (14 dígitos), razão social da empresa ou nome do empresário/sócio.',
+      });
+      return;
+    }
+
+    const liveEnrichedCnpjs: string[] = [];
+    const coverageMap = new Map<string, PartnerNetworkSourceCoverageItem>();
+    const truncationReasons: string[] = [];
+    let requestsUsed = 0;
+
+    const addTruncation = (reason: string) => {
+      if (!truncationReasons.includes(reason)) {
+        truncationReasons.push(reason);
+      }
     };
 
-    const qsaLookup = await fetchAndCacheSupplierQsa(clean, { timeoutMs: 6000 });
-    if (qsaLookup.record) {
-      item.qsaStatus = qsaLookup.fromCache ? 'cached' : 'live_ok';
-      if (!qsaLookup.fromCache) {
-        liveEnrichedCnpjs.push(clean);
+    const budgetRemainingMs = () => MAX_DURATION_MS - (Date.now() - startedAt);
+    const isBudgetExhausted = (): boolean => {
+      if (syncAbort.signal.aborted) {
+        addTruncation('Sincronização cancelada pelo cliente.');
+        return true;
       }
-    } else {
-      item.qsaStatus = 'unavailable';
-      if (qsaLookup.error) item.errorDetail = qsaLookup.error;
+      if (budgetRemainingMs() <= 400) {
+        addTruncation(`Orçamento de tempo da sincronização atingido (${MAX_DURATION_MS} ms).`);
+        return true;
+      }
+      if (requestsUsed >= MAX_REQUESTS) {
+        addTruncation(`Limite de requisições externas atingido (${MAX_REQUESTS}).`);
+        return true;
+      }
+      return false;
+    };
+
+    const queue: Array<{ cnpj: string; depth: number; maxPncpPages: number }> = [];
+    const enqueued = new Set<string>();
+
+    const enqueueCnpj = (rawCnpj: string, depth: number, maxPncpPages: number) => {
+      const clean = normalizeCnpj(rawCnpj);
+      if (!isCnpjFormat(clean) || !isValidCnpj(clean)) return;
+      if (depth > MAX_RECURSION_DEPTH) {
+        addTruncation(`Limite de profundidade societária atingido (${MAX_RECURSION_DEPTH}).`);
+        return;
+      }
+      if (enqueued.has(clean) || coverageMap.has(clean)) return;
+      if (enqueued.size >= MAX_SYNC_COMPANIES) {
+        addTruncation(`Limite de empresas sincronizadas por lote atingido (${MAX_SYNC_COMPANIES}).`);
+        return;
+      }
+      enqueued.add(clean);
+      queue.push({ cnpj: clean, depth, maxPncpPages });
+    };
+
+    const syncSingleCompany = async (
+      cnpj: string,
+      depth: number,
+      maxPncpPages: number
+    ): Promise<SupplierQsaRecord | null> => {
+      const clean = normalizeCnpj(cnpj);
+      if (!isCnpjFormat(clean) || !isValidCnpj(clean)) return null;
+      if (coverageMap.has(clean)) return store.getSupplierQsa(clean);
+      if (isBudgetExhausted()) return store.getSupplierQsa(clean);
+
+      const item: PartnerNetworkSourceCoverageItem = {
+        cnpj: clean,
+        qsaStatus: 'skipped',
+        pncpStatus: 'not_queried',
+        pagesFetched: 0,
+        totalDeclared: 0,
+      };
+
+      const qsaStart = Date.now();
+      const qsaTimeout = Math.max(1200, Math.min(4000, budgetRemainingMs() - 250));
+      requestsUsed += 1;
+      const qsaLookup = await fetchAndCacheSupplierQsa(clean, { timeoutMs: qsaTimeout }).catch(
+        (err: unknown) => ({
+          record: null,
+          fromCache: false,
+          error: err instanceof Error ? err.message : 'erro ao consultar QSA',
+        })
+      );
+      observability.recordSourceCall({
+        source: 'brasilapi_qsa',
+        ok: Boolean(qsaLookup.record),
+        timedOut: Boolean(qsaLookup.error && /abort|timeout/i.test(qsaLookup.error)),
+        latencyMs: Date.now() - qsaStart,
+        statusLabel: qsaLookup.record ? (qsaLookup.fromCache ? 'cached' : 'live_ok') : 'unavailable',
+      });
+
+      if (qsaLookup.record) {
+        item.qsaStatus = qsaLookup.fromCache ? 'cached' : 'live_ok';
+        if (!qsaLookup.fromCache) {
+          liveEnrichedCnpjs.push(clean);
+        }
+        for (const sh of qsaLookup.record.shareholders) {
+          const corpCnpj = resolveCorporatePartnerCnpj({
+            partnerCnpj: sh.partnerCnpj,
+            maskedDocument: sh.maskedDocument,
+            partnerType: sh.partnerType,
+          });
+          if (corpCnpj && corpCnpj !== clean) {
+            enqueueCnpj(corpCnpj, depth + 1, 1);
+          }
+        }
+      } else {
+        item.qsaStatus = 'unavailable';
+        if (qsaLookup.error) item.errorDetail = qsaLookup.error;
+      }
+
+      if (syncPncp && !isBudgetExhausted()) {
+        const pncpStart = Date.now();
+        const pncpTimeout = Math.max(1200, Math.min(3500, budgetRemainingMs() - 250));
+        requestsUsed += 1;
+        try {
+          const livePncp = await fetchPncpContractsByCnpj(clean, {
+            maxPages: Math.min(maxPncpPages, 2),
+            pageSize: 50,
+            timeoutMs: pncpTimeout,
+            retries: 1,
+            signal: syncAbort.signal,
+          });
+          observability.recordSourceCall({
+            source: 'pncp_search',
+            ok: livePncp.status === 'complete' || livePncp.status === 'partial',
+            timedOut: livePncp.status === 'unavailable' && /abort|timeout/i.test(livePncp.message),
+            latencyMs: Date.now() - pncpStart,
+            statusLabel: livePncp.status,
+          });
+          item.pncpStatus = livePncp.status;
+          item.pagesFetched = livePncp.pagesFetched;
+          item.totalDeclared = livePncp.pncpTotalDeclared;
+          if (livePncp.status !== 'complete' && livePncp.message) {
+            item.errorDetail = item.errorDetail
+              ? `${item.errorDetail}; ${livePncp.message}`
+              : livePncp.message;
+          }
+          for (const rec of livePncp.records) {
+            persistContract(rec);
+          }
+        } catch (err) {
+          item.pncpStatus = 'unavailable';
+          const msg = err instanceof Error ? err.message : 'erro de rede PNCP';
+          item.errorDetail = item.errorDetail ? `${item.errorDetail}; ${msg}` : msg;
+          observability.recordSourceCall({
+            source: 'pncp_search',
+            ok: false,
+            timedOut: /abort|timeout/i.test(msg),
+            latencyMs: Date.now() - pncpStart,
+            statusLabel: 'error',
+          });
+        }
+      }
+
+      coverageMap.set(clean, item);
+      return qsaLookup.record ?? null;
+    };
+
+    const cleanCnpjQuery = normalizeCnpj(q);
+    const isCnpjQuery = isCnpjFormat(cleanCnpjQuery) && isValidCnpj(cleanCnpjQuery);
+
+    if (isCnpjQuery) {
+      enqueueCnpj(cleanCnpjQuery, 0, 2);
+    } else if (mode !== 'partner') {
+      const qTokens = normalizePersonName(q)
+        .split(' ')
+        .filter((t) => t.length >= 2);
+      if (qTokens.length > 0) {
+        let seeded = 0;
+        for (const c of getAllContracts()) {
+          const cnpj = normalizeCnpj(c.supplier?.cnpj ?? '');
+          if (!/^\d{14}$/.test(cnpj) || !isValidCnpj(cnpj)) continue;
+          const hay = normalizePersonName(c.supplier?.legalName ?? '');
+          if (qTokens.every((t) => hay.includes(t))) {
+            enqueueCnpj(cnpj, 0, 1);
+            seeded += 1;
+            if (seeded >= 3) break;
+          }
+        }
+        if (seeded === 0) {
+          for (const qsa of store.listAllSupplierQsa()) {
+            const hay = normalizePersonName(qsa.legalName ?? '');
+            if (qTokens.every((t) => hay.includes(t))) {
+              enqueueCnpj(qsa.cnpj, 0, 1);
+              seeded += 1;
+              if (seeded >= 3) break;
+            }
+          }
+        }
+      }
     }
 
-    if (syncPncp) {
-      try {
-        const livePncp = await fetchPncpContractsByCnpj(clean, {
-          maxPages: maxPncpPages,
-          pageSize: 50,
+    let expansionPass = 0;
+    const MAX_EXPANSION_PASSES = MAX_RECURSION_DEPTH;
+    while (
+      expansionPass < MAX_EXPANSION_PASSES &&
+      coverageMap.size < MAX_SYNC_COMPANIES &&
+      !isBudgetExhausted()
+    ) {
+      while (
+        queue.length > 0 &&
+        coverageMap.size < MAX_SYNC_COMPANIES &&
+        !isBudgetExhausted()
+      ) {
+        const next = queue.shift()!;
+        await syncSingleCompany(next.cnpj, next.depth, next.maxPncpPages);
+      }
+
+      if (
+        !syncSecondaryCompanies ||
+        coverageMap.size >= MAX_SYNC_COMPANIES ||
+        isBudgetExhausted()
+      ) {
+        break;
+      }
+
+      const interimGraph = buildPartnerNetworkGraph({
+        query: q,
+        mode,
+        contracts: getAllContracts(),
+        qsaRecords: store.listAllSupplierQsa(),
+      });
+
+      const newlyDiscovered = interimGraph.companies
+        .filter((c) => !coverageMap.has(c.cnpj) && !enqueued.has(c.cnpj))
+        .sort((a, b) => {
+          if (a.isCorporateShareholder !== b.isCorporateShareholder) {
+            return a.isCorporateShareholder ? -1 : 1;
+          }
+          if ((a.qsaSource === 'none') !== (b.qsaSource === 'none')) {
+            return a.qsaSource === 'none' ? -1 : 1;
+          }
+          return b.contractCount - a.contractCount;
         });
-        item.pncpStatus = livePncp.status;
-        item.pagesFetched = livePncp.pagesFetched;
-        item.totalDeclared = livePncp.pncpTotalDeclared;
-        if (livePncp.status !== 'complete' && livePncp.message) {
-          item.errorDetail = item.errorDetail
-            ? `${item.errorDetail}; ${livePncp.message}`
-            : livePncp.message;
-        }
-        for (const rec of livePncp.records) {
-          persistContract(rec);
-        }
-      } catch (err) {
-        item.pncpStatus = 'unavailable';
-        const msg = err instanceof Error ? err.message : 'erro de rede PNCP';
-        item.errorDetail = item.errorDetail ? `${item.errorDetail}; ${msg}` : msg;
+
+      if (newlyDiscovered.length === 0) {
+        break;
       }
+
+      for (const comp of newlyDiscovered) {
+        enqueueCnpj(comp.cnpj, expansionPass + 1, 1);
+        if (enqueued.size >= MAX_SYNC_COMPANIES) break;
+      }
+
+      expansionPass += 1;
     }
 
-    coverageMap.set(clean, item);
-  };
+    if (res.writableEnded) return;
 
-  const cleanCnpjQuery = normalizeCnpj(q);
-  const isCnpjQuery = isCnpjFormat(cleanCnpjQuery) && isValidCnpj(cleanCnpjQuery);
-
-  if (isCnpjQuery) {
-    await syncSingleCompany(cleanCnpjQuery, 3);
-  } else if (mode !== 'partner') {
-    const qTokens = normalizePersonName(q)
-      .split(' ')
-      .filter((t) => t.length >= 2);
-    if (qTokens.length > 0) {
-      const matchingCnpjs = new Set<string>();
-      for (const c of getAllContracts()) {
-        const cnpj = normalizeCnpj(c.supplier?.cnpj ?? '');
-        if (!/^\d{14}$/.test(cnpj) || !isValidCnpj(cnpj)) continue;
-        const hay = normalizePersonName(c.supplier?.legalName ?? '');
-        if (qTokens.every((t) => hay.includes(t))) {
-          matchingCnpjs.add(cnpj);
-          if (matchingCnpjs.size >= 3) break;
-        }
-      }
-      for (const cnpj of matchingCnpjs) {
-        await syncSingleCompany(cnpj, 2);
-      }
-    }
-  }
-
-  // M02: Discover linked secondary companies in the local QSA/contract graph and sync their PNCP contracts
-  if (syncSecondaryCompanies) {
-    const interimGraph = buildPartnerNetworkGraph({
-      query: q,
-      mode,
-      contracts: getAllContracts(),
-      qsaRecords: store.listAllSupplierQsa(),
-    });
-    const secondaryCnpjs = interimGraph.companies
-      .map((c) => c.cnpj)
-      .filter((cnpj) => !coverageMap.has(cnpj))
-      .slice(0, 4);
-
-    for (const secCnpj of secondaryCnpjs) {
-      await syncSingleCompany(secCnpj, 2);
-    }
-  }
-
-  res.json(
-    buildPartnerNetworkResponsePayload({
+    const payload = buildPartnerNetworkResponsePayload({
       query: q,
       mode,
       liveEnrichedCnpjs,
       sourceCoverage: Array.from(coverageMap.values()),
-    })
-  );
+      expansionControl: {
+        truncated: truncationReasons.length > 0 || queue.length > 0,
+        truncationReasons,
+        cancelled: syncAbort.signal.aborted,
+        elapsedMs: Date.now() - startedAt,
+        requestsUsed,
+        maxRequests: MAX_REQUESTS,
+        maxDurationMs: MAX_DURATION_MS,
+        maxDepth: MAX_RECURSION_DEPTH,
+        maxCompanies: MAX_SYNC_COMPANIES,
+        page,
+        pageSize,
+        hasMore: queue.length > 0,
+      },
+    });
+
+    res.json(payload);
+  } catch (err) {
+    console.error(
+      '[NEXOFIS] Erro na sincronização da rede societária:',
+      sanitizeLogPayload({ error: err instanceof Error ? err.message : String(err) })
+    );
+    if (!res.headersSent) {
+      res.status(500).json({
+        error:
+          'Falha interna ao sincronizar QSA e contratos da rede societária. Os dados já indexados permanecem preservados.',
+      });
+    }
+  } finally {
+    req.off('close', onClientClose);
+  }
 });
 
 // ==========================================
@@ -2391,20 +2751,34 @@ app.post(
       return;
     }
 
-    // F08: Optimistic concurrency check on review submission against finding inputsDigest & factsVersion
+    // F08 + Section 1 Hardening: Human reviews MUST supply expectedFactsVersion or expectedFindingInputsDigest
+    // so stale/obsolete reviews can never be silently accepted.
     const expectedFactsVersionRaw = req.body?.expectedFactsVersion;
+    const hasExpectedFactsVersion =
+      expectedFactsVersionRaw !== undefined &&
+      expectedFactsVersionRaw !== null &&
+      String(expectedFactsVersionRaw).trim() !== '';
     const expectedFindingInputsDigest =
       typeof req.body?.expectedFindingInputsDigest === 'string'
         ? req.body.expectedFindingInputsDigest.trim()
         : '';
 
+    if (!hasExpectedFactsVersion && !expectedFindingInputsDigest) {
+      res.status(400).json({
+        error:
+          'A revisão humana exige informar a versão dos fatos (expectedFactsVersion) ou o digest dos insumos do apontamento (expectedFindingInputsDigest) analisado.',
+        currentVersion: currentCase.factSet.version,
+        currentFindingInputsDigest: matchedFinding.inputsDigest,
+      });
+      return;
+    }
+
     if (
-      expectedFactsVersionRaw !== undefined &&
-      expectedFactsVersionRaw !== null &&
+      hasExpectedFactsVersion &&
       Number(expectedFactsVersionRaw) !== currentCase.factSet.version
     ) {
       res.status(409).json({
-        error: `A versão dos fatos foi alterada antes do envio da revisão (esperada v${expectedFactsVersionRaw}, atual v${currentCase.factSet.version}). Recarregue o caso antes de gravar.`,
+        error: `A versão dos fatos foi alterada antes do envio da revisão (esperada v${expectedFactsVersionRaw}, atual v${currentCase.factSet.version}). Revisão obsoleta rejeitada.`,
         expectedVersion: Number(expectedFactsVersionRaw),
         currentVersion: currentCase.factSet.version,
         currentFindingInputsDigest: matchedFinding.inputsDigest,
@@ -2418,7 +2792,7 @@ app.post(
     ) {
       res.status(409).json({
         error:
-          'Os insumos do apontamento mudaram desde que você abriu o formulário de revisão. Recarregue o apontamento antes de confirmar.',
+          'Os insumos do apontamento mudaram desde que você abriu o formulário de revisão. Revisão obsoleta rejeitada.',
         expectedFindingInputsDigest,
         currentFindingInputsDigest: matchedFinding.inputsDigest,
         currentVersion: currentCase.factSet.version,
@@ -2911,6 +3285,17 @@ app.post(
         createdAt: retrievedAt,
       });
 
+      const editalChannelAudit = auditEditalCommunicationChannels(extractedText, {
+        procurementId: targetContract.contractNumber || uploadedDoc.id,
+        ocrQualityScore: confidence,
+      });
+
+      pipelineSteps.push({
+        stage: 'Auditoria de Canais de Contato e Participação (Lei 14.133/2021 · LAI · PNTP)',
+        status: editalChannelAudit.status === 'CONFORME' ? 'ok' : 'fallback',
+        detail: `${editalChannelAudit.status} · E-mails: ${editalChannelAudit.emailsFound.length} · Telefones: ${editalChannelAudit.phonesFound.length} · Plataformas: ${editalChannelAudit.platformsFound.length}`,
+      });
+
       const evaluated = evaluateWithContext(targetContract);
 
       if (claimed) {
@@ -2944,6 +3329,7 @@ app.post(
               }))
             : undefined,
         extraction: extracted,
+        editalChannelAudit,
         ocrTelemetry: ocrResult.telemetry,
         tabularRowsCount: tabularRows.length,
         pipelineSteps,
@@ -3065,10 +3451,536 @@ function handleRiskDashboardSummary(req: express.Request, res: express.Response)
 app.get('/api/dashboard/risk-summary', handleRiskDashboardSummary);
 app.get('/api/dashboard/risks', handleRiskDashboardSummary);
 
+// ==========================================
+// API ROUTES — INVESTIGATIVE EVOLUTION (Sections 3–7: Integrity Trails, Outcomes, SINAPI/SIAPS/Camara Importers, Participation & Observability)
+// ==========================================
+
+app.post(
+  '/api/investigative/public-integrity/evaluate',
+  requireStrictInvestigationAuth,
+  (req: AuthenticatedRequest, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const kinships = Array.isArray(body.kinships) ? body.kinships : [];
+    const appointments = Array.isArray(body.appointments) ? body.appointments : [];
+    const reciprocityHypotheses = Array.isArray(body.reciprocityHypotheses)
+      ? body.reciprocityHypotheses
+      : [];
+    const contractConflicts = Array.isArray(body.contractConflicts)
+      ? body.contractConflicts
+      : [];
+    const roleRequirementCheck = body.roleRequirementCheck as
+      | Parameters<typeof evaluateRoleLegalRequirementsTrail>[0]
+      | undefined;
+
+    res.json({
+      kinshipTrail: evaluateDocumentedKinshipTrail(
+        kinships as Parameters<typeof evaluateDocumentedKinshipTrail>[0]
+      ),
+      appointmentNepotismTrail: evaluateAppointmentNepotismTrail({
+        appointments: appointments as Parameters<typeof evaluateAppointmentNepotismTrail>[0]['appointments'],
+        documentedKinships: kinships as Parameters<typeof evaluateAppointmentNepotismTrail>[0]['documentedKinships'],
+        reciprocityHypotheses: reciprocityHypotheses as Parameters<
+          typeof evaluateAppointmentNepotismTrail
+        >[0]['reciprocityHypotheses'],
+        applicableLegalBasis:
+          typeof body.applicableLegalBasis === 'string' ? body.applicableLegalBasis : null,
+        jurisdiction: typeof body.jurisdiction === 'string' ? body.jurisdiction : null,
+        referenceDate: typeof body.referenceDate === 'string' ? body.referenceDate : null,
+      }),
+      contractConflictTrail: evaluateContractConflictTrail(
+        contractConflicts as Parameters<typeof evaluateContractConflictTrail>[0]
+      ),
+      roleLegalRequirementsTrail: roleRequirementCheck
+        ? evaluateRoleLegalRequirementsTrail(roleRequirementCheck)
+        : null,
+    });
+  }
+);
+
+app.post(
+  '/api/investigative/outcomes/evaluate',
+  requireStrictInvestigationAuth,
+  (req: AuthenticatedRequest, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (!body.claim || !body.definition || !Array.isArray(body.observations)) {
+      res.status(400).json({
+        error: 'Informe claim, definition e observations para avaliar compromissos contratuais.',
+      });
+      return;
+    }
+    const evaluationDate =
+      typeof body.evaluationDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(body.evaluationDate)
+        ? body.evaluationDate
+        : new Date().toISOString().slice(0, 10);
+
+    const run = evaluateOutcomeClaim({
+      claim: body.claim as Parameters<typeof evaluateOutcomeClaim>[0]['claim'],
+      definition: body.definition as Parameters<typeof evaluateOutcomeClaim>[0]['definition'],
+      observations: body.observations as Parameters<typeof evaluateOutcomeClaim>[0]['observations'],
+      evaluationDate,
+      didDesign: body.didDesign as Parameters<typeof evaluateOutcomeClaim>[0]['didDesign'],
+    });
+
+    const siconfi =
+      body.siconfi && typeof body.siconfi === 'object'
+        ? reconcileSiconfiExecution(
+            body.siconfi as Parameters<typeof reconcileSiconfiExecution>[0]
+          )
+        : null;
+
+    res.json({ evaluationRun: run, siconfiReconciliation: siconfi });
+  }
+);
+
+app.post(
+  '/api/investigative/prices/evaluate',
+  requireStrictInvestigationAuth,
+  (req: AuthenticatedRequest, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (!body.subjectProfile || !Array.isArray(body.peers)) {
+      res.status(400).json({
+        error: 'Informe subjectProfile e peers para validação de comparabilidade de preços.',
+      });
+      return;
+    }
+    const result = evaluateInvestigativePriceComparison(
+      body as unknown as Parameters<typeof evaluateInvestigativePriceComparison>[0]
+    );
+    res.json(result);
+  }
+);
+
+app.post(
+  '/api/investigative/participation/evaluate',
+  requireStrictInvestigationAuth,
+  (req: AuthenticatedRequest, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (!body.procurementId || !body.proposalSubmissionChannel) {
+      res.status(400).json({
+        error: 'Informe procurementId e proposalSubmissionChannel para avaliar canais de participação.',
+      });
+      return;
+    }
+    const evaluation = evaluateParticipationChannels(
+      body as unknown as Parameters<typeof evaluateParticipationChannels>[0]
+    );
+    res.json(evaluation);
+  }
+);
+
+app.post(
+  '/api/investigative/importers/siaps',
+  requireStrictInvestigationAuth,
+  (req: AuthenticatedRequest, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const body = (req.body ?? {}) as {
+      rawCsv?: string;
+      filename?: string;
+      defaultMethodologyVersion?: string;
+    };
+    if (typeof body.rawCsv !== 'string' || body.rawCsv.trim().length < 5) {
+      res.status(400).json({ error: 'Conteúdo CSV/TSV da exportação pública SIAPS ausente.' });
+      return;
+    }
+    const imported = importSiapsPublicExport({
+      rawCsv: body.rawCsv,
+      filename: String(body.filename || 'siaps-export.csv').slice(0, 120),
+      defaultMethodologyVersion: String(body.defaultMethodologyVersion || 'siaps-v1'),
+    });
+    const actor = deriveStrictInvestigationActor(req);
+    const saved = store.saveOfficialSnapshot({
+      id: `snap_siaps_${imported.fileSha256.slice(0, 16)}`,
+      sourceKind: 'siaps',
+      filename: imported.filename,
+      sha256: imported.fileSha256,
+      competencia: imported.observations[0]?.competencia ?? 'multi',
+      uf: null,
+      metadataJson: JSON.stringify({
+        rowCount: imported.rowCount,
+        unpublishedCount: imported.unpublishedCount,
+        sourceSystem: imported.sourceSystem,
+      }),
+      payloadJson: JSON.stringify(imported.observations),
+      importedBy: actor.actorName,
+    });
+    res.status(saved.alreadyExisted ? 200 : 201).json({ ...imported, snapshot: saved });
+  }
+);
+
+app.post(
+  '/api/investigative/importers/sinapi',
+  requireStrictInvestigationAuth,
+  (req: AuthenticatedRequest, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const body = (req.body ?? {}) as {
+      rawCsv?: string;
+      filename?: string;
+      uf?: string;
+      competencia?: string;
+      edition?: string;
+      taxRegime?: 'desonerado' | 'nao_desonerado';
+      defaultKind?: 'insumo' | 'composicao';
+      isRectification?: boolean;
+      rectificationNote?: string;
+    };
+    if (typeof body.rawCsv !== 'string' || body.rawCsv.trim().length < 5 || !body.uf || !body.competencia) {
+      res.status(400).json({
+        error: 'Informe rawCsv, uf e competencia da tabela oficial SINAPI.',
+      });
+      return;
+    }
+    const imported = importSinapiOfficialFile({
+      rawBuffer: body.rawCsv,
+      filename: String(body.filename || 'sinapi-oficial.csv').slice(0, 120),
+      uf: body.uf,
+      competencia: body.competencia,
+      edition: String(body.edition || body.competencia),
+      taxRegime: body.taxRegime === 'desonerado' ? 'desonerado' : 'nao_desonerado',
+      defaultKind: body.defaultKind === 'composicao' ? 'composicao' : 'insumo',
+      isRectification: Boolean(body.isRectification),
+      rectificationNote: body.rectificationNote,
+    });
+    const actor = deriveStrictInvestigationActor(req);
+    const saved = store.saveOfficialSnapshot({
+      id: `snap_sinapi_${imported.originalFileSha256.slice(0, 16)}`,
+      sourceKind: 'sinapi',
+      filename: imported.filename,
+      sha256: imported.originalFileSha256,
+      competencia: imported.competencia,
+      uf: imported.uf,
+      metadataJson: JSON.stringify({
+        edition: imported.edition,
+        taxRegime: imported.taxRegime,
+        isRectification: imported.isRectification,
+        itemCount: imported.itemCount,
+      }),
+      payloadJson: JSON.stringify(imported.items),
+      importedBy: actor.actorName,
+    });
+    res.status(saved.alreadyExisted ? 200 : 201).json({ ...imported, snapshot: saved });
+  }
+);
+
+app.post(
+  '/api/investigative/importers/camara-personnel',
+  requireStrictInvestigationAuth,
+  (req: AuthenticatedRequest, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const body = (req.body ?? {}) as {
+      rawCsv?: string;
+      filename?: string;
+      snapshotDate?: string;
+    };
+    if (typeof body.rawCsv !== 'string' || body.rawCsv.trim().length < 5) {
+      res.status(400).json({ error: 'Conteúdo CSV do arquivo diário da Câmara ausente.' });
+      return;
+    }
+    const snapshotDate =
+      typeof body.snapshotDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(body.snapshotDate)
+        ? body.snapshotDate
+        : new Date().toISOString().slice(0, 10);
+    const parsed = parseCamaraDailyPersonnelSnapshot({
+      rawCsv: body.rawCsv,
+      snapshotDate,
+    });
+    const actor = deriveStrictInvestigationActor(req);
+    const saved = store.saveOfficialSnapshot({
+      id: `snap_camara_${parsed.sha256.slice(0, 16)}`,
+      sourceKind: 'camara_personnel',
+      filename: String(body.filename || `camara-funcionarios-${snapshotDate}.csv`).slice(0, 120),
+      sha256: parsed.sha256,
+      competencia: snapshotDate,
+      uf: 'DF',
+      metadataJson: JSON.stringify({
+        coverageScope: parsed.coverageScope,
+        hasHistoricalChanges: parsed.hasHistoricalChanges,
+        recordCount: parsed.recordCount,
+      }),
+      payloadJson: JSON.stringify(parsed.rows),
+      importedBy: actor.actorName,
+    });
+    res.status(saved.alreadyExisted ? 200 : 201).json({ ...parsed, snapshot: saved });
+  }
+);
+
+app.post(
+  '/api/investigative/outcomes/did-evaluate',
+  requireStrictInvestigationAuth,
+  (req: AuthenticatedRequest, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (
+      !body.contractId ||
+      !body.indicatorId ||
+      typeof body.treatedPreValue !== 'number' ||
+      typeof body.treatedPostValue !== 'number' ||
+      !Array.isArray(body.controlMunicipalities)
+    ) {
+      res.status(400).json({
+        error:
+          'Informe contractId, indicatorId, treatedPreValue, treatedPostValue e controlMunicipalities para cálculo de Diferença-em-Diferenças.',
+      });
+      return;
+    }
+    const result = computePairedDidEffect(
+      body as unknown as Parameters<typeof computePairedDidEffect>[0]
+    );
+    res.json(result);
+  }
+);
+
+app.post(
+  '/api/investigative/importers/inep',
+  requireStrictInvestigationAuth,
+  (req: AuthenticatedRequest, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const body = (req.body ?? {}) as {
+      rawCsv?: string;
+      filename?: string;
+      defaultMethodologyVersion?: string;
+    };
+    if (typeof body.rawCsv !== 'string' || body.rawCsv.trim().length < 5) {
+      res.status(400).json({ error: 'Conteúdo CSV/TSV da tabela oficial INEP ausente.' });
+      return;
+    }
+    const imported = importInepPublicExport({
+      rawCsv: body.rawCsv,
+      filename: String(body.filename || 'inep-ideb-saeb.csv').slice(0, 120),
+      defaultMethodologyVersion: String(body.defaultMethodologyVersion || 'inep-ideb-v1'),
+    });
+    const actor = deriveStrictInvestigationActor(req);
+    const saved = store.saveOfficialSnapshot({
+      id: `snap_inep_${imported.fileSha256.slice(0, 16)}`,
+      sourceKind: 'inep',
+      filename: imported.filename,
+      sha256: imported.fileSha256,
+      competencia: imported.observations[0]?.competencia ?? 'multi',
+      uf: null,
+      metadataJson: JSON.stringify({
+        rowCount: imported.rowCount,
+        unpublishedCount: imported.unpublishedCount,
+        sourceSystem: imported.sourceSystem,
+      }),
+      payloadJson: JSON.stringify(imported.observations),
+      importedBy: actor.actorName,
+    });
+    res.status(saved.alreadyExisted ? 200 : 201).json({ ...imported, snapshot: saved });
+  }
+);
+
+app.post(
+  '/api/investigative/participation/audit-edital-text',
+  requireStrictInvestigationAuth,
+  (req: AuthenticatedRequest, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const body = (req.body ?? {}) as {
+      text?: string;
+      procurementId?: string;
+      ocrQualityScore?: number | null;
+      applicableLegalRule?: string;
+      jurisdiction?: string;
+    };
+    if (typeof body.text !== 'string' || body.text.trim().length < 10) {
+      res.status(400).json({ error: 'Texto do edital ausente ou muito curto para auditoria.' });
+      return;
+    }
+    const audit = auditEditalCommunicationChannels(body.text, {
+      procurementId: body.procurementId,
+      ocrQualityScore: typeof body.ocrQualityScore === 'number' ? body.ocrQualityScore : null,
+      applicableLegalRule: body.applicableLegalRule,
+      jurisdiction: body.jurisdiction,
+    });
+    res.json(audit);
+  }
+);
+
+app.post(
+  '/api/investigative/graph/cypher',
+  requireViewerOrAbove,
+  (req: AuthenticatedRequest, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const body = (req.body ?? {}) as {
+      targetCnpj?: string;
+      onlyDocumented?: boolean;
+      snapshot?: ForensicGraphSnapshot;
+    };
+
+    let snapshot: ForensicGraphSnapshot;
+    if (body.snapshot && Array.isArray(body.snapshot.people)) {
+      snapshot = body.snapshot;
+    } else {
+      // Project NEXOFIS's live SQLite QSA + contracts into the Neo4j-compatible forensic graph schema
+      const qsaRecords = store.listAllSupplierQsa();
+      const contracts = getAllContracts();
+      const peopleMap = new Map<string, ForensicGraphSnapshot['people'][number]>();
+      const companiesMap = new Map<string, ForensicGraphSnapshot['companies'][number]>();
+      const agenciesMap = new Map<string, ForensicGraphSnapshot['agencies'][number]>();
+      const contractNodes: ForensicGraphSnapshot['contracts'] = [];
+      const shareholderEdges: ForensicGraphSnapshot['shareholderEdges'] = [];
+
+      for (const qsa of qsaRecords) {
+        const cleanCnpj = normalizeCnpj(qsa.cnpj);
+        if (!cleanCnpj) continue;
+        companiesMap.set(cleanCnpj, {
+          cnpj: cleanCnpj,
+          razaoSocial: qsa.legalName || cleanCnpj,
+          capitalSocial: qsa.shareCapital ?? null,
+        });
+        for (const sh of qsa.shareholders ?? []) {
+          const normName = normalizePersonName(sh.name);
+          const docKey = sh.maskedDocument ? sh.maskedDocument.replace(/\s+/g, '') : 'SEM_DOC';
+          const personId = `person_${normName.replace(/\s+/g, '_').slice(0, 40)}_${docKey}`;
+          if (!peopleMap.has(personId)) {
+            peopleMap.set(personId, {
+              personId,
+              nome: sh.name,
+              cpfMascarado: sh.maskedDocument ?? null,
+              cargoPolitico: null,
+              escolaridadeDocumentada: null,
+              identityResolved: Boolean(sh.maskedDocument && !sh.maskedDocument.includes('*')),
+            });
+          }
+          shareholderEdges.push({
+            personId,
+            cnpj: cleanCnpj,
+            qualificacao: sh.role || 'Sócio',
+            participacaoPct: null,
+            assertionState: sh.maskedDocument && !sh.maskedDocument.includes('*') ? 'documented' : 'candidate',
+            evidenceRef: `QSA:${qsa.sourceProvider}:${cleanCnpj}`,
+          });
+        }
+      }
+
+      for (const c of contracts) {
+        const cleanCnpj = normalizeCnpj(c.supplier?.cnpj ?? '');
+        if (!cleanCnpj) continue;
+        if (!companiesMap.has(cleanCnpj)) {
+          companiesMap.set(cleanCnpj, {
+            cnpj: cleanCnpj,
+            razaoSocial: c.supplier?.legalName || cleanCnpj,
+            capitalSocial: null,
+          });
+        }
+        const orgaoId = `orgao_${c.municipalityIbge || 'BR'}_${normalizeOrganKey(c.entityName || c.municipalityName || 'ORGAO').slice(0, 32)}`;
+        if (!agenciesMap.has(orgaoId)) {
+          agenciesMap.set(orgaoId, {
+            orgaoId,
+            nome: c.entityName || c.municipalityName || 'Órgão Público',
+            ibge: c.municipalityIbge || null,
+          });
+        }
+        contractNodes.push({
+          contratoId: c.id,
+          numero: c.contractNumber,
+          objeto: c.object,
+          valorTotal: c.updatedValue || c.originalValue || 0,
+          valorMensal: null,
+          ano: c.year || new Date().getFullYear(),
+          cnpjFornecedor: cleanCnpj,
+          orgaoId,
+        });
+      }
+
+      snapshot = {
+        people: Array.from(peopleMap.values()),
+        companies: Array.from(companiesMap.values()),
+        agencies: Array.from(agenciesMap.values()),
+        offices: [],
+        contracts: contractNodes,
+        kinshipEdges: [],
+        shareholderEdges,
+        officeHoldingEdges: [],
+      };
+    }
+
+    const cypherScript = generateForensicCypherScript(snapshot);
+    const kinshipMatches = executeKinshipOfficeContractQuery(snapshot, {
+      onlyDocumented: body.onlyDocumented ?? true,
+    });
+    const cleanTarget = body.targetCnpj ? normalizeCnpj(body.targetCnpj) : '';
+    const multiHopMatches = cleanTarget
+      ? executeMultiHopCorporateNetworkQuery(snapshot, cleanTarget, {
+          onlyDocumented: body.onlyDocumented ?? false,
+        })
+      : [];
+
+    res.json({
+      storageArchitectureNote:
+        'Armazenamento primário permanece em SQLite; esta projeção gera script Cypher compatível com Neo4j 5+ e executa as consultas forenses em processo.',
+      counts: {
+        people: snapshot.people.length,
+        companies: snapshot.companies.length,
+        agencies: snapshot.agencies.length,
+        offices: snapshot.offices.length,
+        contracts: snapshot.contracts.length,
+      },
+      constraints: FORENSIC_GRAPH_CYPHER_CONSTRAINTS,
+      queries: FORENSIC_GRAPH_CYPHER_QUERIES,
+      cypherScript,
+      inProcessResults: {
+        kinshipOfficeContractOverlap: kinshipMatches,
+        hiddenMultiHopCorporateNetwork: multiHopMatches,
+      },
+    });
+  }
+);
+
+app.get('/api/investigative/snapshots', requireViewerOrAbove, (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const rawKind = String(req.query.kind ?? '').trim();
+  const kind =
+    rawKind === 'siaps' || rawKind === 'sinapi' || rawKind === 'camara_personnel' || rawKind === 'inep'
+      ? rawKind
+      : undefined;
+  res.json({ snapshots: store.listOfficialSnapshots(kind) });
+});
+
+app.get('/api/observability/metrics', requireViewerOrAbove, (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  const allContracts = getAllContracts();
+  const uniqueSuppliers = new Set(
+    allContracts
+      .map((c) => normalizeCnpj(c.supplier?.cnpj ?? ''))
+      .filter((c) => isCnpjFormat(c) && isValidCnpj(c))
+  );
+  res.json(
+    observability.getSnapshot({
+      engineVersion: INVESTIGATION_ENGINE_VERSION,
+      schemaVersion: store.getSchemaVersion(),
+      queueDepth:
+        jobQueue.listByStatus('queued', 50).length + jobQueue.listByStatus('processing', 50).length,
+      indexedSuppliers: uniqueSuppliers.size,
+      indexedQsa: store.listAllSupplierQsa().length,
+    })
+  );
+});
+
 // Ensure unmatched /api/* routes ALWAYS return JSON 404 (never SPA HTML fallback!)
 app.use('/api', (_req, res) => {
   res.status(404).json({ error: 'Endpoint de API não encontrado.' });
 });
+
+// Global Express JSON error handler for /api/* (prevents HTML error pages on unexpected exceptions)
+app.use(
+  '/api',
+  (
+    err: unknown,
+    _req: express.Request,
+    res: express.Response,
+    _next: express.NextFunction
+  ) => {
+    const message = err instanceof Error ? err.message : 'Erro interno inesperado na API.';
+    console.error('[NEXOFIS] Erro não tratado em /api:', sanitizeLogPayload({ message }));
+    if (res.headersSent) return;
+    res.status(500).json({
+      error: 'Erro interno na API do NEXOFIS. Tente novamente ou verifique os parâmetros enviados.',
+    });
+  }
+);
 
 // ==========================================
 // SERVER BOOTSTRAP (Vite Dev Middleware or Static Production Build)

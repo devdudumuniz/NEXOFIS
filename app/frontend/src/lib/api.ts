@@ -24,6 +24,7 @@ import type {
   PartnerNetworkQueryMode,
   PartnerNetworkSuggestionsPayload,
 } from '@nexofis/shared/lib/partnerNetworkGraph';
+import type { EditalChannelAuditResult } from '@nexofis/shared/lib/participationChannelEvaluator';
 
 // In-memory session token ONLY (never persisted to localStorage — SecureCoder / A09)
 let inMemoryAuthToken: string | null = null;
@@ -175,6 +176,7 @@ export interface DocumentUploadResponse {
     supplierName: string;
   }>;
   extraction: ExtractedDocumentFields;
+  editalChannelAudit?: EditalChannelAuditResult;
   ocrTelemetry?: {
     engineUsed: string;
     extractorVersion: string;
@@ -668,6 +670,12 @@ export async function syncPartnerNetwork(
     mode: PartnerNetworkQueryMode;
     syncPncp?: boolean;
     syncSecondaryCompanies?: boolean;
+    maxDepth?: number;
+    maxCompanies?: number;
+    maxRequests?: number;
+    maxDurationMs?: number;
+    page?: number;
+    pageSize?: number;
   },
   signal?: AbortSignal
 ): Promise<PartnerNetworkPayload> {
@@ -679,6 +687,12 @@ export async function syncPartnerNetwork(
       mode: payload.mode,
       syncPncp: payload.syncPncp ?? true,
       syncSecondaryCompanies: payload.syncSecondaryCompanies ?? true,
+      ...(payload.maxDepth !== undefined ? { maxDepth: payload.maxDepth } : {}),
+      ...(payload.maxCompanies !== undefined ? { maxCompanies: payload.maxCompanies } : {}),
+      ...(payload.maxRequests !== undefined ? { maxRequests: payload.maxRequests } : {}),
+      ...(payload.maxDurationMs !== undefined ? { maxDurationMs: payload.maxDurationMs } : {}),
+      ...(payload.page !== undefined ? { page: payload.page } : {}),
+      ...(payload.pageSize !== undefined ? { pageSize: payload.pageSize } : {}),
     }),
     signal,
   });
@@ -715,4 +729,40 @@ export async function enrichPartnerNetworkIndex(limit = 10): Promise<{
   });
   return readJson(res, 'Falha ao indexar quadros societários (BrasilAPI).');
 }
+
+export interface ForensicCypherProjectionResponse {
+  storageArchitectureNote: string;
+  counts: {
+    people: number;
+    companies: number;
+    agencies: number;
+    offices: number;
+    contracts: number;
+  };
+  constraints: string;
+  queries: {
+    kinshipOfficeContractOverlap: string;
+    hiddenMultiHopCorporateNetwork: string;
+  };
+  cypherScript: string;
+  inProcessResults: {
+    kinshipOfficeContractOverlap: unknown[];
+    hiddenMultiHopCorporateNetwork: unknown[];
+  };
+}
+
+export async function fetchForensicCypherProjection(
+  payload: { targetCnpj?: string; onlyDocumented?: boolean } = {}
+): Promise<ForensicCypherProjectionResponse> {
+  const res = await fetch('/api/investigative/graph/cypher', {
+    method: 'POST',
+    headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  });
+  return readJson<ForensicCypherProjectionResponse>(
+    res,
+    'Falha ao gerar projeção Cypher (Neo4j) do grafo forense.'
+  );
+}
+
 

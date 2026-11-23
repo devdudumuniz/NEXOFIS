@@ -20,6 +20,10 @@ export interface RawBrasilApiQsa {
   data_entrada_sociedade?: string;
   cnpj_cpf_do_socio?: string;
   faixa_etaria?: string;
+  identificador_de_socio?: number;
+  cpf_representante_legal?: string;
+  nome_representante_legal?: string;
+  qualificacao_representante_legal?: string;
 }
 
 export interface RawBrasilApiCnpj {

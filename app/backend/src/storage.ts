@@ -161,6 +161,28 @@ export interface NexofisStore {
   upsertSupplierQsa(record: SupplierQsaRecord): void;
   getSupplierQsa(cnpj: string): SupplierQsaRecord | null;
   listAllSupplierQsa(): SupplierQsaRecord[];
+  saveOfficialSnapshot(snapshot: {
+    id: string;
+    sourceKind: 'siaps' | 'sinapi' | 'camara_personnel' | 'inep';
+    filename: string;
+    sha256: string;
+    competencia: string;
+    uf: string | null;
+    metadataJson: string;
+    payloadJson: string;
+    importedBy: string;
+  }): { alreadyExisted: boolean; id: string };
+  listOfficialSnapshots(sourceKind?: 'siaps' | 'sinapi' | 'camara_personnel' | 'inep'): Array<{
+    id: string;
+    sourceKind: 'siaps' | 'sinapi' | 'camara_personnel' | 'inep';
+    filename: string;
+    sha256: string;
+    competencia: string;
+    uf: string | null;
+    metadataJson: string;
+    importedBy: string;
+    importedAt: string;
+  }>;
 }
 
 const DEFAULT_DB_PATH = path.resolve(process.cwd(), 'data', 'nexofis.db');
@@ -189,9 +211,55 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
     fs.mkdirSync(privateEvidenceDir, { recursive: true });
   }
 
-  const db = new DatabaseSync(resolvedDbPath);
-  db.exec('PRAGMA journal_mode = WAL;');
-  db.exec('PRAGMA foreign_keys = ON;');
+  function openHealthyDatabase(targetPath: string): DatabaseSync {
+    const attemptOpen = (): DatabaseSync => {
+      const candidate = new DatabaseSync(targetPath);
+      candidate.exec('PRAGMA journal_mode = WAL;');
+      candidate.exec('PRAGMA foreign_keys = ON;');
+      const checkRow = candidate.prepare('PRAGMA quick_check(1);').get() as
+        | { quick_check?: string }
+        | undefined;
+      if (checkRow?.quick_check !== 'ok') {
+        candidate.close();
+        throw new Error(`SQLite quick_check failed: ${checkRow?.quick_check ?? 'unknown'}`);
+      }
+      return candidate;
+    };
+
+    try {
+      return attemptOpen();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isCorruption =
+        /malformed|not a database|quick_check failed|corrupt/i.test(msg) ||
+        (typeof err === 'object' && err !== null && 'errcode' in err && (err as { errcode?: number }).errcode === 11);
+
+      if (!isCorruption || !fs.existsSync(targetPath)) {
+        throw err;
+      }
+
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      for (const suffix of ['', '-wal', '-shm']) {
+        const src = `${targetPath}${suffix}`;
+        if (fs.existsSync(src)) {
+          const backup = `${targetPath}.corrupt-${stamp}${suffix}`;
+          try {
+            fs.renameSync(src, backup);
+          } catch {
+            // If rename fails (e.g. cross-device), fall back to copy + unlink for sidecars
+            fs.copyFileSync(src, backup);
+            fs.unlinkSync(src);
+          }
+        }
+      }
+      console.warn(
+        `[NEXOFIS] Banco SQLite corrompido detectado em ${targetPath}; cópia preservada em ${targetPath}.corrupt-${stamp} e novo banco íntegro inicializado.`
+      );
+      return attemptOpen();
+    }
+  }
+
+  const db = openHealthyDatabase(resolvedDbPath);
 
   // Versioned schema migrations table
   db.exec(`
@@ -431,6 +499,58 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
       'INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)'
     ).run(4, 'supplier_qsa_cache_partner_network', new Date().toISOString());
   }
+
+  // Additive migration v5: Official reference snapshots (SIAPS, SINAPI, Camara daily personnel) with SHA-256 idempotency
+  const v5Check = db
+    .prepare('SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations')
+    .get() as { version: number };
+
+  if (v5Check.version < 5) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS official_reference_snapshots (
+        id TEXT PRIMARY KEY,
+        source_kind TEXT NOT NULL CHECK(source_kind IN ('siaps', 'sinapi', 'camara_personnel')),
+        filename TEXT NOT NULL,
+        sha256 TEXT NOT NULL UNIQUE,
+        competencia TEXT NOT NULL,
+        uf TEXT,
+        metadata_json TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        imported_by TEXT NOT NULL,
+        imported_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_official_snapshots_kind
+        ON official_reference_snapshots(source_kind, imported_at);
+    `);
+
+    db.prepare(
+      'INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)'
+    ).run(5, 'official_reference_snapshots_siaps_sinapi_camara', new Date().toISOString());
+  }
+
+  const stmtInsertOfficialSnapshot = db.prepare(`
+    INSERT OR IGNORE INTO official_reference_snapshots (
+      id, source_kind, filename, sha256, competencia, uf,
+      metadata_json, payload_json, imported_by, imported_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const stmtGetOfficialSnapshotBySha = db.prepare(
+    'SELECT id FROM official_reference_snapshots WHERE sha256 = ?'
+  );
+  const stmtListOfficialSnapshotsAll = db.prepare(`
+    SELECT id, source_kind, filename, sha256, competencia, uf, metadata_json, imported_by, imported_at
+    FROM official_reference_snapshots
+    ORDER BY imported_at DESC
+    LIMIT 100
+  `);
+  const stmtListOfficialSnapshotsByKind = db.prepare(`
+    SELECT id, source_kind, filename, sha256, competencia, uf, metadata_json, imported_by, imported_at
+    FROM official_reference_snapshots
+    WHERE source_kind = ?
+    ORDER BY imported_at DESC
+    LIMIT 100
+  `);
 
   const stmtUpsertSupplierQsa = db.prepare(`
     INSERT INTO supplier_qsa_cache (
@@ -1604,6 +1724,45 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
     listAllSupplierQsa() {
       const rows = stmtListAllSupplierQsa.all() as Array<Record<string, unknown>>;
       return rows.map(mapSupplierQsaRow);
+    },
+    saveOfficialSnapshot(snapshot) {
+      const existing = stmtGetOfficialSnapshotBySha.get(snapshot.sha256) as
+        | { id: string }
+        | undefined;
+      if (existing) {
+        return { alreadyExisted: true, id: existing.id };
+      }
+      stmtInsertOfficialSnapshot.run(
+        snapshot.id,
+        snapshot.sourceKind,
+        snapshot.filename,
+        snapshot.sha256,
+        snapshot.competencia,
+        snapshot.uf,
+        snapshot.metadataJson,
+        snapshot.payloadJson,
+        snapshot.importedBy,
+        new Date().toISOString()
+      );
+      return { alreadyExisted: false, id: snapshot.id };
+    },
+    listOfficialSnapshots(sourceKind) {
+      const rows = (
+        sourceKind
+          ? stmtListOfficialSnapshotsByKind.all(sourceKind)
+          : stmtListOfficialSnapshotsAll.all()
+      ) as Array<Record<string, unknown>>;
+      return rows.map((r) => ({
+        id: String(r.id),
+        sourceKind: String(r.source_kind) as 'siaps' | 'sinapi' | 'camara_personnel' | 'inep',
+        filename: String(r.filename),
+        sha256: String(r.sha256),
+        competencia: String(r.competencia),
+        uf: r.uf ? String(r.uf) : null,
+        metadataJson: String(r.metadata_json),
+        importedBy: String(r.imported_by),
+        importedAt: String(r.imported_at),
+      }));
     },
   };
 }

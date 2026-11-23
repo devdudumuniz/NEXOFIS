@@ -94,6 +94,58 @@ export function deriveMatrizCnpj(raw?: string | null): string | null {
 }
 
 /**
+ * Derives the full 14-character Matriz CNPJ (`<root8>0001<dv>`) from an 8-character CNPJ Básico
+ * (as returned by Receita Federal / BrasilAPI in QSA `cnpj_cpf_do_socio` for corporate shareholders).
+ */
+export function deriveMatrizCnpjFromRoot(rawRoot8?: string | null): string | null {
+  const clean = normalizeCnpj(rawRoot8);
+  if (!/^[0-9A-Z]{8}$/.test(clean)) return null;
+  if (/^([0-9])\1{7}$/.test(clean)) return null;
+  const base12 = `${clean}0001`;
+  const dv = computeCnpjCheckDigits(base12);
+  if (!dv) return null;
+  const full = `${base12}${dv}`;
+  return isValidCnpj(full) ? full : null;
+}
+
+/**
+ * Resolves a corporate shareholder's valid 14-character CNPJ from QSA fields:
+ * - Accepts an explicit valid 14-char `partnerCnpj` or unmasked 14-char `maskedDocument`
+ * - Reconstructs the Matriz CNPJ when RFB/BrasilAPI supplies an 8-digit CNPJ Básico (no asterisks)
+ *   for a corporate partner (Pessoa Jurídica / Holding).
+ * - Never matches masked CPFs (which contain `*`) or natural-person (`PF`) records.
+ */
+export function resolveCorporatePartnerCnpj(input: {
+  partnerCnpj?: string | null;
+  maskedDocument?: string | null;
+  partnerType?: 'PJ' | 'PF' | 'EXTERIOR';
+}): string | null {
+  if (input.partnerType === 'PF') return null;
+
+  if (input.partnerCnpj) {
+    const cleanExplicit = normalizeCnpj(input.partnerCnpj);
+    if (isCnpjFormat(cleanExplicit) && isValidCnpj(cleanExplicit)) {
+      return cleanExplicit;
+    }
+  }
+
+  const rawDoc = (input.maskedDocument ?? '').trim();
+  if (!rawDoc || rawDoc.includes('*')) return null;
+
+  const cleanDoc = normalizeCnpj(rawDoc);
+  if (isCnpjFormat(cleanDoc) && isValidCnpj(cleanDoc)) {
+    return cleanDoc;
+  }
+
+  // RFB / BrasilAPI frequently returns the 8-digit CNPJ Básico (root) for corporate partners (identificador_de_socio = 1)
+  if (/^\d{8}$/.test(cleanDoc)) {
+    return deriveMatrizCnpjFromRoot(cleanDoc);
+  }
+
+  return null;
+}
+
+/**
  * Checks whether a normalized CNPJ contains alphabetic characters (RFB 2026 alphanumeric format).
  */
 export function isAlphanumericCnpj(raw?: string | null): boolean {

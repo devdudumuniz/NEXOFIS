@@ -544,11 +544,17 @@ export function ForensicInvestigationTab({
               <span className="font-mono">{caseData?.evaluation.engineVersion ?? 'investigation-engine-2026.11'}</span>
               <span aria-hidden="true">·</span>
               {caseData?.chainVerification.valid &&
+              caseData.chainVerification.integrityStatus !== 'insufficient' &&
               caseData.chainVerification.factsDigestMatchesLedger !== false ? (
                 <span className="inline-flex items-center gap-1 text-emerald-700 dark:text-emerald-400 font-medium">
                   <ShieldCheck className="w-3.5 h-3.5" aria-hidden="true" />
                   Cadeia SHA-256 íntegra ({caseData.chainVerification.eventCount} evento
                   {caseData.chainVerification.eventCount === 1 ? '' : 's'})
+                </span>
+              ) : caseData?.chainVerification.integrityStatus === 'insufficient' ? (
+                <span className="inline-flex items-center gap-1 text-amber-700 dark:text-amber-400 font-semibold">
+                  <AlertTriangle className="w-3.5 h-3.5" aria-hidden="true" />
+                  Integridade insuficiente (digest ou versão esperada ausente — validação não presumida)
                 </span>
               ) : (
                 <span className="inline-flex items-center gap-1 text-red-700 dark:text-red-400 font-semibold">

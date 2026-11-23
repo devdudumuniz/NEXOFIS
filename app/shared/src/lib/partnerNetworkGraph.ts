@@ -1,5 +1,11 @@
 import type { ContractRecord, EvaluatedContract, RiskAssessment } from '../types/audit';
-import { formatCnpjValue, isCnpjFormat, isValidCnpj, normalizeCnpj } from './cnpj';
+import {
+  formatCnpjValue,
+  isCnpjFormat,
+  isValidCnpj,
+  normalizeCnpj,
+  resolveCorporatePartnerCnpj,
+} from './cnpj';
 
 export type PartnerNetworkQueryMode = 'auto' | 'company' | 'partner';
 export type PartnerMatchConfidence =
@@ -7,7 +13,11 @@ export type PartnerMatchConfidence =
   | 'candidate_nominal_match'
   | 'single_company';
 export type PartnerNetworkNodeType = 'partner' | 'company' | 'contract' | 'organ';
-export type PartnerNetworkEdgeRelation = 'SOCIO_DE' | 'CONTRATO_EMPRESA' | 'CONTRATADO_POR';
+export type PartnerNetworkEdgeRelation =
+  | 'SOCIO_DE'
+  | 'SOCIO_PJ_DE'
+  | 'CONTRATO_EMPRESA'
+  | 'CONTRATADO_POR';
 export type PartnerContractTenureOverlap =
   | 'during_observed_tenure'
   | 'before_entry_date'
@@ -19,6 +29,10 @@ export interface SupplierQsaShareholder {
   entryDate: string;
   maskedDocument?: string;
   ageRange?: string;
+  partnerType?: 'PJ' | 'PF' | 'EXTERIOR';
+  partnerCnpj?: string;
+  legalRepresentativeName?: string;
+  legalRepresentativeRole?: string;
 }
 
 export interface SupplierQsaRecord {
@@ -52,6 +66,8 @@ export interface PartnerNetworkNode {
   companyCount?: number;
   contractCount?: number;
   isSharedOrgan?: boolean;
+  isCorporateShareholder?: boolean;
+  ownershipDepth?: number;
   metadata: Record<string, string | number | boolean | null | undefined>;
 }
 
@@ -63,6 +79,16 @@ export interface PartnerNetworkEdge {
   label: string;
   confidence?: PartnerMatchConfidence;
   dashed?: boolean;
+  assertionState?: 'documented' | 'candidate' | 'contested' | 'dismissed';
+}
+
+export interface PartnerNetworkCorporateLinkSummary {
+  cnpj: string;
+  formattedCnpj: string;
+  legalName: string;
+  role: string;
+  entryDate: string;
+  legalRepresentativeName?: string;
 }
 
 export interface PartnerNetworkCompanySummary {
@@ -77,6 +103,10 @@ export interface PartnerNetworkCompanySummary {
   primaryCnaeDescription: string;
   shareCapital: number;
   isSeed: boolean;
+  isCorporateShareholder: boolean;
+  ownershipDepth: number;
+  corporateShareholderOf: PartnerNetworkCorporateLinkSummary[];
+  corporateShareholders: PartnerNetworkCorporateLinkSummary[];
   viaPartners: string[];
   partnerCount: number;
   contractCount: number;
@@ -164,6 +194,16 @@ export interface PartnerNetworkIndexCoverage {
   sourceCoverage?: PartnerNetworkSourceCoverageItem[];
 }
 
+export interface PartnerNetworkLayoutColumn {
+  id: string;
+  kind: 'partners' | 'corporate_layer' | 'companies' | 'contracts' | 'organs';
+  title: string;
+  x: number;
+  count: number;
+  totalCount: number;
+  layerRank?: number;
+}
+
 export interface PartnerNetworkPayload {
   query: string;
   normalizedQuery: string;
@@ -173,6 +213,8 @@ export interface PartnerNetworkPayload {
   seedType: 'company' | 'partner' | null;
   summary: {
     companyCount: number;
+    corporateShareholderCount: number;
+    maxOwnershipDepth: number;
     partnerCount: number;
     multiCompanyPartnerCount: number;
     candidateMultiCompanyPartnerCount: number;
@@ -196,6 +238,7 @@ export interface PartnerNetworkPayload {
   layout: {
     width: number;
     height: number;
+    columns: PartnerNetworkLayoutColumn[];
   };
   companies: PartnerNetworkCompanySummary[];
   partners: PartnerNetworkPartnerSummary[];
@@ -203,6 +246,34 @@ export interface PartnerNetworkPayload {
   sharedOrgans: PartnerNetworkSharedOrganAlert[];
   evaluatedContracts?: EvaluatedContract[];
   indexCoverage?: PartnerNetworkIndexCoverage;
+  expansionControl?: {
+    truncated: boolean;
+    truncationReasons: string[];
+    cancelled: boolean;
+    elapsedMs: number;
+    requestsUsed: number;
+    maxRequests: number;
+    maxDurationMs: number;
+    maxDepth: number;
+    maxCompanies: number;
+    page: number;
+    pageSize: number;
+    hasMore: boolean;
+  };
+  disambiguation?: {
+    requiresDisambiguation: boolean;
+    candidateCount: number;
+    snapshotCoverageDeclaration: string;
+    candidates: Array<{
+      candidateId: string;
+      displayName: string;
+      maskedDocuments: string[];
+      relatedCompanyCnpjs: string[];
+      relatedCompanyNames: string[];
+      matchConfidence: 'candidate_masked_cpf_and_name' | 'candidate_nominal_only';
+      disambiguationReason: string;
+    }>;
+  };
   methodologicalNotice: string;
 }
 
@@ -343,6 +414,14 @@ interface PartnerCluster {
   hasHomonymWarning: boolean;
 }
 
+interface CorporateLink {
+  parentCnpj: string;
+  childCnpj: string;
+  role: string;
+  entryDate: string;
+  legalRepresentativeName?: string;
+}
+
 function buildUnifiedIndex(
   contracts: Array<ContractRecord | EvaluatedContract>,
   qsaRecords: SupplierQsaRecord[]
@@ -350,6 +429,9 @@ function buildUnifiedIndex(
   companiesByCnpj: Map<string, UnifiedCompanyEntry>;
   partnerClusters: PartnerCluster[];
   partnersByCnpj: Map<string, PartnerCluster[]>;
+  corporateLinks: CorporateLink[];
+  corporateParentsByChild: Map<string, CorporateLink[]>;
+  corporateChildrenByParent: Map<string, CorporateLink[]>;
 } {
   const companiesByCnpj = new Map<string, UnifiedCompanyEntry>();
 
@@ -369,13 +451,24 @@ function buildUnifiedIndex(
       shareCapital: Number(qsa.shareCapital || 0),
       shareholders: (qsa.shareholders ?? [])
         .filter((s) => normalizePersonName(s.name).length >= 2)
-        .map((s) => ({
-          name: s.name.trim(),
-          role: s.role?.trim() || 'Sócio',
-          entryDate: s.entryDate?.trim() || '',
-          maskedDocument: normalizeMaskedDocument(s.maskedDocument) || undefined,
-          ageRange: s.ageRange,
-        })),
+        .map((s) => {
+          const resolvedCorpCnpj = resolveCorporatePartnerCnpj({
+            partnerCnpj: s.partnerCnpj,
+            maskedDocument: s.maskedDocument,
+            partnerType: s.partnerType,
+          });
+          return {
+            name: s.name.trim(),
+            role: s.role?.trim() || 'Sócio',
+            entryDate: s.entryDate?.trim() || '',
+            maskedDocument: normalizeMaskedDocument(s.maskedDocument) || undefined,
+            ageRange: s.ageRange,
+            partnerType: s.partnerType ?? (resolvedCorpCnpj ? 'PJ' : undefined),
+            partnerCnpj: resolvedCorpCnpj ?? undefined,
+            legalRepresentativeName: s.legalRepresentativeName?.trim() || undefined,
+            legalRepresentativeRole: s.legalRepresentativeRole?.trim() || undefined,
+          };
+        }),
       qsaSource: 'qsa_cache',
       contracts: [],
       contractsByDedupeKey: new Map(),
@@ -469,7 +562,13 @@ function buildUnifiedIndex(
     }
   }
 
-  // 3. Build identity-safe Partner Clusters (strict homonym safeguard)
+  // 3. Separate Corporate Shareholders (PJ/Holdings) into company-to-company ownership links
+  //    and Natural Persons (PF) into identity-safe Partner Clusters.
+  const corporateLinks: CorporateLink[] = [];
+  const corporateParentsByChild = new Map<string, CorporateLink[]>();
+  const corporateChildrenByParent = new Map<string, CorporateLink[]>();
+  const seenCorporateLinkKeys = new Set<string>();
+
   interface RawMention {
     cnpj: string;
     companyName: string;
@@ -481,12 +580,61 @@ function buildUnifiedIndex(
   }
 
   const mentionsByName = new Map<string, RawMention[]>();
-  for (const company of companiesByCnpj.values()) {
+  const initialCompanySnapshots = Array.from(companiesByCnpj.values());
+
+  for (const company of initialCompanySnapshots) {
     // Deduplicate same partner listed twice in the exact same company
     const seenInCompany = new Set<string>();
     for (const sh of company.shareholders) {
       const normName = normalizePersonName(sh.name);
       if (normName.length < 2) continue;
+
+      const corpCnpj = resolveCorporatePartnerCnpj({
+        partnerCnpj: sh.partnerCnpj,
+        maskedDocument: sh.maskedDocument,
+        partnerType: sh.partnerType,
+      });
+
+      if (corpCnpj && corpCnpj !== company.cnpj) {
+        // Ensure corporate shareholder (Holding / PJ) exists as a first-class company node
+        if (!companiesByCnpj.has(corpCnpj)) {
+          companiesByCnpj.set(corpCnpj, {
+            cnpj: corpCnpj,
+            legalName: sh.name.trim() || `CNPJ ${formatCnpjValue(corpCnpj)}`,
+            registrationStatus: 'DESCONHECIDA',
+            openingDate: '',
+            primaryCnaeCode: '',
+            primaryCnaeDescription: '',
+            municipality: '',
+            uf: '',
+            shareCapital: 0,
+            shareholders: [],
+            qsaSource: 'none',
+            contracts: [],
+            contractsByDedupeKey: new Map(),
+          });
+        }
+        const linkKey = `${corpCnpj}->${company.cnpj}`;
+        if (!seenCorporateLinkKeys.has(linkKey)) {
+          seenCorporateLinkKeys.add(linkKey);
+          const link: CorporateLink = {
+            parentCnpj: corpCnpj,
+            childCnpj: company.cnpj,
+            role: sh.role || 'Sócio PJ',
+            entryDate: sh.entryDate || '',
+            legalRepresentativeName: sh.legalRepresentativeName,
+          };
+          corporateLinks.push(link);
+          const pList = corporateParentsByChild.get(company.cnpj) ?? [];
+          pList.push(link);
+          corporateParentsByChild.set(company.cnpj, pList);
+          const cList = corporateChildrenByParent.get(corpCnpj) ?? [];
+          cList.push(link);
+          corporateChildrenByParent.set(corpCnpj, cList);
+        }
+        continue;
+      }
+
       const doc = normalizeMaskedDocument(sh.maskedDocument);
       const dedupeKey = `${normName}::${doc}`;
       if (seenInCompany.has(dedupeKey)) continue;
@@ -619,7 +767,14 @@ function buildUnifiedIndex(
     }
   }
 
-  return { companiesByCnpj, partnerClusters, partnersByCnpj };
+  return {
+    companiesByCnpj,
+    partnerClusters,
+    partnersByCnpj,
+    corporateLinks,
+    corporateParentsByChild,
+    corporateChildrenByParent,
+  };
 }
 
 function matchesAllTokens(haystack: string, tokens: string[]): boolean {
@@ -644,18 +799,27 @@ export function buildPartnerNetworkGraph(params: {
 }): PartnerNetworkPayload {
   const rawQuery = (params.query ?? '').trim();
   const requestedMode: PartnerNetworkQueryMode = params.mode ?? 'auto';
-  const maxVisualPartners = params.maxVisualPartners ?? 8;
-  const maxVisualCompanies = params.maxVisualCompanies ?? 8;
-  const maxVisualContracts = params.maxVisualContracts ?? 8;
+  const maxVisualPartners = params.maxVisualPartners ?? 12;
+  const maxVisualCompanies = params.maxVisualCompanies ?? 12;
+  const maxVisualContracts = params.maxVisualContracts ?? 10;
   const normalizedCnpjQuery = normalizeCnpj(rawQuery);
   const isCnpjQuery = isCnpjFormat(normalizedCnpjQuery);
   const normalizedTextQuery = normalizePersonName(rawQuery);
   const queryTokens = normalizedTextQuery.split(' ').filter((t) => t.length >= 2);
 
-  const { companiesByCnpj, partnerClusters, partnersByCnpj } = buildUnifiedIndex(
-    params.contracts,
-    params.qsaRecords
-  );
+  const {
+    companiesByCnpj,
+    partnerClusters,
+    partnersByCnpj,
+    corporateLinks,
+    corporateParentsByChild,
+    corporateChildrenByParent,
+  } = buildUnifiedIndex(params.contracts, params.qsaRecords);
+
+  const partnerById = new Map<string, PartnerCluster>();
+  for (const cluster of partnerClusters) {
+    partnerById.set(cluster.id, cluster);
+  }
 
   // Match candidates in both dimensions
   const matchedCompanyEntries: UnifiedCompanyEntry[] = [];
@@ -720,6 +884,35 @@ export function buildPartnerNetworkGraph(params: {
   const includedPartnerIds = new Set<string>();
   const viaPartnersByCnpj = new Map<string, Set<string>>();
 
+  // Cycle-safe recursive BFS expansion across corporate shareholders (PJ/Holdings),
+  // corporate subsidiaries, natural-person partners (PF), and affiliated companies
+  // until every reachable link in the ownership tree terminates (bounded for safety).
+  const MAX_TREE_COMPANIES = 40;
+  const MAX_TREE_PARTNERS = 60;
+  const companyQueue: string[] = [];
+  const partnerQueue: string[] = [];
+
+  const enqueueCompany = (cnpj: string, viaLabel?: string) => {
+    if (!companiesByCnpj.has(cnpj)) return;
+    if (viaLabel && !seedCompanyCnpjs.has(cnpj)) {
+      const via = viaPartnersByCnpj.get(cnpj) ?? new Set<string>();
+      via.add(viaLabel);
+      viaPartnersByCnpj.set(cnpj, via);
+    }
+    if (includedCompanyCnpjs.has(cnpj)) return;
+    if (includedCompanyCnpjs.size >= MAX_TREE_COMPANIES) return;
+    includedCompanyCnpjs.add(cnpj);
+    companyQueue.push(cnpj);
+  };
+
+  const enqueuePartner = (partnerId: string) => {
+    if (!partnerById.has(partnerId)) return;
+    if (includedPartnerIds.has(partnerId)) return;
+    if (includedPartnerIds.size >= MAX_TREE_PARTNERS) return;
+    includedPartnerIds.add(partnerId);
+    partnerQueue.push(partnerId);
+  };
+
   if (resolvedMode === 'company') {
     // Limit seed companies to top 5 most relevant if a broad company name was searched
     const sortedSeedCompanies = [...matchedCompanyEntries].sort((a, b) => {
@@ -731,24 +924,10 @@ export function buildPartnerNetworkGraph(params: {
 
     for (const seed of sortedSeedCompanies.slice(0, 5)) {
       seedCompanyCnpjs.add(seed.cnpj);
-      includedCompanyCnpjs.add(seed.cnpj);
-
-      const seedPartners = partnersByCnpj.get(seed.cnpj) ?? [];
-      for (const partner of seedPartners) {
-        includedPartnerIds.add(partner.id);
-        // Traverse 2nd hop: all other companies where this same partner participates
-        for (const otherCnpj of partner.companyCnpjs) {
-          includedCompanyCnpjs.add(otherCnpj);
-          if (!seedCompanyCnpjs.has(otherCnpj)) {
-            const via = viaPartnersByCnpj.get(otherCnpj) ?? new Set<string>();
-            via.add(partner.displayName);
-            viaPartnersByCnpj.set(otherCnpj, via);
-          }
-        }
-      }
+      enqueueCompany(seed.cnpj);
     }
   } else {
-    // Partner mode: find all matched partner clusters -> all their companies -> all contracts
+    // Partner mode: find all matched partner clusters -> all their companies -> full corporate tree
     const sortedSeedPartners = [...matchedPartnerClusters].sort((a, b) => {
       const aExact = a.normalizedName === normalizedTextQuery ? 1 : 0;
       const bExact = b.normalizedName === normalizedTextQuery ? 1 : 0;
@@ -758,20 +937,55 @@ export function buildPartnerNetworkGraph(params: {
 
     for (const partner of sortedSeedPartners.slice(0, 8)) {
       seedPartnerIds.add(partner.id);
-      includedPartnerIds.add(partner.id);
-      for (const cnpj of partner.companyCnpjs) {
-        includedCompanyCnpjs.add(cnpj);
-        const via = viaPartnersByCnpj.get(cnpj) ?? new Set<string>();
-        via.add(partner.displayName);
-        viaPartnersByCnpj.set(cnpj, via);
+      enqueuePartner(partner.id);
+    }
+  }
+
+  let companyCursor = 0;
+  let partnerCursor = 0;
+  while (companyCursor < companyQueue.length || partnerCursor < partnerQueue.length) {
+    while (companyCursor < companyQueue.length) {
+      const currentCnpj = companyQueue[companyCursor++];
+      const currentCompany = companiesByCnpj.get(currentCnpj);
+      if (!currentCompany) continue;
+
+      // 1. Scale UP the corporate ownership tree: holdings / corporate shareholders (PJ)
+      const parentLinks = corporateParentsByChild.get(currentCnpj) ?? [];
+      for (const link of parentLinks) {
+        enqueueCompany(link.parentCnpj, `Sócio PJ de ${currentCompany.legalName}`);
+      }
+
+      // 2. Scale DOWN the corporate ownership tree: other subsidiaries owned by this company/holding
+      const childLinks = corporateChildrenByParent.get(currentCnpj) ?? [];
+      for (const link of childLinks) {
+        enqueueCompany(link.childCnpj, `Participação via ${currentCompany.legalName}`);
+      }
+
+      // 3. Follow natural-person (PF) partners of this company/holding
+      const directPartners = partnersByCnpj.get(currentCnpj) ?? [];
+      for (const partner of directPartners) {
+        enqueuePartner(partner.id);
       }
     }
 
-    // Also include co-partners that link >= 2 of the discovered companies together
+    while (partnerCursor < partnerQueue.length) {
+      const currentPartnerId = partnerQueue[partnerCursor++];
+      const partner = partnerById.get(currentPartnerId);
+      if (!partner) continue;
+
+      // Traverse all other companies where this PF partner participates
+      for (const otherCnpj of partner.companyCnpjs) {
+        enqueueCompany(otherCnpj, partner.displayName);
+      }
+    }
+  }
+
+  // Also include any co-partners that bridge >= 2 discovered companies in partner mode
+  if (resolvedMode === 'partner') {
     for (const cluster of partnerClusters) {
       if (includedPartnerIds.has(cluster.id)) continue;
       const overlapCount = cluster.companyCnpjs.filter((c) => includedCompanyCnpjs.has(c)).length;
-      if (overlapCount >= 2) {
+      if (overlapCount >= 2 && includedPartnerIds.size < MAX_TREE_PARTNERS) {
         includedPartnerIds.add(cluster.id);
       }
     }
@@ -782,6 +996,31 @@ export function buildPartnerNetworkGraph(params: {
     .filter((c): c is UnifiedCompanyEntry => Boolean(c));
 
   const selectedPartners = partnerClusters.filter((p) => includedPartnerIds.has(p.id));
+
+  // Filter corporate links strictly to those inside the discovered connected tree
+  const activeCorporateLinks = corporateLinks.filter(
+    (link) => includedCompanyCnpjs.has(link.parentCnpj) && includedCompanyCnpjs.has(link.childCnpj)
+  );
+
+  // Cycle-safe bounded longest-path depth from operating/leaf companies up to top holdings
+  const ownershipDepthByCnpj = new Map<string, number>();
+  for (const cnpj of includedCompanyCnpjs) {
+    ownershipDepthByCnpj.set(cnpj, 0);
+  }
+  const maxRelaxPasses = Math.min(includedCompanyCnpjs.size, 5);
+  for (let pass = 0; pass < maxRelaxPasses; pass += 1) {
+    let changed = false;
+    for (const link of activeCorporateLinks) {
+      const childDepth = ownershipDepthByCnpj.get(link.childCnpj) ?? 0;
+      const parentDepth = ownershipDepthByCnpj.get(link.parentCnpj) ?? 0;
+      const nextParentDepth = Math.min(5, childDepth + 1);
+      if (nextParentDepth > parentDepth) {
+        ownershipDepthByCnpj.set(link.parentCnpj, nextParentDepth);
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
 
   // Build contract summaries across every company in the network (deduplicated per M03)
   const allContractSummaries: PartnerNetworkContractSummary[] = [];
@@ -829,13 +1068,17 @@ export function buildPartnerNetworkGraph(params: {
     return b.updatedValue - a.updatedValue;
   });
 
-  // Build company summaries
+  // Build company summaries (including corporate shareholder / holding hierarchy)
   const companySummaries: PartnerNetworkCompanySummary[] = selectedCompanies
     .map((company) => {
       const cList = contractsByCompany.get(company.cnpj) ?? [];
       const totalContractValue = cList.reduce((acc, c) => acc + c.updatedValue, 0);
       const scores = cList.map((c) => c.riskScore).filter((s): s is number => s !== null);
       const distinctOrgans = Array.from(new Set(cList.map((c) => c.entityName).filter(Boolean)));
+      const childLinks = activeCorporateLinks.filter((l) => l.parentCnpj === company.cnpj);
+      const parentLinks = activeCorporateLinks.filter((l) => l.childCnpj === company.cnpj);
+      const ownershipDepth = ownershipDepthByCnpj.get(company.cnpj) ?? 0;
+
       return {
         cnpj: company.cnpj,
         formattedCnpj: formatCnpjValue(company.cnpj),
@@ -848,8 +1091,26 @@ export function buildPartnerNetworkGraph(params: {
         primaryCnaeDescription: company.primaryCnaeDescription,
         shareCapital: company.shareCapital,
         isSeed: seedCompanyCnpjs.has(company.cnpj),
+        isCorporateShareholder: childLinks.length > 0,
+        ownershipDepth,
+        corporateShareholderOf: childLinks.map((l) => ({
+          cnpj: l.childCnpj,
+          formattedCnpj: formatCnpjValue(l.childCnpj),
+          legalName: companiesByCnpj.get(l.childCnpj)?.legalName ?? l.childCnpj,
+          role: l.role,
+          entryDate: l.entryDate,
+          legalRepresentativeName: l.legalRepresentativeName,
+        })),
+        corporateShareholders: parentLinks.map((l) => ({
+          cnpj: l.parentCnpj,
+          formattedCnpj: formatCnpjValue(l.parentCnpj),
+          legalName: companiesByCnpj.get(l.parentCnpj)?.legalName ?? l.parentCnpj,
+          role: l.role,
+          entryDate: l.entryDate,
+          legalRepresentativeName: l.legalRepresentativeName,
+        })),
         viaPartners: Array.from(viaPartnersByCnpj.get(company.cnpj) ?? []),
-        partnerCount: (partnersByCnpj.get(company.cnpj) ?? []).length,
+        partnerCount: (partnersByCnpj.get(company.cnpj) ?? []).length + parentLinks.length,
         contractCount: cList.length,
         totalContractValue,
         maxRiskScore: scores.length > 0 ? Math.max(...scores) : null,
@@ -859,6 +1120,9 @@ export function buildPartnerNetworkGraph(params: {
     })
     .sort((a, b) => {
       if (a.isSeed !== b.isSeed) return a.isSeed ? -1 : 1;
+      if (a.isCorporateShareholder !== b.isCorporateShareholder) {
+        return a.isCorporateShareholder ? -1 : 1;
+      }
       if (b.contractCount !== a.contractCount) return b.contractCount - a.contractCount;
       return b.totalContractValue - a.totalContractValue;
     });
@@ -984,8 +1248,8 @@ export function buildPartnerNetworkGraph(params: {
   sharedOrgans.sort((a, b) => b.totalValue - a.totalValue);
 
   // =========================================================
-  // DETERMINISTIC LAYERED SVG LAYOUT (ZERO OVERLAP & LEGIBLE SCALE)
-  // Columns: Partners (x=150) -> Companies (x=465) -> Contracts (x=790) -> Organs (x=1100)
+  // DETERMINISTIC MULTI-LEVEL HIERARCHICAL SVG LAYOUT
+  // Columns: Sócios PF -> [Holdings / Sócios PJ (Nível N..1)] -> Empresas -> Contratos -> Órgãos
   // =========================================================
   const visualPartners = partnerSummaries.slice(0, maxVisualPartners);
   const visualPartnersTruncated = partnerSummaries.length > visualPartners.length;
@@ -1009,19 +1273,108 @@ export function buildPartnerNetworkGraph(params: {
       }
       return b.totalValue - a.totalValue;
     });
-  const visualOrganEntries = matchingOrganBuckets.slice(0, 8);
+  const visualOrganEntries = matchingOrganBuckets.slice(0, 10);
   const visualOrgansTruncated = organBuckets.size > visualOrganEntries.length;
 
+  // Group visual companies by corporate ownership depth (0 = operating companies, >= 1 = Holdings / Sócios PJ)
+  const companiesByDepth = new Map<number, PartnerNetworkCompanySummary[]>();
+  let maxVisualOwnershipDepth = 0;
+  for (const comp of visualCompanies) {
+    const d = comp.ownershipDepth;
+    if (d > maxVisualOwnershipDepth) maxVisualOwnershipDepth = d;
+    const list = companiesByDepth.get(d) ?? [];
+    list.push(comp);
+    companiesByDepth.set(d, list);
+  }
+
+  const COL_START_X = 150;
+  const COL_PITCH_X = 315;
+  const layoutColumns: PartnerNetworkLayoutColumn[] = [];
+  let nextColIndex = 0;
+
+  // Column 0: Natural-Person Partners (Sócios PF)
+  const partnersX = COL_START_X + nextColIndex * COL_PITCH_X;
+  layoutColumns.push({
+    id: 'col:partners',
+    kind: 'partners',
+    title: maxVisualOwnershipDepth > 0 ? 'Sócios PF' : 'Sócios',
+    x: partnersX,
+    count: visualPartners.length,
+    totalCount: partnerSummaries.length,
+  });
+  nextColIndex += 1;
+
+  // Corporate Shareholder / Holding Tiers (highest depth on left -> depth 1 -> operating companies depth 0)
+  const xByCompanyDepth = new Map<number, number>();
+  for (let depth = maxVisualOwnershipDepth; depth >= 1; depth -= 1) {
+    const tierCompanies = companiesByDepth.get(depth) ?? [];
+    if (tierCompanies.length === 0) continue;
+    const colX = COL_START_X + nextColIndex * COL_PITCH_X;
+    xByCompanyDepth.set(depth, colX);
+    layoutColumns.push({
+      id: `col:holding:${depth}`,
+      kind: 'corporate_layer',
+      title: maxVisualOwnershipDepth > 1 ? `Holdings / PJ (N${depth})` : 'Holdings / Sócios PJ',
+      x: colX,
+      count: tierCompanies.length,
+      totalCount: companySummaries.filter((c) => c.ownershipDepth === depth).length,
+      layerRank: depth,
+    });
+    nextColIndex += 1;
+  }
+
+  // Operating / Target Companies (depth 0)
+  const operatingCompanies = companiesByDepth.get(0) ?? [];
+  const operatingX = COL_START_X + nextColIndex * COL_PITCH_X;
+  xByCompanyDepth.set(0, operatingX);
+  layoutColumns.push({
+    id: 'col:companies',
+    kind: 'companies',
+    title: 'Empresas',
+    x: operatingX,
+    count: operatingCompanies.length,
+    totalCount: companySummaries.filter((c) => c.ownershipDepth === 0).length,
+    layerRank: 0,
+  });
+  nextColIndex += 1;
+
+  // Contracts Column
+  const contractsX = COL_START_X + nextColIndex * COL_PITCH_X;
+  layoutColumns.push({
+    id: 'col:contracts',
+    kind: 'contracts',
+    title: 'Contratos',
+    x: contractsX,
+    count: visualContracts.length,
+    totalCount: allContractSummaries.length,
+  });
+  nextColIndex += 1;
+
+  // Public Organs Column
+  const organsX = COL_START_X + nextColIndex * COL_PITCH_X;
+  layoutColumns.push({
+    id: 'col:organs',
+    kind: 'organs',
+    title: 'Órgãos',
+    x: organsX,
+    count: visualOrganEntries.length,
+    totalCount: organBuckets.size,
+  });
+
+  const maxTierCompanyRows = Array.from(companiesByDepth.values()).reduce(
+    (max, list) => Math.max(max, list.length),
+    0
+  );
   const maxRows = Math.max(
     visualPartners.length,
-    visualCompanies.length,
+    maxTierCompanyRows,
     visualContracts.length,
     visualOrganEntries.length,
     1
   );
-  const rowPitch = 74;
-  const verticalPadding = 60;
-  const layoutWidth = 1240;
+  const rowPitch = 78;
+  const verticalPadding = 64;
+  const layoutWidth = organsX + 160;
   const layoutHeight = Math.max(460, maxRows * rowPitch + verticalPadding * 2);
 
   const computeColumnY = (index: number, count: number): number => {
@@ -1034,12 +1387,12 @@ export function buildPartnerNetworkGraph(params: {
   const nodes: PartnerNetworkNode[] = [];
   const edges: PartnerNetworkEdge[] = [];
 
-  // Column 0: Partners
+  // Partners Nodes
   visualPartners.forEach((p, idx) => {
     nodes.push({
       id: p.id,
       type: 'partner',
-      label: truncateLabel(p.displayName, 26),
+      label: truncateLabel(p.displayName, 24),
       subtitle:
         p.companyCount >= 2
           ? `${p.companyCount} empresas · ${
@@ -1048,7 +1401,7 @@ export function buildPartnerNetworkGraph(params: {
                 : 'Candidato nominal'
             }`
           : `${p.roles[0]?.role ?? 'Sócio'}${p.maskedDocument ? ` · ${p.maskedDocument}` : ''}`,
-      x: 150,
+      x: partnersX,
       y: computeColumnY(idx, visualPartners.length),
       isSeed: p.isSeed,
       confidence: p.confidence,
@@ -1067,41 +1420,52 @@ export function buildPartnerNetworkGraph(params: {
     });
   });
 
-  // Column 1: Companies
-  visualCompanies.forEach((c, idx) => {
-    nodes.push({
-      id: `company:${c.cnpj}`,
-      type: 'company',
-      label: truncateLabel(c.legalName, 28),
-      subtitle: `${c.formattedCnpj} · ${c.contractCount} contrato(s)`,
-      x: 465,
-      y: computeColumnY(idx, visualCompanies.length),
-      isSeed: c.isSeed,
-      cnpj: c.cnpj,
-      contractCount: c.contractCount,
-      value: c.totalContractValue,
-      riskScore: c.maxRiskScore ?? undefined,
-      metadata: {
-        legalName: c.legalName,
-        formattedCnpj: c.formattedCnpj,
-        registrationStatus: c.registrationStatus,
-        openingDate: c.openingDate,
-        municipality: c.municipality,
-        uf: c.uf,
-        qsaSource: c.qsaSource,
-        viaPartners: c.viaPartners.join(', '),
-      },
+  // Company Nodes (across all corporate holding depths + operating companies)
+  for (let depth = maxVisualOwnershipDepth; depth >= 0; depth -= 1) {
+    const tierCompanies = companiesByDepth.get(depth) ?? [];
+    const colX = xByCompanyDepth.get(depth) ?? operatingX;
+    tierCompanies.forEach((c, idx) => {
+      const subtitleText = c.isCorporateShareholder
+        ? `${c.formattedCnpj} · Sócia PJ${c.contractCount > 0 ? ` · ${c.contractCount} ct.` : ''}`
+        : `${c.formattedCnpj} · ${c.contractCount} contrato(s)`;
+      nodes.push({
+        id: `company:${c.cnpj}`,
+        type: 'company',
+        label: truncateLabel(c.legalName, 25),
+        subtitle: subtitleText,
+        x: colX,
+        y: computeColumnY(idx, tierCompanies.length),
+        isSeed: c.isSeed,
+        cnpj: c.cnpj,
+        contractCount: c.contractCount,
+        value: c.totalContractValue,
+        riskScore: c.maxRiskScore ?? undefined,
+        isCorporateShareholder: c.isCorporateShareholder,
+        ownershipDepth: c.ownershipDepth,
+        metadata: {
+          legalName: c.legalName,
+          formattedCnpj: c.formattedCnpj,
+          registrationStatus: c.registrationStatus,
+          openingDate: c.openingDate,
+          municipality: c.municipality,
+          uf: c.uf,
+          qsaSource: c.qsaSource,
+          isCorporateShareholder: c.isCorporateShareholder,
+          ownershipDepth: c.ownershipDepth,
+          viaPartners: c.viaPartners.join(', '),
+        },
+      });
     });
-  });
+  }
 
-  // Column 2: Contracts
+  // Contract Nodes
   visualContracts.forEach((ct, idx) => {
     nodes.push({
       id: `contract:${ct.contractId}`,
       type: 'contract',
-      label: truncateLabel(`Contrato ${ct.contractNumber}`, 26),
+      label: truncateLabel(`Contrato ${ct.contractNumber}`, 24),
       subtitle: `${truncateLabel(ct.entityName, 24)}`,
-      x: 790,
+      x: contractsX,
       y: computeColumnY(idx, visualContracts.length),
       isSeed: false,
       contractId: ct.contractId,
@@ -1122,17 +1486,17 @@ export function buildPartnerNetworkGraph(params: {
     });
   });
 
-  // Column 3: Public Organs
+  // Public Organ Nodes
   visualOrganEntries.forEach((org, idx) => {
     const isShared = org.companyCnpjs.size >= 2;
     nodes.push({
       id: `organ:${org.organKey}`,
       type: 'organ',
-      label: truncateLabel(org.organName, 26),
+      label: truncateLabel(org.organName, 24),
       subtitle: isShared
         ? `${org.companyCnpjs.size} empresas da rede · ${org.contractCount} contrato(s)`
         : `${org.municipalityName || 'Órgão público'} · ${org.contractCount} contrato(s)`,
-      x: 1100,
+      x: organsX,
       y: computeColumnY(idx, visualOrganEntries.length),
       isSeed: false,
       companyCount: org.companyCnpjs.size,
@@ -1150,7 +1514,7 @@ export function buildPartnerNetworkGraph(params: {
     });
   });
 
-  // Edges: Partner -> Company (only for visible partner/company nodes)
+  // Edges: Partner (PF) -> Company (operating OR holding)
   const visualOrganIds = new Set(visualOrganEntries.map((o) => `organ:${o.organKey}`));
   for (const p of visualPartners) {
     for (const cnpj of p.companyCnpjs) {
@@ -1166,6 +1530,18 @@ export function buildPartnerNetworkGraph(params: {
         dashed: p.confidence === 'candidate_nominal_match',
       });
     }
+  }
+
+  // Edges: Corporate Shareholder (PJ / Holding) -> Owned Company
+  for (const link of activeCorporateLinks) {
+    if (!visualCompanySet.has(link.parentCnpj) || !visualCompanySet.has(link.childCnpj)) continue;
+    edges.push({
+      id: `edge:company:${link.parentCnpj}->company:${link.childCnpj}`,
+      source: `company:${link.parentCnpj}`,
+      target: `company:${link.childCnpj}`,
+      relation: 'SOCIO_PJ_DE',
+      label: link.role || 'Sócio PJ',
+    });
   }
 
   // Edges: Company -> Contract and Contract -> Organ
@@ -1212,6 +1588,11 @@ export function buildPartnerNetworkGraph(params: {
 
   const totalContractValue = allContractSummaries.reduce((acc, c) => acc + c.updatedValue, 0);
   const candidateMultiCount = partnerSummaries.filter((p) => p.companyCount >= 2).length;
+  const corporateShareholderCount = companySummaries.filter((c) => c.isCorporateShareholder).length;
+  const maxOwnershipDepth = companySummaries.reduce(
+    (max, c) => Math.max(max, c.ownershipDepth),
+    0
+  );
 
   return {
     query: rawQuery,
@@ -1222,6 +1603,8 @@ export function buildPartnerNetworkGraph(params: {
     seedType,
     summary: {
       companyCount: companySummaries.length,
+      corporateShareholderCount,
+      maxOwnershipDepth,
       partnerCount: partnerSummaries.length,
       multiCompanyPartnerCount: candidateMultiCount,
       candidateMultiCompanyPartnerCount: candidateMultiCount,
@@ -1245,6 +1628,7 @@ export function buildPartnerNetworkGraph(params: {
     layout: {
       width: layoutWidth,
       height: layoutHeight,
+      columns: layoutColumns,
     },
     companies: companySummaries,
     partners: partnerSummaries,

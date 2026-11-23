@@ -5,9 +5,10 @@ import path from 'path';
 import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
-  const frontendRoot = path.resolve(__dirname, 'app/frontend');
-  const publicDir = path.resolve(__dirname, 'public');
-  const distDir = path.resolve(__dirname, 'dist');
+  const rootDir = import.meta.dirname;
+  const frontendRoot = path.resolve(rootDir, 'app/frontend');
+  const publicDir = path.resolve(rootDir, 'public');
+  const distDir = path.resolve(rootDir, 'dist');
 
   return {
     root: frontendRoot,
@@ -38,8 +39,8 @@ export default defineConfig(() => {
     ],
     resolve: {
       alias: {
-        '@nexofis/shared': path.resolve(__dirname, 'app/shared/src'),
-        '@nexofis/backend': path.resolve(__dirname, 'app/backend/src'),
+        '@nexofis/shared': path.resolve(rootDir, 'app/shared/src'),
+        '@nexofis/backend': path.resolve(rootDir, 'app/backend/src'),
         '@': path.resolve(frontendRoot, 'src'),
       },
     },

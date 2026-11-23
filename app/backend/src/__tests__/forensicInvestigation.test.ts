@@ -519,7 +519,7 @@ describe('Persistência SQLite v3, Append-Only, Concorrência Otimista e Isolame
     const store = createNexofisStore(dbPath);
 
     try {
-      assert.equal(store.getSchemaVersion(), 4);
+      assert.equal(store.getSchemaVersion(), 5);
 
       const initialized = store.getOrCreateInvestigationCase(BASE_CONTRACT.id, TEST_ACTOR);
       assert.equal(initialized.factSet.version, 1);
