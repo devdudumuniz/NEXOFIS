@@ -5,12 +5,21 @@ import path from 'path';
 import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
+  const frontendRoot = path.resolve(__dirname, 'app/frontend');
+  const publicDir = path.resolve(__dirname, 'public');
+  const distDir = path.resolve(__dirname, 'dist');
+
   return {
+    root: frontendRoot,
+    publicDir,
+    build: {
+      outDir: distDir,
+      emptyOutDir: true,
+    },
     plugins: [
       react(),
       tailwindcss(),
-      // Copies src/assets into dist/ so root-relative URLs like
-      // "/src/assets/images/..." (e.g. generate_image output) still resolve
+      // Copies app/frontend/src/assets into dist/ so root-relative URLs still resolve
       // in production builds. Do not remove.
       {
         name: 'copy-unbundled-src-assets',
@@ -19,8 +28,7 @@ export default defineConfig(() => {
           if (error) {
             return;
           }
-          const distDir = path.resolve(__dirname, 'dist');
-          const srcAssets = path.resolve(__dirname, 'src/assets');
+          const srcAssets = path.resolve(frontendRoot, 'src/assets');
           const distAssets = path.resolve(distDir, 'src/assets');
           if (fs.existsSync(distDir) && fs.existsSync(srcAssets)) {
             fs.cpSync(srcAssets, distAssets, {recursive: true, force: true});
@@ -30,7 +38,9 @@ export default defineConfig(() => {
     ],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        '@nexofis/shared': path.resolve(__dirname, 'app/shared/src'),
+        '@nexofis/backend': path.resolve(__dirname, 'app/backend/src'),
+        '@': path.resolve(frontendRoot, 'src'),
       },
     },
     server: {

@@ -4,14 +4,19 @@
   "version": "0.1.0",
   "license": "AGPL-3.0-only",
   "type": "module",
+  "packageManager": "pnpm@10.12.1",
   "scripts": {
-    "dev": "tsx server.ts",
+    "dev": "tsx app/api/src/server.ts",
     "start": "node server.ts",
     "build": "vite build",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test": "node --import tsx --test src/lib/*.test.ts"
+    "test": "node --import tsx --test app/shared/src/lib/*.test.ts app/frontend/src/lib/*.test.ts app/backend/src/__tests__/*.test.ts",
+    "test:shared": "pnpm --filter @nexofis/shared test",
+    "test:frontend": "pnpm --filter @nexofis/frontend test",
+    "test:backend": "pnpm --filter @nexofis/backend test",
+    "smoke": "tsx scripts/smoke-api.ts"
   },
   "dependencies": {
     "@google/genai": "^3.6.1",

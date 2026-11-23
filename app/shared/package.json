@@ -1,0 +1,15 @@
+{
+  "name": "@nexofis/shared",
+  "version": "0.1.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "exports": {
+    "./types/*": "./src/types/*.ts",
+    "./lib/*": "./src/lib/*.ts"
+  },
+  "scripts": {
+    "lint": "tsc --noEmit -p ../../tsconfig.json",
+    "test": "node --import tsx --test src/lib/*.test.ts"
+  }
+}

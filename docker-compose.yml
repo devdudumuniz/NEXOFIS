@@ -56,7 +56,7 @@ services:
 
   paddleocr-worker:
     build:
-      context: ./worker
+      context: ./app/worker
       dockerfile: Dockerfile
     container_name: nexofis-paddleocr
     profiles: ["full-ocr"]
@@ -88,7 +88,7 @@ services:
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - nexofis_pgdata:/var/lib/postgresql/data
-      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+      - ./app/backend/db/migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-nexofis} -d ${POSTGRES_DB:-nexofis}"]
       interval: 10s

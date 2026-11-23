@@ -123,7 +123,7 @@ try {
     counts[t.name] = Number(row.cnt);
   }
 
-  // Verify investigation_events SHA-256 hash chain per contract_id if v3 table exists
+  // Verify investigation_events SHA-256 hash chain and facts snapshot digest binding
   if (tableNames.has('investigation_events')) {
     const contracts = db
       .prepare('SELECT DISTINCT contract_id FROM investigation_events')
@@ -140,6 +140,8 @@ try {
         )
         .all(c.contract_id);
       let expectedPrev = 'GENESIS';
+      let latestFactsDigest = null;
+      let latestFactsVersion = null;
       for (const ev of events) {
         if (ev.prev_hash !== expectedPrev) {
           throw new Error(`Cadeia de eventos corrompida (prev_hash) em ${c.contract_id} seq #${ev.seq}`);
@@ -160,44 +162,82 @@ try {
         if (recomputed !== ev.event_hash) {
           throw new Error(`Cadeia de eventos corrompida (event_hash) em ${c.contract_id} seq #${ev.seq}`);
         }
+        if (ev.event_type === 'CASE_INITIALIZED' || ev.event_type === 'FACTS_UPDATED') {
+          try {
+            const parsedPayload = JSON.parse(String(ev.payload_json || '{}'));
+            if (typeof parsedPayload.factsSnapshotDigest === 'string' && parsedPayload.factsSnapshotDigest) {
+              latestFactsDigest = parsedPayload.factsSnapshotDigest;
+              latestFactsVersion = Number(ev.facts_version);
+            }
+          } catch {
+            // ignore legacy malformed payload
+          }
+        }
         expectedPrev = ev.event_hash;
         totalChecked += 1;
       }
+
+      if (latestFactsDigest && tableNames.has('investigation_cases')) {
+        const invCase = db
+          .prepare('SELECT facts_version, facts_json FROM investigation_cases WHERE contract_id = ?')
+          .get(c.contract_id);
+        if (!invCase) {
+          throw new Error(`Caso ausente em investigation_cases para ${c.contract_id}.`);
+        }
+        const parsedFacts = JSON.parse(String(invCase.facts_json));
+        const actualDigest = crypto.createHash('sha256').update(canonicalStringify(parsedFacts)).digest('hex');
+        if (Number(invCase.facts_version) !== latestFactsVersion || actualDigest !== latestFactsDigest) {
+          throw new Error(
+            `Adulteração detectada em investigation_cases.facts_json para ${c.contract_id}: digest não coincide com o livro-razão.`
+          );
+        }
+      }
     }
-    console.log(`Cadeia SHA-256 de investigation_events íntegra (${totalChecked} eventos verificados).`);
+    console.log(`Cadeia SHA-256 e vínculo facts_json de investigation_events íntegros (${totalChecked} eventos verificados).`);
   }
 
-  // Verify staged private_evidence binaries against SQLite metadata if provided
-  if (privDir && tableNames.has('investigation_private_evidence')) {
-    const resolvedPriv = path.resolve(privDir);
+  // F05: ALWAYS enforce private_evidence integrity whenever investigation_private_evidence has rows!
+  if (tableNames.has('investigation_private_evidence')) {
     const rows = db
       .prepare('SELECT id, sha256, size_bytes, export_filename FROM investigation_private_evidence')
       .all();
-    for (const row of rows) {
-      const sha = String(row.sha256).toLowerCase();
-      if (!/^[a-f0-9]{64}$/.test(sha)) {
-        throw new Error(`SHA-256 inválido na tabela investigation_private_evidence (${row.id})`);
+    if (rows.length > 0) {
+      if (!privDir || !fs.existsSync(privDir)) {
+        throw new Error(
+          `Backup incompleto: banco referencia ${rows.length} evidência(s) privada(s), mas o arquivo .private_evidence.tar.gz / diretório private_evidence está ausente.`
+        );
       }
-      const absPath = path.resolve(resolvedPriv, sha.slice(0, 2), sha);
-      if (!absPath.startsWith(resolvedPriv + path.sep)) {
-        throw new Error(`Caminho fora do diretório private_evidence confinado: ${absPath}`);
+      const resolvedPriv = fs.realpathSync(path.resolve(privDir));
+      for (const row of rows) {
+        const sha = String(row.sha256).toLowerCase();
+        if (!/^[a-f0-9]{64}$/.test(sha)) {
+          throw new Error(`SHA-256 inválido na tabela investigation_private_evidence (${row.id})`);
+        }
+        const absPath = path.resolve(resolvedPriv, sha.slice(0, 2), sha);
+        if (!absPath.startsWith(resolvedPriv + path.sep)) {
+          throw new Error(`Caminho fora do diretório private_evidence confinado: ${absPath}`);
+        }
+        if (!fs.existsSync(absPath)) {
+          throw new Error(`Evidência privada ausente no backup: ${row.export_filename} (${sha})`);
+        }
+        const lstat = fs.lstatSync(absPath);
+        if (lstat.isSymbolicLink()) {
+          throw new Error(`Symlink proibido em private_evidence: ${row.export_filename}`);
+        }
+        if (lstat.size > MAX_PRIVATE_EVIDENCE_BYTES) {
+          throw new Error(`Evidência privada excede 1 MiB: ${row.export_filename} (${lstat.size} bytes)`);
+        }
+        const bytes = fs.readFileSync(absPath);
+        if (bytes.length !== Number(row.size_bytes)) {
+          throw new Error(`Tamanho divergente para evidência privada ${row.export_filename}`);
+        }
+        const actualSha = crypto.createHash('sha256').update(bytes).digest('hex');
+        if (actualSha !== sha) {
+          throw new Error(`SHA-256 divergente para evidência privada ${row.export_filename}`);
+        }
       }
-      if (!fs.existsSync(absPath)) {
-        throw new Error(`Evidência privada ausente no backup: ${row.export_filename} (${sha})`);
-      }
-      const bytes = fs.readFileSync(absPath);
-      if (bytes.length > MAX_PRIVATE_EVIDENCE_BYTES) {
-        throw new Error(`Evidência privada excede 1 MiB: ${row.export_filename} (${bytes.length} bytes)`);
-      }
-      if (bytes.length !== Number(row.size_bytes)) {
-        throw new Error(`Tamanho divergente para evidência privada ${row.export_filename}`);
-      }
-      const actualSha = crypto.createHash('sha256').update(bytes).digest('hex');
-      if (actualSha !== sha) {
-        throw new Error(`SHA-256 divergente para evidência privada ${row.export_filename}`);
-      }
+      console.log(`Evidências privadas verificadas (${rows.length} arquivos SHA-256 + limite 1 MiB OK).`);
     }
-    console.log(`Evidências privadas verificadas (${rows.length} arquivos SHA-256 + limite 1 MiB OK).`);
   }
 
   console.log(`Integridade verificada (ok): ${JSON.stringify(counts)}`);
@@ -264,8 +304,45 @@ case "$ACTION" in
     mkdir -p "$DEST_DIR"
 
     STAGE_DIR="$(mktemp -d)"
-    trap 'rm -rf "$STAGE_DIR"' EXIT
+    STAGED_DB="${DEST}.restore-staged.$$"
+    PRE_DB_BAK="${DEST}.pre-restore-${TIMESTAMP}.bak"
+    OBJ_PREV="$DEST_DIR/objects.restore-prev.$$"
+    PRIV_PREV="$DEST_DIR/private_evidence.restore-prev.$$"
+    SWAPPED_DB=0
+    SWAPPED_OBJ=0
+    SWAPPED_PRIV=0
 
+    rollback_restore() {
+      local exit_code=$?
+      if [ "$exit_code" -ne 0 ]; then
+        echo "ERRO durante a restauração — revertendo alterações no destino..." >&2
+        if [ "$SWAPPED_PRIV" -eq 1 ]; then
+          rm -rf "$DEST_DIR/private_evidence"
+          if [ -d "$PRIV_PREV" ]; then
+            mv "$PRIV_PREV" "$DEST_DIR/private_evidence"
+          fi
+        fi
+        if [ "$SWAPPED_OBJ" -eq 1 ]; then
+          rm -rf "$DEST_DIR/objects"
+          if [ -d "$OBJ_PREV" ]; then
+            mv "$OBJ_PREV" "$DEST_DIR/objects"
+          fi
+        fi
+        if [ "$SWAPPED_DB" -eq 1 ]; then
+          rm -f "${DEST}-wal" "${DEST}-shm"
+          if [ -f "$PRE_DB_BAK" ]; then
+            cp "$PRE_DB_BAK" "$DEST"
+          else
+            rm -f "$DEST"
+          fi
+        fi
+      fi
+      rm -f "$STAGED_DB"
+      rm -rf "$STAGE_DIR"
+    }
+    trap rollback_restore EXIT
+
+    # Phase 1: Validate ALL backup artifacts in staging BEFORE touching destination DB or directories
     if [ -f "${TARGET}.objects.tar.gz" ]; then
       verify_tar_safety "${TARGET}.objects.tar.gz" "objects"
       tar -xzf "${TARGET}.objects.tar.gz" -C "$STAGE_DIR"
@@ -278,40 +355,44 @@ case "$ACTION" in
       PRIV_STAGE="$STAGE_DIR/private_evidence"
     fi
 
-    echo "Verificando integridade do backup (SQLite, cadeia de eventos e evidências privadas) antes da restauração..."
+    echo "Verificando integridade completa do backup em staging (SQLite, cadeia de eventos, facts_json e evidências privadas) antes de alterar o destino..."
     run_node_sqlite_verify "$TARGET" "$PRIV_STAGE"
 
-    STAGED="${DEST}.restore-staged.$$"
-    cp "$TARGET" "$STAGED"
+    # Phase 2: Snapshot existing destination state & stage DB file
+    cp "$TARGET" "$STAGED_DB"
     if [ -f "$DEST" ]; then
-      cp "$DEST" "${DEST}.pre-restore-${TIMESTAMP}.bak"
+      cp "$DEST" "$PRE_DB_BAK"
     fi
 
+    # Phase 3: Swap DB and directories with rollback protection active
     rm -f "${DEST}-wal" "${DEST}-shm"
-    mv -f "$STAGED" "$DEST"
+    mv -f "$STAGED_DB" "$DEST"
+    SWAPPED_DB=1
 
     if [ -d "$STAGE_DIR/objects" ]; then
-      rm -rf "$DEST_DIR/objects.restore-prev"
+      rm -rf "$OBJ_PREV"
       if [ -d "$DEST_DIR/objects" ]; then
-        mv "$DEST_DIR/objects" "$DEST_DIR/objects.restore-prev"
+        mv "$DEST_DIR/objects" "$OBJ_PREV"
       fi
       mv "$STAGE_DIR/objects" "$DEST_DIR/objects"
-      rm -rf "$DEST_DIR/objects.restore-prev"
-      echo "Objetos originais (objects/) restaurados em: $DEST_DIR/objects"
+      SWAPPED_OBJ=1
     fi
 
     if [ -d "$STAGE_DIR/private_evidence" ]; then
-      rm -rf "$DEST_DIR/private_evidence.restore-prev"
+      rm -rf "$PRIV_PREV"
       if [ -d "$DEST_DIR/private_evidence" ]; then
-        mv "$DEST_DIR/private_evidence" "$DEST_DIR/private_evidence.restore-prev"
+        mv "$DEST_DIR/private_evidence" "$PRIV_PREV"
       fi
       mv "$STAGE_DIR/private_evidence" "$DEST_DIR/private_evidence"
-      rm -rf "$DEST_DIR/private_evidence.restore-prev"
-      echo "Evidências privadas (private_evidence/) restauradas em: $DEST_DIR/private_evidence"
+      SWAPPED_PRIV=1
     fi
 
+    # Phase 4: Final post-swap integrity verification (if this fails, rollback_restore reverts everything!)
     echo "Verificando banco e evidências privadas restaurados..."
     run_node_sqlite_verify "$DEST" "$DEST_DIR/private_evidence"
+
+    # Clean up temporary backup directories only after full verification passes
+    rm -rf "$OBJ_PREV" "$PRIV_PREV"
     echo "Banco SQLite restaurado com sucesso em: $DEST (reinicie o servidor NEXOFIS se estiver em execução)."
     ;;
 

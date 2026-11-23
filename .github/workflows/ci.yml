@@ -13,27 +13,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
       - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
+          cache: 'pnpm'
 
       - name: Install dependencies (frozen lockfile)
-        run: bun install --frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Typecheck (lint)
-        run: npm run lint
+        run: pnpm run lint
 
       - name: Run unit and audit regression tests
-        run: npm test
+        run: pnpm test
 
       - name: Production build
-        run: npm run build
+        run: pnpm run build
 
       - name: Real HTTP API smoke test (production fail-closed auth + persistence)
-        run: npx tsx scripts/smoke-api.ts
+        run: pnpm run smoke

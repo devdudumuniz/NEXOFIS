@@ -17,12 +17,34 @@
     "allowJs": true,
     "jsx": "react-jsx",
     "paths": {
+      "@nexofis/shared/*": [
+        "./app/shared/src/*"
+      ],
+      "@nexofis/backend/*": [
+        "./app/backend/src/*"
+      ],
+      "@nexofis/api/*": [
+        "./app/api/src/*"
+      ],
+      "@nexofis/frontend/*": [
+        "./app/frontend/src/*"
+      ],
       "@/*": [
-        "./*"
+        "./app/frontend/src/*"
       ]
     },
     "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "exclude": ["dist"]
+  "include": [
+    "server.ts",
+    "vite.config.ts",
+    "app/api/src/**/*.ts",
+    "app/backend/src/**/*.ts",
+    "app/frontend/src/**/*.ts",
+    "app/frontend/src/**/*.tsx",
+    "app/shared/src/**/*.ts",
+    "scripts/**/*.ts"
+  ],
+  "exclude": ["dist", "node_modules"]
 }

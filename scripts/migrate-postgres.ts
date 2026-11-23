@@ -31,7 +31,7 @@ async function main() {
     process.exit(1);
   }
 
-  const migrationsDir = path.resolve(process.cwd(), 'db', 'migrations');
+  const migrationsDir = path.resolve(process.cwd(), 'app', 'backend', 'db', 'migrations');
   if (!fs.existsSync(migrationsDir)) {
     console.error(`Erro: diretório de migrações não encontrado em ${migrationsDir}`);
     process.exit(1);
