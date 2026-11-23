@@ -10,6 +10,50 @@ import type {
   SavedDossierSnapshot,
   SavedDossierSummary,
 } from '../types/audit';
+import type {
+  CadastralMinimizedExtract,
+  InvestigationEventRecord,
+  InvestigationFactSet,
+  InvestigationReviewRecord,
+  ObservedHistorySnapshot,
+  PrivateEvidenceRecord,
+} from '../types/investigation';
+import {
+  computeEventChainHash,
+  createEmptyFactSet,
+  MAX_PRIVATE_EVIDENCE_BYTES,
+} from '../lib/forensicInvestigationEngine';
+import type { SupplierQsaRecord, SupplierQsaShareholder } from '../lib/partnerNetworkGraph';
+
+export interface InvestigationActor {
+  actorId: string;
+  actorName: string;
+  actorRole: 'admin' | 'analyst' | 'viewer';
+}
+
+export interface StoredInvestigationCase {
+  contractId: string;
+  factSet: InvestigationFactSet;
+  cadastralExtracts: CadastralMinimizedExtract[];
+  observedHistory: ObservedHistorySnapshot | null;
+  privateEvidence: PrivateEvidenceRecord[];
+  reviews: InvestigationReviewRecord[];
+  events: InvestigationEventRecord[];
+}
+
+export class InvestigationVersionConflictError extends Error {
+  readonly expectedVersion: number;
+  readonly currentVersion: number;
+
+  constructor(expectedVersion: number, currentVersion: number) {
+    super(
+      `Conflito de versão ao atualizar fatos da investigação (esperada v${expectedVersion}, atual v${currentVersion}). Recarregue o caso antes de salvar.`
+    );
+    this.name = 'InvestigationVersionConflictError';
+    this.expectedVersion = expectedVersion;
+    this.currentVersion = currentVersion;
+  }
+}
 
 export interface SyncCheckpoint {
   scopeKey: string;
@@ -49,6 +93,7 @@ export interface NexofisUserRecord {
 export interface NexofisStore {
   dbPath: string;
   objectsDir: string;
+  privateEvidenceDir: string;
   close(): void;
   getSchemaVersion(): number;
   upsertContract(contract: ContractRecord): void;
@@ -76,6 +121,45 @@ export interface NexofisStore {
   createUser(user: NexofisUserRecord): NexofisUserRecord;
   getUserByEmail(email: string): NexofisUserRecord | null;
   listUsers(): Array<Omit<NexofisUserRecord, 'passwordHash'>>;
+  getOrCreateInvestigationCase(contractId: string, actor: InvestigationActor): StoredInvestigationCase;
+  appendCadastralExtract(
+    contractId: string,
+    extract: CadastralMinimizedExtract,
+    actor: InvestigationActor
+  ): StoredInvestigationCase;
+  saveObservedHistory(
+    contractId: string,
+    snapshot: ObservedHistorySnapshot,
+    actor: InvestigationActor
+  ): StoredInvestigationCase;
+  saveInvestigationFactSet(
+    contractId: string,
+    expectedVersion: number,
+    factsPayload: Omit<InvestigationFactSet, 'version' | 'updatedAt' | 'updatedBy'>,
+    actor: InvestigationActor
+  ): StoredInvestigationCase;
+  savePrivateEvidence(
+    input: {
+      contractId: string;
+      filename: string;
+      mimeType: string;
+      sourceLabel: string;
+      description: string;
+      acquiredAt: string;
+      bytes: Buffer;
+    },
+    actor: InvestigationActor
+  ): { record: PrivateEvidenceRecord; investigation: StoredInvestigationCase };
+  getPrivateEvidenceById(contractId: string, evidenceId: string): PrivateEvidenceRecord | null;
+  readPrivateEvidenceBytes(sha256: string): { bytes: Buffer; verified: boolean } | null;
+  addInvestigationReview(
+    review: Omit<InvestigationReviewRecord, 'id' | 'createdAt'>,
+    actor: InvestigationActor
+  ): { review: InvestigationReviewRecord; investigation: StoredInvestigationCase };
+  listInvestigationEvents(contractId: string): InvestigationEventRecord[];
+  upsertSupplierQsa(record: SupplierQsaRecord): void;
+  getSupplierQsa(cnpj: string): SupplierQsaRecord | null;
+  listAllSupplierQsa(): SupplierQsaRecord[];
 }
 
 const DEFAULT_DB_PATH = path.resolve(process.cwd(), 'data', 'nexofis.db');
@@ -98,6 +182,10 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
   const objectsDir = path.resolve(dir, 'objects');
   if (!fs.existsSync(objectsDir)) {
     fs.mkdirSync(objectsDir, { recursive: true });
+  }
+  const privateEvidenceDir = path.resolve(dir, 'private_evidence');
+  if (!fs.existsSync(privateEvidenceDir)) {
+    fs.mkdirSync(privateEvidenceDir, { recursive: true });
   }
 
   const db = new DatabaseSync(resolvedDbPath);
@@ -220,6 +308,187 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
     db.prepare(
       'INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)'
     ).run(2, 'durable_originals_dossier_snapshots_rbac_users', new Date().toISOString());
+  }
+
+  // Additive migration v3: Forensic investigation cases, isolated private evidence, append-only hash-chained ledger, fact-bound reviews
+  const v3Check = db
+    .prepare('SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations')
+    .get() as { version: number };
+
+  if (v3Check.version < 3) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS investigation_cases (
+        contract_id TEXT PRIMARY KEY,
+        facts_version INTEGER NOT NULL DEFAULT 1,
+        facts_json TEXT NOT NULL,
+        cadastral_extracts_json TEXT NOT NULL DEFAULT '[]',
+        observed_history_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        updated_by TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS investigation_private_evidence (
+        id TEXT PRIMARY KEY,
+        contract_id TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        filename TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        source_label TEXT NOT NULL,
+        description TEXT NOT NULL,
+        acquired_at TEXT NOT NULL,
+        uploaded_by TEXT NOT NULL,
+        export_filename TEXT NOT NULL,
+        object_key TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_inv_priv_ev_contract
+        ON investigation_private_evidence(contract_id, created_at);
+
+      CREATE TABLE IF NOT EXISTS investigation_events (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        id TEXT NOT NULL UNIQUE,
+        contract_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        actor_name TEXT NOT NULL,
+        actor_role TEXT NOT NULL,
+        facts_version INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        prev_hash TEXT NOT NULL,
+        event_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_inv_events_contract_seq
+        ON investigation_events(contract_id, seq);
+
+      CREATE TRIGGER IF NOT EXISTS trg_investigation_events_no_update
+      BEFORE UPDATE ON investigation_events
+      BEGIN
+        SELECT RAISE(ABORT, 'investigation_events is append-only: UPDATE forbidden');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS trg_investigation_events_no_delete
+      BEFORE DELETE ON investigation_events
+      BEGIN
+        SELECT RAISE(ABORT, 'investigation_events is append-only: DELETE forbidden');
+      END;
+
+      CREATE TABLE IF NOT EXISTS investigation_reviews (
+        id TEXT PRIMARY KEY,
+        contract_id TEXT NOT NULL,
+        finding_id TEXT NOT NULL,
+        action TEXT NOT NULL CHECK(action IN ('dismiss', 'confirm', 'restore')),
+        rationale TEXT NOT NULL,
+        facts_version INTEGER NOT NULL,
+        finding_inputs_digest TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        actor_name TEXT NOT NULL,
+        actor_role TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_inv_reviews_contract
+        ON investigation_reviews(contract_id, created_at);
+    `);
+
+    db.prepare(
+      'INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)'
+    ).run(3, 'forensic_investigation_module_append_only_ledger', new Date().toISOString());
+  }
+
+  // Additive migration v4: Supplier QSA persistent cache for corporate/partner network graph
+  const v4Check = db
+    .prepare('SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations')
+    .get() as { version: number };
+
+  if (v4Check.version < 4) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS supplier_qsa_cache (
+        cnpj TEXT PRIMARY KEY,
+        legal_name TEXT NOT NULL,
+        registration_status TEXT NOT NULL,
+        opening_date TEXT NOT NULL,
+        primary_cnae_code TEXT NOT NULL,
+        primary_cnae_description TEXT NOT NULL,
+        municipality TEXT NOT NULL,
+        uf TEXT NOT NULL,
+        share_capital REAL NOT NULL DEFAULT 0,
+        qsa_json TEXT NOT NULL DEFAULT '[]',
+        source_provider TEXT NOT NULL,
+        fetched_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_supplier_qsa_fetched_at
+        ON supplier_qsa_cache(fetched_at);
+    `);
+
+    db.prepare(
+      'INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)'
+    ).run(4, 'supplier_qsa_cache_partner_network', new Date().toISOString());
+  }
+
+  const stmtUpsertSupplierQsa = db.prepare(`
+    INSERT INTO supplier_qsa_cache (
+      cnpj, legal_name, registration_status, opening_date,
+      primary_cnae_code, primary_cnae_description, municipality, uf,
+      share_capital, qsa_json, source_provider, fetched_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(cnpj) DO UPDATE SET
+      legal_name = excluded.legal_name,
+      registration_status = excluded.registration_status,
+      opening_date = excluded.opening_date,
+      primary_cnae_code = excluded.primary_cnae_code,
+      primary_cnae_description = excluded.primary_cnae_description,
+      municipality = excluded.municipality,
+      uf = excluded.uf,
+      share_capital = excluded.share_capital,
+      qsa_json = excluded.qsa_json,
+      source_provider = excluded.source_provider,
+      fetched_at = excluded.fetched_at
+  `);
+
+  const stmtGetSupplierQsa = db.prepare(`
+    SELECT cnpj, legal_name, registration_status, opening_date,
+           primary_cnae_code, primary_cnae_description, municipality, uf,
+           share_capital, qsa_json, source_provider, fetched_at
+    FROM supplier_qsa_cache
+    WHERE cnpj = ?
+  `);
+
+  const stmtListAllSupplierQsa = db.prepare(`
+    SELECT cnpj, legal_name, registration_status, opening_date,
+           primary_cnae_code, primary_cnae_description, municipality, uf,
+           share_capital, qsa_json, source_provider, fetched_at
+    FROM supplier_qsa_cache
+    ORDER BY fetched_at DESC
+  `);
+
+  function mapSupplierQsaRow(row: Record<string, unknown>): SupplierQsaRecord {
+    let shareholders: SupplierQsaShareholder[] = [];
+    try {
+      const parsed = JSON.parse(String(row.qsa_json ?? '[]'));
+      if (Array.isArray(parsed)) shareholders = parsed as SupplierQsaShareholder[];
+    } catch {
+      shareholders = [];
+    }
+    return {
+      cnpj: String(row.cnpj ?? ''),
+      legalName: String(row.legal_name ?? ''),
+      registrationStatus: String(row.registration_status ?? 'DESCONHECIDA'),
+      openingDate: String(row.opening_date ?? ''),
+      primaryCnaeCode: String(row.primary_cnae_code ?? ''),
+      primaryCnaeDescription: String(row.primary_cnae_description ?? ''),
+      municipality: String(row.municipality ?? ''),
+      uf: String(row.uf ?? ''),
+      shareCapital: Number(row.share_capital ?? 0),
+      shareholders,
+      sourceProvider: String(row.source_provider ?? 'BrasilAPI CNPJ'),
+      fetchedAt: String(row.fetched_at ?? ''),
+    };
   }
 
   const stmtUpsertContract = db.prepare(`
@@ -379,6 +648,285 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
     return { objectKey, absPath };
   }
 
+  function resolveSafePrivateEvidencePath(sha256: string): { objectKey: string; absPath: string } {
+    const cleanSha = sha256.trim().toLowerCase();
+    if (!SHA256_RE.test(cleanSha)) {
+      throw new Error('SHA-256 inválido para armazenamento de evidência privada.');
+    }
+    const prefix = cleanSha.slice(0, 2);
+    const objectKey = `${prefix}/${cleanSha}`;
+    const absPath = path.resolve(privateEvidenceDir, prefix, cleanSha);
+    if (!absPath.startsWith(privateEvidenceDir + path.sep)) {
+      throw new Error('Caminho de evidência privada fora do diretório confinado.');
+    }
+    return { objectKey, absPath };
+  }
+
+  const stmtGetInvCase = db.prepare(`
+    SELECT contract_id, facts_version, facts_json, cadastral_extracts_json,
+           observed_history_json, created_at, updated_at, updated_by
+    FROM investigation_cases
+    WHERE contract_id = ?
+  `);
+
+  const stmtInsertInvCase = db.prepare(`
+    INSERT INTO investigation_cases (
+      contract_id, facts_version, facts_json, cadastral_extracts_json,
+      observed_history_json, created_at, updated_at, updated_by
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const stmtUpdateInvCadastral = db.prepare(`
+    UPDATE investigation_cases
+    SET cadastral_extracts_json = ?, updated_at = ?, updated_by = ?
+    WHERE contract_id = ?
+  `);
+
+  const stmtUpdateInvObservedHistory = db.prepare(`
+    UPDATE investigation_cases
+    SET observed_history_json = ?, updated_at = ?, updated_by = ?
+    WHERE contract_id = ?
+  `);
+
+  const stmtUpdateInvFactsOptimistic = db.prepare(`
+    UPDATE investigation_cases
+    SET facts_version = ?, facts_json = ?, updated_at = ?, updated_by = ?
+    WHERE contract_id = ? AND facts_version = ?
+  `);
+
+  const stmtInsertInvPrivateEvidence = db.prepare(`
+    INSERT INTO investigation_private_evidence (
+      id, contract_id, sha256, filename, mime_type, size_bytes,
+      source_label, description, acquired_at, uploaded_by,
+      export_filename, object_key, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const stmtListInvPrivateEvidence = db.prepare(`
+    SELECT id, contract_id, sha256, filename, mime_type, size_bytes,
+           source_label, description, acquired_at, uploaded_by, export_filename
+    FROM investigation_private_evidence
+    WHERE contract_id = ?
+    ORDER BY created_at ASC
+  `);
+
+  const stmtGetInvPrivateEvidenceById = db.prepare(`
+    SELECT id, contract_id, sha256, filename, mime_type, size_bytes,
+           source_label, description, acquired_at, uploaded_by, export_filename
+    FROM investigation_private_evidence
+    WHERE contract_id = ? AND id = ?
+  `);
+
+  const stmtInsertInvReview = db.prepare(`
+    INSERT INTO investigation_reviews (
+      id, contract_id, finding_id, action, rationale,
+      facts_version, finding_inputs_digest, actor_id, actor_name, actor_role, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const stmtListInvReviews = db.prepare(`
+    SELECT id, contract_id, finding_id, action, rationale,
+           facts_version, finding_inputs_digest, actor_id, actor_name, actor_role, created_at
+    FROM investigation_reviews
+    WHERE contract_id = ?
+    ORDER BY created_at ASC
+  `);
+
+  const stmtGetLastInvEventHash = db.prepare(`
+    SELECT event_hash
+    FROM investigation_events
+    WHERE contract_id = ?
+    ORDER BY seq DESC
+    LIMIT 1
+  `);
+
+  const stmtInsertInvEvent = db.prepare(`
+    INSERT INTO investigation_events (
+      id, contract_id, event_type, actor_id, actor_name, actor_role,
+      facts_version, payload_json, prev_hash, event_hash, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  const stmtListInvEvents = db.prepare(`
+    SELECT seq, id, contract_id, event_type, actor_id, actor_name, actor_role,
+           facts_version, payload_json, prev_hash, event_hash, created_at
+    FROM investigation_events
+    WHERE contract_id = ?
+    ORDER BY seq ASC
+  `);
+
+  function appendInvEventTx(
+    contractId: string,
+    eventType: InvestigationEventRecord['eventType'],
+    factsVersion: number,
+    payload: Record<string, unknown>,
+    actor: InvestigationActor
+  ): void {
+    const last = stmtGetLastInvEventHash.get(contractId) as { event_hash: string } | undefined;
+    const prevHash = last?.event_hash ?? 'GENESIS';
+    const id = `IEV-${crypto.randomUUID()}`;
+    const createdAt = new Date().toISOString();
+    const payloadJson = JSON.stringify(payload);
+    const eventHash = computeEventChainHash({
+      id,
+      contractId,
+      eventType,
+      actorId: actor.actorId,
+      actorName: actor.actorName,
+      actorRole: actor.actorRole,
+      factsVersion,
+      payloadJson,
+      prevHash,
+      createdAt,
+    });
+    stmtInsertInvEvent.run(
+      id,
+      contractId,
+      eventType,
+      actor.actorId,
+      actor.actorName,
+      actor.actorRole,
+      factsVersion,
+      payloadJson,
+      prevHash,
+      eventHash,
+      createdAt
+    );
+  }
+
+  function mapPrivateEvidenceRow(r: Record<string, unknown>): PrivateEvidenceRecord {
+    return {
+      id: String(r.id),
+      contractId: String(r.contract_id),
+      sha256: String(r.sha256),
+      filename: String(r.filename),
+      mimeType: String(r.mime_type),
+      sizeBytes: Number(r.size_bytes),
+      sourceLabel: String(r.source_label),
+      description: String(r.description),
+      acquiredAt: String(r.acquired_at),
+      uploadedBy: String(r.uploaded_by),
+      exportFilename: String(r.export_filename),
+    };
+  }
+
+  function mapInvReviewRow(r: Record<string, unknown>): InvestigationReviewRecord {
+    return {
+      id: String(r.id),
+      contractId: String(r.contract_id),
+      findingId: String(r.finding_id),
+      action: r.action as InvestigationReviewRecord['action'],
+      rationale: String(r.rationale),
+      factsVersion: Number(r.facts_version),
+      findingInputsDigest: String(r.finding_inputs_digest),
+      actorId: String(r.actor_id),
+      actorName: String(r.actor_name),
+      actorRole: r.actor_role as InvestigationReviewRecord['actorRole'],
+      createdAt: String(r.created_at),
+    };
+  }
+
+  function mapInvEventRow(r: Record<string, unknown>): InvestigationEventRecord {
+    return {
+      seq: Number(r.seq),
+      id: String(r.id),
+      contractId: String(r.contract_id),
+      eventType: r.event_type as InvestigationEventRecord['eventType'],
+      actorId: String(r.actor_id),
+      actorName: String(r.actor_name),
+      actorRole: r.actor_role as InvestigationEventRecord['actorRole'],
+      factsVersion: Number(r.facts_version),
+      payloadJson: String(r.payload_json),
+      prevHash: String(r.prev_hash),
+      eventHash: String(r.event_hash),
+      createdAt: String(r.created_at),
+    };
+  }
+
+  function ensureInvestigationCaseRow(
+    contractId: string,
+    actor: InvestigationActor
+  ): Record<string, unknown> {
+    const existing = stmtGetInvCase.get(contractId) as Record<string, unknown> | undefined;
+    if (existing) return existing;
+
+    const now = new Date().toISOString();
+    const initialFacts = createEmptyFactSet(actor.actorName);
+    initialFacts.updatedAt = now;
+
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const doubleCheck = stmtGetInvCase.get(contractId) as Record<string, unknown> | undefined;
+      if (doubleCheck) {
+        db.exec('COMMIT');
+        return doubleCheck;
+      }
+      stmtInsertInvCase.run(
+        contractId,
+        1,
+        JSON.stringify(initialFacts),
+        '[]',
+        null,
+        now,
+        now,
+        actor.actorName
+      );
+      appendInvEventTx(
+        contractId,
+        'CASE_INITIALIZED',
+        1,
+        { message: 'Caso de investigação forense inicializado.' },
+        actor
+      );
+      db.exec('COMMIT');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
+    }
+
+    return stmtGetInvCase.get(contractId) as Record<string, unknown>;
+  }
+
+  function hydrateInvestigationCase(
+    contractId: string,
+    actor: InvestigationActor
+  ): StoredInvestigationCase {
+    const row = ensureInvestigationCaseRow(contractId, actor);
+    const factSet = JSON.parse(String(row.facts_json)) as InvestigationFactSet;
+    const cadastralExtracts = JSON.parse(
+      String(row.cadastral_extracts_json || '[]')
+    ) as CadastralMinimizedExtract[];
+    const observedHistory =
+      typeof row.observed_history_json === 'string' && row.observed_history_json.trim()
+        ? (JSON.parse(row.observed_history_json) as ObservedHistorySnapshot)
+        : null;
+    const privateEvidence = (
+      stmtListInvPrivateEvidence.all(contractId) as Array<Record<string, unknown>>
+    ).map(mapPrivateEvidenceRow);
+    const reviews = (
+      stmtListInvReviews.all(contractId) as Array<Record<string, unknown>>
+    ).map(mapInvReviewRow);
+    const events = (
+      stmtListInvEvents.all(contractId) as Array<Record<string, unknown>>
+    ).map(mapInvEventRow);
+
+    return {
+      contractId,
+      factSet,
+      cadastralExtracts,
+      observedHistory,
+      privateEvidence,
+      reviews,
+      events,
+    };
+  }
+
+  function sanitizeExportFilenamePart(filename: string): string {
+    const base = path.basename(filename || 'evidencia.bin');
+    const clean = base.replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^_+|_+$/g, '');
+    return (clean || 'evidencia.bin').slice(0, 120);
+  }
+
   function mapDossierRow(r: Record<string, unknown>): SavedDossierSummary {
     return {
       id: String(r.id),
@@ -443,6 +991,7 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
   return {
     dbPath: resolvedDbPath,
     objectsDir,
+    privateEvidenceDir,
     close() {
       db.close();
     },
@@ -706,6 +1255,350 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
         role: row.role as NexofisUserRecord['role'],
         createdAt: String(row.created_at),
       }));
+    },
+    getOrCreateInvestigationCase(contractId: string, actor: InvestigationActor) {
+      return hydrateInvestigationCase(contractId, actor);
+    },
+    appendCadastralExtract(
+      contractId: string,
+      extract: CadastralMinimizedExtract,
+      actor: InvestigationActor
+    ) {
+      ensureInvestigationCaseRow(contractId, actor);
+      const now = new Date().toISOString();
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const row = stmtGetInvCase.get(contractId) as Record<string, unknown>;
+        const existing = JSON.parse(
+          String(row.cadastral_extracts_json || '[]')
+        ) as CadastralMinimizedExtract[];
+        const nextList = [...existing, extract];
+        stmtUpdateInvCadastral.run(JSON.stringify(nextList), now, actor.actorName, contractId);
+        appendInvEventTx(
+          contractId,
+          'CADASTRAL_QUERY_RECORDED',
+          Number(row.facts_version),
+          {
+            extractId: extract.id,
+            cnpj: extract.cnpj,
+            sourceProvider: extract.sourceProvider,
+            sourceType: extract.sourceType,
+            purpose: extract.purpose,
+            legalBasis: extract.legalBasis,
+            extractSha256: extract.extractSha256,
+            qsaCount: extract.qsa.length,
+          },
+          actor
+        );
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+      return hydrateInvestigationCase(contractId, actor);
+    },
+    saveObservedHistory(
+      contractId: string,
+      snapshot: ObservedHistorySnapshot,
+      actor: InvestigationActor
+    ) {
+      ensureInvestigationCaseRow(contractId, actor);
+      const now = new Date().toISOString();
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const row = stmtGetInvCase.get(contractId) as Record<string, unknown>;
+        stmtUpdateInvObservedHistory.run(
+          JSON.stringify(snapshot),
+          now,
+          actor.actorName,
+          contractId
+        );
+        appendInvEventTx(
+          contractId,
+          'PNCP_HISTORY_SYNCED',
+          Number(row.facts_version),
+          {
+            supplierCnpj: snapshot.supplierCnpj,
+            pncpStatus: snapshot.pncpStatus,
+            sourcesChecked: snapshot.sourcesChecked,
+            contractsObservedCount: snapshot.contracts.length,
+          },
+          actor
+        );
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+      return hydrateInvestigationCase(contractId, actor);
+    },
+    saveInvestigationFactSet(
+      contractId: string,
+      expectedVersion: number,
+      factsPayload: Omit<InvestigationFactSet, 'version' | 'updatedAt' | 'updatedBy'>,
+      actor: InvestigationActor
+    ) {
+      ensureInvestigationCaseRow(contractId, actor);
+      const now = new Date().toISOString();
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const row = stmtGetInvCase.get(contractId) as Record<string, unknown>;
+        const currentVersion = Number(row.facts_version);
+        if (currentVersion !== expectedVersion) {
+          db.exec('ROLLBACK');
+          throw new InvestigationVersionConflictError(expectedVersion, currentVersion);
+        }
+        const nextVersion = currentVersion + 1;
+        const nextFactSet: InvestigationFactSet = {
+          ...factsPayload,
+          version: nextVersion,
+          updatedAt: now,
+          updatedBy: actor.actorName,
+        };
+        const res = stmtUpdateInvFactsOptimistic.run(
+          nextVersion,
+          JSON.stringify(nextFactSet),
+          now,
+          actor.actorName,
+          contractId,
+          expectedVersion
+        );
+        if (Number(res.changes) === 0) {
+          const latest = stmtGetInvCase.get(contractId) as Record<string, unknown>;
+          db.exec('ROLLBACK');
+          throw new InvestigationVersionConflictError(
+            expectedVersion,
+            Number(latest?.facts_version ?? currentVersion)
+          );
+        }
+        appendInvEventTx(
+          contractId,
+          'FACTS_UPDATED',
+          nextVersion,
+          {
+            previousVersion: currentVersion,
+            newVersion: nextVersion,
+            counts: {
+              corporateDates: nextFactSet.corporateDates.length,
+              corporateChanges: nextFactSet.corporateChanges.length,
+              people: nextFactSet.people.length,
+              corporateLinks: nextFactSet.corporateLinks.length,
+              publicFunctions: nextFactSet.publicFunctions.length,
+              kinshipRelations: nextFactSet.kinshipRelations.length,
+              lotParticipants: nextFactSet.lotParticipants.length,
+            },
+          },
+          actor
+        );
+        db.exec('COMMIT');
+      } catch (err) {
+        if (!(err instanceof InvestigationVersionConflictError)) {
+          try {
+            db.exec('ROLLBACK');
+          } catch {
+            // already rolled back
+          }
+        }
+        throw err;
+      }
+      return hydrateInvestigationCase(contractId, actor);
+    },
+    savePrivateEvidence(
+      input: {
+        contractId: string;
+        filename: string;
+        mimeType: string;
+        sourceLabel: string;
+        description: string;
+        acquiredAt: string;
+        bytes: Buffer;
+      },
+      actor: InvestigationActor
+    ) {
+      if (input.bytes.length === 0) {
+        throw new Error('Arquivo de evidência privada vazio.');
+      }
+      if (input.bytes.length > MAX_PRIVATE_EVIDENCE_BYTES) {
+        throw new Error(
+          `Evidência privada excede o limite de ${MAX_PRIVATE_EVIDENCE_BYTES} bytes (1 MiB).`
+        );
+      }
+      ensureInvestigationCaseRow(input.contractId, actor);
+      const sha256 = crypto.createHash('sha256').update(input.bytes).digest('hex');
+      const { objectKey, absPath } = resolveSafePrivateEvidencePath(sha256);
+      const subDir = path.dirname(absPath);
+      if (!fs.existsSync(subDir)) {
+        fs.mkdirSync(subDir, { recursive: true });
+      }
+      if (!fs.existsSync(absPath)) {
+        const tmpPath = `${absPath}.${process.pid}.${Date.now()}.tmp`;
+        fs.writeFileSync(tmpPath, input.bytes);
+        fs.renameSync(tmpPath, absPath);
+      }
+
+      const safeName = sanitizeExportFilenamePart(input.filename);
+      const exportFilename = `${sha256}__${safeName}`;
+      const id = `PEV-${crypto.randomUUID()}`;
+      const now = new Date().toISOString();
+
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        const row = stmtGetInvCase.get(input.contractId) as Record<string, unknown>;
+        stmtInsertInvPrivateEvidence.run(
+          id,
+          input.contractId,
+          sha256,
+          path.basename(input.filename || 'evidencia.bin').slice(0, 180),
+          input.mimeType || 'application/octet-stream',
+          input.bytes.length,
+          input.sourceLabel.trim().slice(0, 200),
+          input.description.trim().slice(0, 1000),
+          input.acquiredAt.trim() || now,
+          actor.actorName,
+          exportFilename,
+          objectKey,
+          now
+        );
+        appendInvEventTx(
+          input.contractId,
+          'PRIVATE_EVIDENCE_UPLOADED',
+          Number(row.facts_version),
+          {
+            evidenceId: id,
+            sha256,
+            filename: path.basename(input.filename || 'evidencia.bin').slice(0, 180),
+            exportFilename,
+            sizeBytes: input.bytes.length,
+            sourceLabel: input.sourceLabel.trim().slice(0, 200),
+          },
+          actor
+        );
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+
+      const record: PrivateEvidenceRecord = {
+        id,
+        contractId: input.contractId,
+        sha256,
+        filename: path.basename(input.filename || 'evidencia.bin').slice(0, 180),
+        mimeType: input.mimeType || 'application/octet-stream',
+        sizeBytes: input.bytes.length,
+        sourceLabel: input.sourceLabel.trim().slice(0, 200),
+        description: input.description.trim().slice(0, 1000),
+        acquiredAt: input.acquiredAt.trim() || now,
+        uploadedBy: actor.actorName,
+        exportFilename,
+      };
+      return {
+        record,
+        investigation: hydrateInvestigationCase(input.contractId, actor),
+      };
+    },
+    getPrivateEvidenceById(contractId: string, evidenceId: string) {
+      const row = stmtGetInvPrivateEvidenceById.get(contractId, evidenceId) as
+        | Record<string, unknown>
+        | undefined;
+      return row ? mapPrivateEvidenceRow(row) : null;
+    },
+    readPrivateEvidenceBytes(sha256: string) {
+      let absPath: string;
+      try {
+        absPath = resolveSafePrivateEvidencePath(sha256).absPath;
+      } catch {
+        return null;
+      }
+      if (!fs.existsSync(absPath)) return null;
+      const bytes = fs.readFileSync(absPath);
+      const computed = crypto.createHash('sha256').update(bytes).digest('hex');
+      return {
+        bytes,
+        verified: computed === sha256.trim().toLowerCase(),
+      };
+    },
+    addInvestigationReview(
+      review: Omit<InvestigationReviewRecord, 'id' | 'createdAt'>,
+      actor: InvestigationActor
+    ) {
+      ensureInvestigationCaseRow(review.contractId, actor);
+      const id = `IRV-${crypto.randomUUID()}`;
+      const createdAt = new Date().toISOString();
+
+      db.exec('BEGIN IMMEDIATE');
+      try {
+        stmtInsertInvReview.run(
+          id,
+          review.contractId,
+          review.findingId,
+          review.action,
+          review.rationale,
+          review.factsVersion,
+          review.findingInputsDigest,
+          actor.actorId,
+          actor.actorName,
+          actor.actorRole,
+          createdAt
+        );
+        appendInvEventTx(
+          review.contractId,
+          'FINDING_REVIEWED',
+          review.factsVersion,
+          {
+            reviewId: id,
+            findingId: review.findingId,
+            action: review.action,
+            findingInputsDigest: review.findingInputsDigest,
+          },
+          actor
+        );
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+
+      const fullReview: InvestigationReviewRecord = {
+        ...review,
+        id,
+        actorId: actor.actorId,
+        actorName: actor.actorName,
+        actorRole: actor.actorRole,
+        createdAt,
+      };
+      return {
+        review: fullReview,
+        investigation: hydrateInvestigationCase(review.contractId, actor),
+      };
+    },
+    listInvestigationEvents(contractId: string) {
+      const rows = stmtListInvEvents.all(contractId) as Array<Record<string, unknown>>;
+      return rows.map(mapInvEventRow);
+    },
+    upsertSupplierQsa(record: SupplierQsaRecord) {
+      stmtUpsertSupplierQsa.run(
+        record.cnpj,
+        record.legalName,
+        record.registrationStatus,
+        record.openingDate,
+        record.primaryCnaeCode,
+        record.primaryCnaeDescription,
+        record.municipality,
+        record.uf,
+        Number(record.shareCapital || 0),
+        JSON.stringify(record.shareholders ?? []),
+        record.sourceProvider || 'BrasilAPI CNPJ',
+        record.fetchedAt || new Date().toISOString()
+      );
+    },
+    getSupplierQsa(cnpj: string) {
+      const row = stmtGetSupplierQsa.get(cnpj) as Record<string, unknown> | undefined;
+      return row ? mapSupplierQsaRow(row) : null;
+    },
+    listAllSupplierQsa() {
+      const rows = stmtListAllSupplierQsa.all() as Array<Record<string, unknown>>;
+      return rows.map(mapSupplierQsaRow);
     },
   };
 }

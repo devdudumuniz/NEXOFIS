@@ -18,8 +18,7 @@ function rotr(x: number, n: number): number {
   return (x >>> n) | (x << (32 - n));
 }
 
-export function sha256HexSync(input: string): string {
-  const bytes = new TextEncoder().encode(input);
+export function sha256BytesSync(bytes: Uint8Array): string {
   const bitLen = bytes.length * 8;
   const paddedLen = Math.ceil((bytes.length + 9) / 64) * 64;
   const padded = new Uint8Array(paddedLen);
@@ -93,4 +92,15 @@ export function sha256HexSync(input: string): string {
   return [h0, h1, h2, h3, h4, h5, h6, h7]
     .map((n) => n.toString(16).padStart(8, '0'))
     .join('');
+}
+
+export function sha256HexSync(input: string): string {
+  return sha256BytesSync(new TextEncoder().encode(input));
+}
+
+export function sha256Hex(input: string | Uint8Array): string {
+  if (typeof input === 'string') {
+    return sha256HexSync(input);
+  }
+  return sha256BytesSync(input);
 }

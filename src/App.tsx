@@ -12,6 +12,7 @@ import {
   LogOut,
   Menu,
   Moon,
+  Network,
   PanelLeftClose,
   PanelLeftOpen,
   Scale,
@@ -53,15 +54,18 @@ import { DocumentUploadView } from './components/DocumentUploadView';
 import { ContractDossierView } from './components/ContractDossierView';
 import { SavedDossiersView } from './components/SavedDossiersView';
 import { RiskDashboardView } from './components/RiskDashboardView';
+import { PartnerNetworkView } from './components/PartnerNetworkView';
 import { ToastContainer } from './components/ToastContainer';
+import type { PartnerNetworkQueryMode } from './lib/partnerNetworkGraph';
 
-type ActiveSection = 'dashboard' | 'municipio' | 'contrato' | 'documento' | 'dossies';
+type ActiveSection = 'dashboard' | 'municipio' | 'contrato' | 'rede' | 'documento' | 'dossies';
 
 interface UrlState {
   section: ActiveSection;
   ibge: string;
   entityId: string;
   q: string;
+  networkMode: PartnerNetworkQueryMode;
   year: string;
   status: '' | 'em_andamento' | 'concluido' | 'suspenso';
   startDate: string;
@@ -78,6 +82,7 @@ function readUrlState(): UrlState {
       ibge: '',
       entityId: 'ALL',
       q: '',
+      networkMode: 'auto',
       year: '',
       status: '',
       startDate: '',
@@ -92,6 +97,7 @@ function readUrlState(): UrlState {
   const section: ActiveSection =
     rawSec === 'dashboard' ||
     rawSec === 'contrato' ||
+    rawSec === 'rede' ||
     rawSec === 'documento' ||
     rawSec === 'dossies'
       ? rawSec
@@ -100,6 +106,9 @@ function readUrlState(): UrlState {
   const ibge = /^\d{7}$/.test(rawIbge) ? rawIbge : '';
   const entityId = params.get('ent') || 'ALL';
   const q = params.get('q') ?? '';
+  const rawMode = params.get('mode');
+  const networkMode: PartnerNetworkQueryMode =
+    rawMode === 'company' || rawMode === 'partner' ? rawMode : 'auto';
   const year = params.get('year') ?? '';
   const rawStatus = params.get('status') ?? '';
   const status =
@@ -118,6 +127,7 @@ function readUrlState(): UrlState {
     ibge,
     entityId,
     q,
+    networkMode,
     year,
     status,
     startDate,
@@ -141,7 +151,7 @@ export default function App() {
     endDate: initial.endDate,
   });
   const [searchFilters, setSearchFilters] = useState<ContractSearchFilterState>({
-    query: initial.q,
+    query: initial.section === 'contrato' ? initial.q : '',
     ibgeFilter: initial.section === 'contrato' ? initial.ibge : '',
     municipalityInput: '',
     yearFilter: initial.year,
@@ -149,6 +159,13 @@ export default function App() {
     startDate: initial.startDate,
     endDate: initial.endDate,
     minRisk: initial.minRisk,
+  });
+  const [networkState, setNetworkState] = useState<{
+    query: string;
+    mode: PartnerNetworkQueryMode;
+  }>({
+    query: initial.section === 'rede' ? initial.q : '',
+    mode: initial.networkMode,
   });
 
   const [activeContract, setActiveContract] = useState<EvaluatedContract | null>(null);
@@ -287,7 +304,7 @@ export default function App() {
       setPeriodFilter({ startDate: next.startDate, endDate: next.endDate });
       setSearchFilters((prev) => ({
         ...prev,
-        query: next.q,
+        query: next.section === 'contrato' ? next.q : prev.query,
         ibgeFilter: next.section === 'contrato' ? next.ibge : prev.ibgeFilter,
         yearFilter: next.year,
         statusFilter: next.status,
@@ -295,6 +312,9 @@ export default function App() {
         endDate: next.endDate,
         minRisk: next.minRisk,
       }));
+      if (next.section === 'rede') {
+        setNetworkState({ query: next.q, mode: next.networkMode });
+      }
       hydrateDeepLink(next.contractId, next.dossierId);
     };
 
@@ -326,6 +346,9 @@ export default function App() {
       if (searchFilters.startDate) params.set('from', searchFilters.startDate);
       if (searchFilters.endDate) params.set('to', searchFilters.endDate);
       if (searchFilters.minRisk > 0) params.set('minRisk', String(searchFilters.minRisk));
+    } else if (section === 'rede') {
+      if (networkState.query) params.set('q', networkState.query);
+      if (networkState.mode !== 'auto') params.set('mode', networkState.mode);
     }
 
     if (archivedSnapshot) {
@@ -345,6 +368,7 @@ export default function App() {
     selectedEntityId,
     periodFilter,
     searchFilters,
+    networkState,
     activeContract,
     archivedSnapshot,
     deepLinkLoading,
@@ -358,6 +382,19 @@ export default function App() {
     setMobileMenuOpen(false);
     window.scrollTo(0, 0);
   };
+
+  const handleOpenPartnerNetwork = useCallback(
+    (query: string, mode: PartnerNetworkQueryMode = 'auto') => {
+      setNetworkState({ query: query.trim(), mode });
+      setSection('rede');
+      setActiveContract(null);
+      setArchivedSnapshot(null);
+      setDeepLinkError(null);
+      setMobileMenuOpen(false);
+      window.scrollTo(0, 0);
+    },
+    []
+  );
 
   const handleOpenContract = (contract: EvaluatedContract) => {
     setArchivedSnapshot(null);
@@ -474,6 +511,12 @@ export default function App() {
       label: 'Contrato',
       hint: 'Nº contrato, PNCP ou CNPJ',
       icon: FileSearch,
+    },
+    {
+      id: 'rede',
+      label: 'Rede de Sócios',
+      hint: 'Sócios → Empresas → Contratos',
+      icon: Network,
     },
     {
       id: 'documento',
@@ -600,25 +643,16 @@ export default function App() {
               </button>
             </div>
           ) : (
-            <>
-              <div className="text-[11px] text-slate-500 dark:text-slate-400 space-y-1 px-0.5">
-                <div className="font-semibold text-[#0B2540] dark:text-slate-200">
-                  Fontes e persistência
-                </div>
-                <div>IBGE · PNCP Nacional · CGU/SICONFI · SQLite WAL</div>
-              </div>
-
-              <div className="pt-2 border-t border-slate-100 dark:border-[#1D3A57] flex items-center justify-between text-[10px] text-slate-500 dark:text-slate-400 font-mono">
-                <span>NEXOFIS v1.0</span>
-                <button
-                  type="button"
-                  onClick={() => setLicenseModalOpen(true)}
-                  className="text-[#D95B35] hover:underline underline-offset-2 font-semibold"
-                >
-                  AGPL-3.0-only
-                </button>
-              </div>
-            </>
+            <div className="flex items-center justify-between text-[10px] text-slate-500 dark:text-slate-400 font-mono">
+              <span>NEXOFIS v1.0</span>
+              <button
+                type="button"
+                onClick={() => setLicenseModalOpen(true)}
+                className="text-[#D95B35] hover:underline underline-offset-2 font-semibold"
+              >
+                AGPL-3.0-only
+              </button>
+            </div>
           )}
         </div>
       </aside>
@@ -730,9 +764,11 @@ export default function App() {
                     ? 'Municípios'
                     : section === 'contrato'
                       ? 'Contratos'
-                      : section === 'documento'
-                        ? 'Documentos'
-                        : 'Dossiês'}
+                      : section === 'rede'
+                        ? 'Rede de Sócios'
+                        : section === 'documento'
+                          ? 'Documentos'
+                          : 'Dossiês'}
               </button>
 
               {section === 'municipio' && breadcrumbCtx.municipality && (
@@ -883,6 +919,11 @@ export default function App() {
             <ContractDossierView
               contract={activeContract}
               archivedSnapshot={archivedSnapshot}
+              authPrincipal={principal}
+              onRequireAuth={() => {
+                setAuthError(null);
+                setAuthModalOpen(true);
+              }}
               onBack={() => {
                 setActiveContract(null);
                 setArchivedSnapshot(null);
@@ -892,6 +933,7 @@ export default function App() {
               }
               onDossierSaved={refreshDossiers}
               onSelectContract={handleOpenContract}
+              onOpenPartnerNetwork={handleOpenPartnerNetwork}
             />
           ) : section === 'dashboard' ? (
             <RiskDashboardView
@@ -921,6 +963,13 @@ export default function App() {
               onFilterStateChange={setSearchFilters}
               onSelectContract={handleOpenContract}
               onNavigateToDocument={() => handleNavigate('documento')}
+            />
+          ) : section === 'rede' ? (
+            <PartnerNetworkView
+              initialQuery={networkState.query}
+              initialMode={networkState.mode}
+              onQueryStateChange={(q, mode) => setNetworkState({ query: q, mode })}
+              onSelectContract={handleOpenContract}
             />
           ) : section === 'documento' ? (
             <DocumentUploadView onSelectContract={handleOpenContract} />

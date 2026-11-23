@@ -9,6 +9,21 @@ import type {
 import type { ExtractedDocumentFields } from './documentParser';
 import type { RiskDashboardSummary } from './dashboardAggregator';
 import type { ParsedContractCode } from './pncpQueryParser';
+import type {
+  CadastralMinimizedExtract,
+  InvestigationCasePayload,
+  InvestigationExportPackage,
+  InvestigationFactSet,
+  InvestigationReviewAction,
+  InvestigationReviewRecord,
+  ObservedHistorySnapshot,
+  PrivateEvidenceRecord,
+} from '../types/investigation';
+import type {
+  PartnerNetworkPayload,
+  PartnerNetworkQueryMode,
+  PartnerNetworkSuggestionsPayload,
+} from './partnerNetworkGraph';
 
 // In-memory session token ONLY (never persisted to localStorage — SecureCoder / A09)
 let inMemoryAuthToken: string | null = null;
@@ -448,3 +463,220 @@ export async function deleteSavedDossier(id: string): Promise<SavedDossierSummar
   );
   return data.dossiers;
 }
+
+// ==========================================
+// FORENSIC INVESTIGATION MODULE API (STRICT AUTH)
+// ==========================================
+
+export class InvestigationConflictApiError extends Error {
+  readonly expectedVersion: number;
+  readonly currentVersion: number;
+
+  constructor(message: string, expectedVersion: number, currentVersion: number) {
+    super(message);
+    this.name = 'InvestigationConflictApiError';
+    this.expectedVersion = expectedVersion;
+    this.currentVersion = currentVersion;
+  }
+}
+
+export async function fetchInvestigationCase(contractId: string): Promise<InvestigationCasePayload> {
+  const res = await fetch(`/api/contracts/${encodeURIComponent(contractId)}/investigation`, {
+    headers: buildAuthHeaders(),
+  });
+  return readJson<InvestigationCasePayload>(
+    res,
+    'Falha ao carregar o caso de investigação forense.'
+  );
+}
+
+export async function runInvestigationCadastralQuery(
+  contractId: string,
+  payload: { purpose: string; legalBasis: string; justification: string }
+): Promise<{ extract: CadastralMinimizedExtract; investigation: InvestigationCasePayload }> {
+  const res = await fetch(
+    `/api/contracts/${encodeURIComponent(contractId)}/investigation/cadastral-query`,
+    {
+      method: 'POST',
+      headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(payload),
+    }
+  );
+  return readJson(res, 'Falha ao consultar dados cadastrais/QSA.');
+}
+
+export async function syncInvestigationPncpHistory(
+  contractId: string
+): Promise<{ observedHistory: ObservedHistorySnapshot; investigation: InvestigationCasePayload }> {
+  const res = await fetch(
+    `/api/contracts/${encodeURIComponent(contractId)}/investigation/pncp-history`,
+    {
+      method: 'POST',
+      headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+    }
+  );
+  return readJson(res, 'Falha ao sincronizar histórico contratual observado.');
+}
+
+export async function uploadPrivateEvidence(
+  contractId: string,
+  input: {
+    file: File;
+    sourceLabel: string;
+    description: string;
+    acquiredAt?: string;
+  }
+): Promise<{ evidence: PrivateEvidenceRecord; investigation: InvestigationCasePayload }> {
+  const form = new FormData();
+  form.append('file', input.file);
+  form.append('sourceLabel', input.sourceLabel);
+  form.append('description', input.description);
+  if (input.acquiredAt) {
+    form.append('acquiredAt', input.acquiredAt);
+  }
+  const res = await fetch(
+    `/api/contracts/${encodeURIComponent(contractId)}/investigation/evidence`,
+    {
+      method: 'POST',
+      headers: buildAuthHeaders(),
+      body: form,
+    }
+  );
+  return readJson(res, 'Falha ao anexar evidência privada.');
+}
+
+export async function downloadPrivateEvidenceFile(
+  contractId: string,
+  evidenceId: string,
+  fallbackFilename: string
+): Promise<void> {
+  const res = await fetch(
+    `/api/contracts/${encodeURIComponent(contractId)}/investigation/evidence/${encodeURIComponent(evidenceId)}/download`,
+    {
+      headers: buildAuthHeaders(),
+    }
+  );
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    let msg = `Falha ao baixar evidência privada (HTTP ${res.status}).`;
+    try {
+      const parsed = JSON.parse(errText) as { error?: string };
+      if (parsed.error) msg = parsed.error;
+    } catch {
+      // keep fallback
+    }
+    throw new Error(msg);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = fallbackFilename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+export async function updateInvestigationFacts(
+  contractId: string,
+  expectedVersion: number,
+  facts: Omit<InvestigationFactSet, 'version' | 'updatedAt' | 'updatedBy'>
+): Promise<InvestigationCasePayload> {
+  const res = await fetch(`/api/contracts/${encodeURIComponent(contractId)}/investigation/facts`, {
+    method: 'PUT',
+    headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ expectedVersion, facts }),
+  });
+
+  if (res.status === 409) {
+    const body = (await res.json().catch(() => ({}))) as {
+      error?: string;
+      expectedVersion?: number;
+      currentVersion?: number;
+    };
+    throw new InvestigationConflictApiError(
+      body.error ?? 'Conflito de versão nos fatos da investigação.',
+      body.expectedVersion ?? expectedVersion,
+      body.currentVersion ?? expectedVersion
+    );
+  }
+
+  return readJson<InvestigationCasePayload>(res, 'Falha ao salvar fatos da investigação.');
+}
+
+export async function submitInvestigationReview(
+  contractId: string,
+  payload: {
+    findingId: string;
+    action: InvestigationReviewAction;
+    rationale: string;
+  }
+): Promise<{ review: InvestigationReviewRecord; investigation: InvestigationCasePayload }> {
+  const res = await fetch(`/api/contracts/${encodeURIComponent(contractId)}/investigation/reviews`, {
+    method: 'POST',
+    headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  });
+  return readJson(res, 'Falha ao registrar revisão humana do apontamento.');
+}
+
+export async function exportInvestigationPackage(
+  contractId: string
+): Promise<InvestigationExportPackage> {
+  const res = await fetch(`/api/contracts/${encodeURIComponent(contractId)}/investigation/export`, {
+    headers: buildAuthHeaders(),
+  });
+  return readJson<InvestigationExportPackage>(
+    res,
+    'Falha ao exportar pacote verificável de investigação.'
+  );
+}
+
+// ==========================================
+// PARTNER & CORPORATE RELATIONSHIP NETWORK API
+// ==========================================
+
+export async function fetchPartnerNetwork(
+  query: string,
+  mode: PartnerNetworkQueryMode = 'auto',
+  syncPncp = true
+): Promise<PartnerNetworkPayload> {
+  const qs = new URLSearchParams();
+  qs.set('q', query.trim());
+  qs.set('mode', mode);
+  if (!syncPncp) qs.set('syncPncp', 'false');
+  const res = await fetch(`/api/network/partners?${qs.toString()}`, {
+    headers: buildAuthHeaders(),
+  });
+  return readJson<PartnerNetworkPayload>(
+    res,
+    'Falha ao mapear vínculos societários e contratos.'
+  );
+}
+
+export async function fetchPartnerNetworkSuggestions(): Promise<PartnerNetworkSuggestionsPayload> {
+  const res = await fetch('/api/network/partners/suggestions', {
+    headers: buildAuthHeaders(),
+  });
+  return readJson<PartnerNetworkSuggestionsPayload>(
+    res,
+    'Falha ao consultar cobertura do índice societário (QSA).'
+  );
+}
+
+export async function enrichPartnerNetworkIndex(limit = 10): Promise<{
+  attempted: number;
+  enriched: number;
+  failed: number;
+  enrichedCnpjs: string[];
+  suggestions: PartnerNetworkSuggestionsPayload;
+}> {
+  const res = await fetch('/api/network/partners/enrich-index', {
+    method: 'POST',
+    headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ limit }),
+  });
+  return readJson(res, 'Falha ao indexar quadros societários (BrasilAPI).');
+}
+

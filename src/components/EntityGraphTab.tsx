@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ArrowRight, GitBranch } from 'lucide-react';
+import { ArrowRight, GitBranch, Network } from 'lucide-react';
 import type { EvaluatedContract } from '../types/audit';
 import { fetchSupplierMirrorContracts } from '../lib/api';
 import { formatCnpj, formatCurrencyBRL, formatDateBR } from '../lib/formatters';
@@ -8,6 +8,7 @@ import { RiskScoreInline } from './RiskText';
 interface EntityGraphTabProps {
   contract: EvaluatedContract;
   onSelectContract?: (contract: EvaluatedContract) => void;
+  onOpenPartnerNetwork?: (query: string, mode?: 'auto' | 'company' | 'partner') => void;
 }
 
 interface FtmEntityNode {
@@ -26,7 +27,11 @@ interface FtmEdge {
   evidence: string;
 }
 
-export function EntityGraphTab({ contract, onSelectContract }: EntityGraphTabProps) {
+export function EntityGraphTab({
+  contract,
+  onSelectContract,
+  onOpenPartnerNetwork,
+}: EntityGraphTabProps) {
   const [mirrorContracts, setMirrorContracts] = useState<EvaluatedContract[]>([]);
   const [indexSource, setIndexSource] = useState<string>('SQLite Local + PNCP Search API');
   const [loadingMirror, setLoadingMirror] = useState(false);
@@ -198,8 +203,20 @@ export function EntityGraphTab({ contract, onSelectContract }: EntityGraphTabPro
               Grafo Probatório de Entidades ({nodes.length} nós · {edges.length} arestas)
             </h2>
           </div>
-          <div className="text-xs font-mono text-slate-500 dark:text-slate-400 shrink-0">
-            Entidade raiz: ftm:contract:{contract.id}
+          <div className="flex flex-wrap items-center gap-3 shrink-0">
+            {onOpenPartnerNetwork && hasValidSupplierCnpj && (
+              <button
+                type="button"
+                onClick={() => onOpenPartnerNetwork(contract.supplier.cnpj, 'company')}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-[#0B2540] dark:bg-[#D95B35] hover:opacity-90 rounded-md transition-opacity whitespace-nowrap"
+              >
+                <Network className="w-3.5 h-3.5" aria-hidden="true" />
+                Mapa de Vínculos Societários
+              </button>
+            )}
+            <div className="text-xs font-mono text-slate-500 dark:text-slate-400">
+              Entidade raiz: ftm:contract:{contract.id}
+            </div>
           </div>
         </div>
 

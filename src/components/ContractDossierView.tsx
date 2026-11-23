@@ -10,6 +10,7 @@ import {
   FileCode2,
   FileDown,
   FileJson,
+  Network,
   RefreshCw,
   RotateCcw,
   ShieldAlert,
@@ -44,9 +45,12 @@ import { downloadConsolidatedAuditReportPdf } from '../lib/pdfReportGenerator';
 import { DossierRiskCharts } from './DossierRiskCharts';
 import { getRiskToneClass, SeverityText } from './RiskText';
 import { EntityGraphTab } from './EntityGraphTab';
+import { ForensicInvestigationTab } from './ForensicInvestigationTab';
+import type { AuthPrincipalInfo } from '../lib/api';
 
 type DossierTab =
   | 'overview'
+  | 'investigation'
   | 'benchmark'
   | 'graph'
   | 'supplier'
@@ -60,6 +64,9 @@ interface ContractDossierViewProps {
   onSelectContract?: (contract: EvaluatedContract) => void;
   archivedSnapshot?: SavedDossierSnapshot | null;
   onOpenCurrentContract?: () => void;
+  authPrincipal?: AuthPrincipalInfo | null;
+  onRequireAuth?: () => void;
+  onOpenPartnerNetwork?: (query: string, mode?: 'auto' | 'company' | 'partner') => void;
 }
 
 function downloadTextFile(filename: string, content: string, mimeType: string) {
@@ -148,6 +155,9 @@ export function ContractDossierView({
   onSelectContract,
   archivedSnapshot,
   onOpenCurrentContract,
+  authPrincipal = null,
+  onRequireAuth,
+  onOpenPartnerNetwork,
 }: ContractDossierViewProps) {
   const { assessment } = contract;
   const isSnapshotReadOnly = Boolean(archivedSnapshot);
@@ -866,11 +876,12 @@ export function ContractDossierView({
         <div
           role="tablist"
           aria-label="Seções do dossiê"
-          className="flex items-center gap-6 min-w-max"
+          className="flex items-center gap-4 min-w-max"
         >
           {(
             [
               { id: 'overview', label: `Resumo e Riscos (${assessment.indicators.length})` },
+              { id: 'investigation', label: 'Investigação Forense' },
               { id: 'benchmark', label: 'Benchmarking & Execução' },
               { id: 'graph', label: 'Grafo FollowTheMoney' },
               { id: 'supplier', label: 'Fornecedor e Sanções' },
@@ -889,7 +900,7 @@ export function ContractDossierView({
                 type="button"
                 aria-selected={active}
                 onClick={() => setActiveTab(tab.id)}
-                className={`pb-3 text-sm font-medium border-b-2 transition-colors whitespace-nowrap shrink-0 ${
+                className={`pb-3 text-[13px] font-medium border-b-2 transition-colors whitespace-nowrap shrink-0 ${
                   active
                     ? 'border-[#0B2540] dark:border-[#D95B35] text-[#0B2540] dark:text-[#FAF9F5]'
                     : 'border-transparent text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
@@ -1681,7 +1692,11 @@ export function ContractDossierView({
 
       {/* TAB 3: GRAFO FOLLOWTHEMONEY */}
       {activeTab === 'graph' && (
-        <EntityGraphTab contract={contract} onSelectContract={onSelectContract} />
+        <EntityGraphTab
+          contract={contract}
+          onSelectContract={onSelectContract}
+          onOpenPartnerNetwork={onOpenPartnerNetwork}
+        />
       )}
 
       {/* TAB 4: FORNECEDOR, RECEITA/CNPJ, QSA E SANÇÕES */}
@@ -1711,18 +1726,32 @@ export function ContractDossierView({
                 </div>
               </div>
 
-              <button
-                type="button"
-                disabled={checkingCnpj}
-                onClick={handleLiveCnpjCheck}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 bg-white dark:bg-[#061321] border border-slate-300 dark:border-[#1D3A57] hover:bg-slate-50 dark:hover:bg-[#102843] rounded-md transition-colors whitespace-nowrap disabled:opacity-60"
-              >
-                <RefreshCw
-                  className={`w-3.5 h-3.5 ${checkingCnpj ? 'animate-spin' : ''}`}
-                  aria-hidden="true"
-                />
-                {checkingCnpj ? 'Consultando Receita...' : 'Consultar Receita (Tempo Real)'}
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                {onOpenPartnerNetwork &&
+                  contract.supplier.cnpj &&
+                  contract.supplier.cnpj !== '00000000000000' && (
+                    <button
+                      type="button"
+                      onClick={() => onOpenPartnerNetwork(contract.supplier.cnpj, 'company')}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-[#0B2540] dark:bg-[#D95B35] hover:opacity-90 rounded-md transition-opacity whitespace-nowrap"
+                    >
+                      <Network className="w-3.5 h-3.5" aria-hidden="true" />
+                      Mapa de Vínculos Societários
+                    </button>
+                  )}
+                <button
+                  type="button"
+                  disabled={checkingCnpj}
+                  onClick={handleLiveCnpjCheck}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-700 dark:text-slate-200 bg-white dark:bg-[#061321] border border-slate-300 dark:border-[#1D3A57] hover:bg-slate-50 dark:hover:bg-[#102843] rounded-md transition-colors whitespace-nowrap disabled:opacity-60"
+                >
+                  <RefreshCw
+                    className={`w-3.5 h-3.5 ${checkingCnpj ? 'animate-spin' : ''}`}
+                    aria-hidden="true"
+                  />
+                  {checkingCnpj ? 'Consultando Receita...' : 'Consultar Receita (Tempo Real)'}
+                </button>
+              </div>
             </div>
 
             {liveCnpjResult && (
@@ -1880,7 +1909,18 @@ export function ContractDossierView({
                     {contract.supplier.shareholders.map((sh) => (
                       <tr key={sh.name}>
                         <td className="py-3 px-5 font-medium text-slate-900 dark:text-[#FAF9F5]">
-                          {sh.name}
+                          <div className="flex items-center gap-2">
+                            <span>{sh.name}</span>
+                            {onOpenPartnerNetwork && (
+                              <button
+                                type="button"
+                                onClick={() => onOpenPartnerNetwork(sh.name, 'partner')}
+                                className="text-[11px] font-semibold text-[#D95B35] hover:underline whitespace-nowrap"
+                              >
+                                Mapear rede →
+                              </button>
+                            )}
+                          </div>
                         </td>
                         <td className="py-3 px-5 text-slate-600 dark:text-slate-300">{sh.role}</td>
                         <td className="py-3 px-5 font-mono text-xs text-slate-600 dark:text-slate-300">
@@ -2225,6 +2265,15 @@ export function ContractDossierView({
             ))
           )}
         </div>
+      )}
+
+      {/* TAB: INVESTIGAÇÃO FORENSE */}
+      {activeTab === 'investigation' && (
+        <ForensicInvestigationTab
+          contract={contract}
+          authPrincipal={authPrincipal}
+          onRequireAuth={onRequireAuth ?? (() => {})}
+        />
       )}
     </div>
   );
