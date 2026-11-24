@@ -271,6 +271,8 @@ export interface InvestigationCasePayload {
     municipalityIbge: string;
     uf: string;
     entityName: string;
+    publicationDate?: string | null;
+    submissionDate?: string | null;
     signatureDate: string;
     originalValue: number;
     updatedValue: number;

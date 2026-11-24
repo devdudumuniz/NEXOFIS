@@ -25,6 +25,10 @@ import {
   MAX_PRIVATE_EVIDENCE_BYTES,
 } from '@nexofis/shared/lib/forensicInvestigationEngine';
 import type { SupplierQsaRecord, SupplierQsaShareholder } from '@nexofis/shared/lib/partnerNetworkGraph';
+import {
+  computeCanonicalDossierSnapshotHash,
+  extractDistinctContractDates,
+} from '@nexofis/shared/lib/contractLifecycleEvents';
 
 export interface InvestigationActor {
   actorId: string;
@@ -103,10 +107,20 @@ export interface NexofisStore {
   getStoredContractById(id: string): ContractRecord | null;
   listDossiers(): SavedDossierSummary[];
   getDossierById(id: string): SavedDossierSnapshot | null;
+  getDossierByHash(sha256Digest: string): SavedDossierSummary | null;
   saveDossier(
     dossier: SavedDossierSummary,
     snapshot?: { contract: EvaluatedContract; reviews: FindingReviewRecord[] }
   ): SavedDossierSummary[];
+  saveDossierWithDedup(
+    dossier: SavedDossierSummary,
+    snapshot?: { contract: EvaluatedContract; reviews: FindingReviewRecord[] }
+  ): {
+    dossier: SavedDossierSummary;
+    dossiers: SavedDossierSummary[];
+    deduplicated: boolean;
+    contentHash: string;
+  };
   deleteDossier(id: string): boolean;
   addFindingReview(review: FindingReviewRecord): FindingReviewRecord;
   listFindingReviews(contractId: string): FindingReviewRecord[];
@@ -590,6 +604,90 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
     }
   }
 
+  // Additive migration v7:
+  //  - Defect 1.8: Explicit separate publication_date, submission_date, and lifecycle_events_json columns on contracts
+  //  - Defect 1.2: Content-hash deduplication UNIQUE(sha256_digest) on saved_dossiers so identical snapshots are NEVER replicated
+  const v7Check = db
+    .prepare('SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations')
+    .get() as { version: number };
+
+  if (v7Check.version < 7) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      safeAddColumn(db, 'contracts', 'publication_date TEXT');
+      safeAddColumn(db, 'contracts', 'submission_date TEXT');
+      safeAddColumn(db, 'contracts', 'lifecycle_events_json TEXT');
+
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_contracts_publication_date ON contracts(publication_date);
+        CREATE INDEX IF NOT EXISTS idx_contracts_submission_date ON contracts(submission_date);
+
+        CREATE TABLE saved_dossiers_v7 (
+          id TEXT PRIMARY KEY,
+          contract_id TEXT NOT NULL,
+          contract_number TEXT NOT NULL,
+          municipality_name TEXT NOT NULL,
+          municipality_ibge TEXT NOT NULL,
+          entity_name TEXT NOT NULL,
+          supplier_name TEXT NOT NULL,
+          risk_score INTEGER NOT NULL,
+          saved_at TEXT NOT NULL,
+          analyst_note TEXT NOT NULL,
+          sha256_digest TEXT NOT NULL UNIQUE,
+          snapshot_json TEXT
+        );
+
+        INSERT INTO saved_dossiers_v7 (
+          id, contract_id, contract_number, municipality_name, municipality_ibge,
+          entity_name, supplier_name, risk_score, saved_at, analyst_note, sha256_digest, snapshot_json
+        )
+        SELECT
+          id, contract_id, contract_number, municipality_name, municipality_ibge,
+          entity_name, supplier_name, risk_score, saved_at, analyst_note, sha256_digest, snapshot_json
+        FROM saved_dossiers
+        WHERE rowid IN (
+          SELECT MIN(rowid) FROM saved_dossiers GROUP BY sha256_digest
+        );
+
+        DROP TABLE saved_dossiers;
+        ALTER TABLE saved_dossiers_v7 RENAME TO saved_dossiers;
+
+        CREATE INDEX IF NOT EXISTS idx_saved_dossiers_contract ON saved_dossiers(contract_id, saved_at DESC);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_dossiers_sha256 ON saved_dossiers(sha256_digest);
+      `);
+
+      // Backfill explicit publication_date, submission_date, and lifecycle_events_json on existing contracts rows
+      const existingContracts = db
+        .prepare('SELECT id, payload_json FROM contracts')
+        .all() as Array<{ id: string; payload_json: string }>;
+      const stmtBackfillContractDates = db.prepare(
+        'UPDATE contracts SET publication_date = ?, submission_date = ?, lifecycle_events_json = ? WHERE id = ?'
+      );
+      for (const row of existingContracts) {
+        try {
+          const parsed = JSON.parse(row.payload_json) as ContractRecord;
+          const distinct = extractDistinctContractDates(parsed);
+          stmtBackfillContractDates.run(
+            distinct.publicationDate,
+            distinct.submissionDate,
+            distinct.events.length > 0 ? JSON.stringify(distinct.events) : null,
+            row.id
+          );
+        } catch {
+          // Ignore malformed legacy rows
+        }
+      }
+
+      db.prepare(
+        'INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)'
+      ).run(7, 'contract_lifecycle_dates_and_dossier_hash_dedup', new Date().toISOString());
+      db.exec('COMMIT');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
   const stmtInsertOfficialSnapshot = db.prepare(`
     INSERT INTO official_reference_snapshots (
       id, source_kind, filename, sha256, competencia, uf, uf_norm,
@@ -683,8 +781,9 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
   const stmtUpsertContract = db.prepare(`
     INSERT INTO contracts (
       id, pncp_control_number, contract_number, municipality_ibge, supplier_cnpj,
-      cnpj_role, year, data_source_origin, payload_json, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      cnpj_role, year, data_source_origin, publication_date, submission_date, lifecycle_events_json,
+      payload_json, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       pncp_control_number = excluded.pncp_control_number,
       contract_number = excluded.contract_number,
@@ -693,6 +792,9 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
       cnpj_role = excluded.cnpj_role,
       year = excluded.year,
       data_source_origin = excluded.data_source_origin,
+      publication_date = excluded.publication_date,
+      submission_date = excluded.submission_date,
+      lifecycle_events_json = excluded.lifecycle_events_json,
       payload_json = excluded.payload_json,
       updated_at = excluded.updated_at
   `);
@@ -719,23 +821,27 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
     WHERE id = ?
   `);
 
-  const stmtUpsertDossier = db.prepare(`
+  const stmtGetDossierByHash = db.prepare(`
+    SELECT id, contract_id, contract_number, municipality_name, municipality_ibge,
+           entity_name, supplier_name, risk_score, saved_at, analyst_note, sha256_digest,
+           CASE WHEN snapshot_json IS NOT NULL AND length(snapshot_json) > 2 THEN 1 ELSE 0 END AS has_snapshot
+    FROM saved_dossiers
+    WHERE sha256_digest = ?
+  `);
+
+  const stmtListDossierSnapshotsByContract = db.prepare(`
+    SELECT id, contract_id, contract_number, municipality_name, municipality_ibge,
+           entity_name, supplier_name, risk_score, saved_at, analyst_note, sha256_digest, snapshot_json
+    FROM saved_dossiers
+    WHERE contract_id = ?
+    ORDER BY saved_at ASC
+  `);
+
+  const stmtInsertDossier = db.prepare(`
     INSERT INTO saved_dossiers (
       id, contract_id, contract_number, municipality_name, municipality_ibge,
       entity_name, supplier_name, risk_score, saved_at, analyst_note, sha256_digest, snapshot_json
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(contract_id) DO UPDATE SET
-      id = excluded.id,
-      contract_number = excluded.contract_number,
-      municipality_name = excluded.municipality_name,
-      municipality_ibge = excluded.municipality_ibge,
-      entity_name = excluded.entity_name,
-      supplier_name = excluded.supplier_name,
-      risk_score = excluded.risk_score,
-      saved_at = excluded.saved_at,
-      analyst_note = excluded.analyst_note,
-      sha256_digest = excluded.sha256_digest,
-      snapshot_json = excluded.snapshot_json
   `);
 
   const stmtDeleteDossier = db.prepare('DELETE FROM saved_dossiers WHERE id = ?');
@@ -1194,16 +1300,28 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
       return Number(row.version);
     },
     upsertContract(contract: ContractRecord) {
+      const distinctDates = extractDistinctContractDates(contract);
+      const normalizedContract: ContractRecord = {
+        ...contract,
+        publicationDate: distinctDates.publicationDate,
+        submissionDate: distinctDates.submissionDate,
+        submissionWindowStart: distinctDates.submissionWindowStart,
+        submissionWindowEnd: distinctDates.submissionWindowEnd,
+        lifecycleEvents: distinctDates.events,
+      };
       stmtUpsertContract.run(
-        contract.id,
-        contract.pncpControlNumber ?? '',
-        contract.contractNumber ?? '',
-        contract.municipalityIbge ?? '',
-        contract.supplier?.cnpj ?? '',
-        contract.cnpjRole ?? null,
-        contract.year ?? new Date().getUTCFullYear(),
-        contract.dataSourceOrigin ?? 'Índice Local',
-        JSON.stringify(contract),
+        normalizedContract.id,
+        normalizedContract.pncpControlNumber ?? '',
+        normalizedContract.contractNumber ?? '',
+        normalizedContract.municipalityIbge ?? '',
+        normalizedContract.supplier?.cnpj ?? '',
+        normalizedContract.cnpjRole ?? null,
+        normalizedContract.year ?? new Date().getUTCFullYear(),
+        normalizedContract.dataSourceOrigin ?? 'Índice Local',
+        distinctDates.publicationDate,
+        distinctDates.submissionDate,
+        distinctDates.events.length > 0 ? JSON.stringify(distinctDates.events) : null,
+        JSON.stringify(normalizedContract),
         new Date().toISOString()
       );
     },
@@ -1212,16 +1330,28 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
       db.exec('BEGIN');
       try {
         for (const contract of contracts) {
+          const distinctDates = extractDistinctContractDates(contract);
+          const normalizedContract: ContractRecord = {
+            ...contract,
+            publicationDate: distinctDates.publicationDate,
+            submissionDate: distinctDates.submissionDate,
+            submissionWindowStart: distinctDates.submissionWindowStart,
+            submissionWindowEnd: distinctDates.submissionWindowEnd,
+            lifecycleEvents: distinctDates.events,
+          };
           stmtUpsertContract.run(
-            contract.id,
-            contract.pncpControlNumber,
-            contract.contractNumber,
-            contract.municipalityIbge,
-            contract.supplier.cnpj,
-            contract.cnpjRole ?? null,
-            contract.year,
-            contract.dataSourceOrigin,
-            JSON.stringify(contract),
+            normalizedContract.id,
+            normalizedContract.pncpControlNumber,
+            normalizedContract.contractNumber,
+            normalizedContract.municipalityIbge,
+            normalizedContract.supplier.cnpj,
+            normalizedContract.cnpjRole ?? null,
+            normalizedContract.year,
+            normalizedContract.dataSourceOrigin,
+            distinctDates.publicationDate,
+            distinctDates.submissionDate,
+            distinctDates.events.length > 0 ? JSON.stringify(distinctDates.events) : null,
+            JSON.stringify(normalizedContract),
             now
           );
         }
@@ -1281,23 +1411,134 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
         snapshotReviews,
       };
     },
-    saveDossier(dossier: SavedDossierSummary, snapshot?: { contract: EvaluatedContract; reviews: FindingReviewRecord[] }) {
+    getDossierByHash(sha256Digest: string) {
+      const cleanHash = sha256Digest.trim().toLowerCase();
+      if (!cleanHash) return null;
+      const row = stmtGetDossierByHash.get(cleanHash) as Record<string, unknown> | undefined;
+      return row ? mapDossierRow(row) : null;
+    },
+    saveDossierWithDedup(
+      dossier: SavedDossierSummary,
+      snapshot?: { contract: EvaluatedContract; reviews: FindingReviewRecord[] }
+    ) {
+      // Defect 1.2: Always verify/compute canonical content hash on the backend so identical dossier
+      // snapshots cannot be replicated even across different timestamps, IDs, or client-supplied digests.
+      const verifiedContentHash = snapshot
+        ? computeCanonicalDossierSnapshotHash({
+            contractId: dossier.contractId,
+            contract: snapshot.contract,
+            reviews: snapshot.reviews,
+            analystNote: dossier.analystNote,
+          })
+        : dossier.sha256Digest.trim().toLowerCase() ||
+          crypto
+            .createHash('sha256')
+            .update(
+              JSON.stringify({
+                contractId: dossier.contractId,
+                contractNumber: dossier.contractNumber,
+                riskScore: dossier.riskScore,
+                analystNote: dossier.analystNote.trim(),
+              })
+            )
+            .digest('hex');
+
+      const existing = stmtGetDossierByHash.get(verifiedContentHash) as Record<string, unknown> | undefined;
+      if (existing) {
+        return {
+          dossier: mapDossierRow(existing),
+          dossiers: this.listDossiers(),
+          deduplicated: true,
+          contentHash: verifiedContentHash,
+        };
+      }
+
+      // Deep pre-persistence comparison: also verify canonical SHA-256 against any previously stored
+      // snapshots for the same contract (protects against duplicating pre-v7 legacy rows whose stored
+      // digest included volatile evaluatedAt timestamps).
+      if (snapshot) {
+        const contractRows = stmtListDossierSnapshotsByContract.all(dossier.contractId) as Array<
+          Record<string, unknown>
+        >;
+        for (const row of contractRows) {
+          if (typeof row.snapshot_json !== 'string' || !row.snapshot_json.trim()) continue;
+          try {
+            const parsed = JSON.parse(row.snapshot_json) as {
+              contract?: EvaluatedContract;
+              reviews?: FindingReviewRecord[];
+            };
+            if (!parsed.contract) continue;
+            const storedCanonicalHash = computeCanonicalDossierSnapshotHash({
+              contractId: String(row.contract_id),
+              contract: parsed.contract,
+              reviews: Array.isArray(parsed.reviews) ? parsed.reviews : [],
+              analystNote: String(row.analyst_note ?? ''),
+            });
+            if (storedCanonicalHash === verifiedContentHash) {
+              return {
+                dossier: mapDossierRow(row),
+                dossiers: this.listDossiers(),
+                deduplicated: true,
+                contentHash: verifiedContentHash,
+              };
+            }
+          } catch {
+            // Skip unreadable legacy JSON
+          }
+        }
+      }
+
       const snapshotJson = snapshot ? JSON.stringify(snapshot) : null;
-      stmtUpsertDossier.run(
-        dossier.id,
-        dossier.contractId,
-        dossier.contractNumber,
-        dossier.municipalityName,
-        dossier.municipalityIbge,
-        dossier.entityName,
-        dossier.supplierName,
-        dossier.riskScore,
-        dossier.savedAt,
-        dossier.analystNote,
-        dossier.sha256Digest,
-        snapshotJson
-      );
-      return this.listDossiers();
+      try {
+        const res = stmtInsertDossier.run(
+          dossier.id,
+          dossier.contractId,
+          dossier.contractNumber,
+          dossier.municipalityName,
+          dossier.municipalityIbge,
+          dossier.entityName,
+          dossier.supplierName,
+          dossier.riskScore,
+          dossier.savedAt,
+          dossier.analystNote,
+          verifiedContentHash,
+          snapshotJson
+        );
+        if (Number(res.changes) !== 1) {
+          throw new Error(
+            `Persistência do snapshot de dossiê falhou: nenhuma linha gravada (id=${dossier.id}).`
+          );
+        }
+      } catch (err) {
+        // Handle concurrent race on UNIQUE(sha256_digest) cleanly as idempotent deduplication
+        const concurrentExisting = stmtGetDossierByHash.get(verifiedContentHash) as
+          | Record<string, unknown>
+          | undefined;
+        if (concurrentExisting) {
+          return {
+            dossier: mapDossierRow(concurrentExisting),
+            dossiers: this.listDossiers(),
+            deduplicated: true,
+            contentHash: verifiedContentHash,
+          };
+        }
+        throw err;
+      }
+
+      const verifiedRow = stmtGetDossierById.get(dossier.id) as Record<string, unknown> | undefined;
+      if (!verifiedRow) {
+        throw new Error(`Releitura pós-gravação do dossiê falhou (id=${dossier.id}).`);
+      }
+
+      return {
+        dossier: mapDossierRow(verifiedRow),
+        dossiers: this.listDossiers(),
+        deduplicated: false,
+        contentHash: verifiedContentHash,
+      };
+    },
+    saveDossier(dossier: SavedDossierSummary, snapshot?: { contract: EvaluatedContract; reviews: FindingReviewRecord[] }) {
+      return this.saveDossierWithDedup(dossier, snapshot).dossiers;
     },
     deleteDossier(id: string) {
       const result = stmtDeleteDossier.run(id);

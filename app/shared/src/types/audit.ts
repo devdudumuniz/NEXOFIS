@@ -411,6 +411,27 @@ export interface PncpVerificationRecord {
   coverageNote?: string;
 }
 
+export type ContractLifecycleEventType =
+  | 'publication'
+  | 'proposal_submission_open'
+  | 'proposal_submission'
+  | 'proposal_submission_close'
+  | 'signature'
+  | 'execution_start'
+  | 'execution_end';
+
+export interface ContractLifecycleEvent {
+  type: ContractLifecycleEventType;
+  /** ISO-8601 date (YYYY-MM-DD) or full ISO timestamp */
+  date: string;
+  sourceSystem: string;
+  sourceField?: string;
+  channelName?: string | null;
+  channelUrl?: string | null;
+  timezone?: string;
+  notes?: string;
+}
+
 export interface ContractRecord {
   id: string;
   pncpControlNumber: string;
@@ -433,6 +454,16 @@ export interface ContractRecord {
   object: string;
   objectCategory: string;
   expectedCnaePrefixes: string[];
+  /** Explicit official publication date (e.g. PNCP / Diário Oficial) — strictly distinct from proposal submission and contract execution start (Defect 1.8) */
+  publicationDate?: string | null;
+  /** Explicit proposal submission date / deadline — strictly distinct from publicationDate (Defect 1.8) */
+  submissionDate?: string | null;
+  /** Optional start of proposal submission window (ISO date or timestamp) */
+  submissionWindowStart?: string | null;
+  /** Optional end / closing deadline of proposal submission window (ISO date or timestamp) */
+  submissionWindowEnd?: string | null;
+  /** Structured timeline separating publication, proposal submission, signature, and execution as distinct events (Defect 1.8) */
+  lifecycleEvents?: ContractLifecycleEvent[];
   signatureDate: string;
   startDate: string;
   endDate: string;
@@ -490,6 +521,11 @@ export interface OCDSRelease {
     id: string;
     title: string;
     procurementMethodDetails: string;
+    datePublished?: string;
+    tenderPeriod?: {
+      startDate?: string;
+      endDate?: string;
+    };
     numberOfTenderers?: number;
     value?: { amount: number; currency: 'BRL' };
   };

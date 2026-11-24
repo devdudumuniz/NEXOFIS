@@ -11,6 +11,12 @@ export interface ExtractedDocumentFields {
   object: string | null;
   originalValue: number | null;
   updatedValue: number | null;
+  /** Explicit official publication date extracted from document text (distinct from submission/signature — Defect 1.8) */
+  publicationDate: string | null;
+  /** Explicit proposal submission date / deadline extracted from document text (distinct from publication — Defect 1.8) */
+  submissionDate: string | null;
+  submissionWindowStart: string | null;
+  submissionWindowEnd: string | null;
   signatureDate: string | null;
   extractionMethod: ExtractionMethod;
   confidence: number;
@@ -217,9 +223,81 @@ export function extractFieldsFromNativeText(
     });
   }
 
-  // Signature date dd/mm/yyyy
-  const dateMatch = text.match(/(\d{2})\/(\d{2})\/(\d{4})/);
-  const signatureDate = dateMatch ? `${dateMatch[3]}-${dateMatch[2]}-${dateMatch[1]}` : null;
+  // Helper: convert DD/MM/YYYY or YYYY-MM-DD match to ISO YYYY-MM-DD
+  const toIsoBrOrIso = (raw: string): string | null => {
+    const br = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+    if (br) return `${br[3]}-${br[2]}-${br[1]}`;
+    const iso = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+    return iso ? iso[1] : null;
+  };
+
+  // Explicit publication date (Defect 1.8: strictly separate from proposal submission and contract signature)
+  const pubMatch = text.match(
+    /(?:data\s+de\s+publica[cç][aã]o|publicado\s+em|publica[cç][aã]o(?:\s+no\s+(?:pncp|di[aá]rio\s+oficial|dou|dom))?)\s*[:\-]?\s*(\d{2}\/\d{2}\/\d{4}|\d{4}-\d{2}-\d{2})/i
+  );
+  const publicationDate = pubMatch ? toIsoBrOrIso(pubMatch[1]) : null;
+  if (pubMatch && publicationDate) {
+    excerpts.push({
+      field: 'data_publicacao',
+      pageNumber: 1,
+      excerpt: pubMatch[0].trim(),
+      normalizedValue: publicationDate,
+    });
+  }
+
+  // Explicit proposal submission window / date (Defect 1.8: never conflated with publicationDate)
+  const subOpenMatch = text.match(
+    /(?:abertura\s+(?:das?\s+)?propostas?|in[ií]cio\s+(?:do\s+)?(?:envio|recebimento|submiss[aã]o)\s+(?:de|das?)\s+propostas?)\s*[:\-]?\s*(\d{2}\/\d{2}\/\d{4}|\d{4}-\d{2}-\d{2})/i
+  );
+  const submissionWindowStart = subOpenMatch ? toIsoBrOrIso(subOpenMatch[1]) : null;
+  if (subOpenMatch && submissionWindowStart) {
+    excerpts.push({
+      field: 'abertura_propostas',
+      pageNumber: 1,
+      excerpt: subOpenMatch[0].trim(),
+      normalizedValue: submissionWindowStart,
+    });
+  }
+
+  const subCloseMatch = text.match(
+    /(?:encerramento\s+(?:das?\s+)?propostas?|prazo\s+(?:final\s+)?(?:para\s+)?(?:envio|submiss[aã]o)\s+(?:de|das?)\s+propostas?|limite\s+(?:de|para)\s+submiss[aã]o)\s*[:\-]?\s*(\d{2}\/\d{2}\/\d{4}|\d{4}-\d{2}-\d{2})/i
+  );
+  const submissionWindowEnd = subCloseMatch ? toIsoBrOrIso(subCloseMatch[1]) : null;
+  if (subCloseMatch && submissionWindowEnd) {
+    excerpts.push({
+      field: 'encerramento_propostas',
+      pageNumber: 1,
+      excerpt: subCloseMatch[0].trim(),
+      normalizedValue: submissionWindowEnd,
+    });
+  }
+
+  const subExplicitMatch = text.match(
+    /(?:data\s+de\s+submiss[aã]o|submiss[aã]o\s+(?:de|das?)\s+propostas?|envio\s+(?:de|das?)\s+propostas?)\s*[:\-]?\s*(\d{2}\/\d{2}\/\d{4}|\d{4}-\d{2}-\d{2})/i
+  );
+  const submissionDate =
+    (subExplicitMatch ? toIsoBrOrIso(subExplicitMatch[1]) : null) ??
+    submissionWindowEnd ??
+    submissionWindowStart ??
+    null;
+  if (subExplicitMatch && submissionDate) {
+    excerpts.push({
+      field: 'data_submissao',
+      pageNumber: 1,
+      excerpt: subExplicitMatch[0].trim(),
+      normalizedValue: submissionDate,
+    });
+  }
+
+  // Signature date dd/mm/yyyy (prefer explicit label; fallback to generic date only when not labeled as publication/submission)
+  const sigLabeledMatch = text.match(
+    /(?:data\s+de\s+assinatura|assinado\s+em|assinatura\s+do\s+contrato)\s*[:\-]?\s*(\d{2}\/\d{2}\/\d{4}|\d{4}-\d{2}-\d{2})/i
+  );
+  let signatureDate: string | null = sigLabeledMatch ? toIsoBrOrIso(sigLabeledMatch[1]) : null;
+  if (!signatureDate && !publicationDate && !submissionDate) {
+    const dateMatch = text.match(/(\d{2})\/(\d{2})\/(\d{4})/);
+    signatureDate = dateMatch ? `${dateMatch[3]}-${dateMatch[2]}-${dateMatch[1]}` : null;
+  }
 
   const detectedCount = [contractNumber, cnpj, supplierName, object, originalValue].filter(Boolean).length;
   const confidence = Number(Math.min(0.99, 0.55 + detectedCount * 0.088).toFixed(2));
@@ -234,6 +312,10 @@ export function extractFieldsFromNativeText(
     object,
     originalValue,
     updatedValue,
+    publicationDate,
+    submissionDate,
+    submissionWindowStart,
+    submissionWindowEnd,
     signatureDate,
     extractionMethod: method,
     confidence,

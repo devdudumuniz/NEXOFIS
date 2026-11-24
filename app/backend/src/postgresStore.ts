@@ -17,6 +17,7 @@ import type {
   SavedDossierSummary,
 } from '@nexofis/shared/types/audit';
 import type { DocumentArtifactRecord, SyncCheckpoint } from './storage';
+import { extractDistinctContractDates } from '@nexofis/shared/lib/contractLifecycleEvents';
 
 interface PgQueryResult<T = Record<string, unknown>> {
   rows: T[];
@@ -84,18 +85,29 @@ export async function createPostgresStore(
   });
 
   const upsertContract = async (contract: ContractRecord): Promise<void> => {
+    const distinctDates = extractDistinctContractDates(contract);
+    const normalizedContract: ContractRecord = {
+      ...contract,
+      publicationDate: distinctDates.publicationDate,
+      submissionDate: distinctDates.submissionDate,
+      submissionWindowStart: distinctDates.submissionWindowStart,
+      submissionWindowEnd: distinctDates.submissionWindowEnd,
+      lifecycleEvents: distinctDates.events,
+    };
     await pool.query(
       `
       INSERT INTO contracts (
         id, pncp_control_number, contract_number, municipality_ibge, municipality_name, uf,
         entity_id, entity_name, supplier_cnpj, cnpj_role, year, lifecycle_status,
-        signature_date, start_date, end_date, original_value_cents, updated_value_cents,
+        publication_date, submission_date, signature_date, start_date, end_date,
+        original_value_cents, updated_value_cents,
         data_source_origin, payload_json, updated_at
       ) VALUES (
         $1, $2, $3, $4, $5, $6,
         $7, $8, $9, $10, $11, $12,
         $13, $14, $15, $16, $17,
-        $18, $19::jsonb, NOW()
+        $18, $19,
+        $20, $21::jsonb, NOW()
       )
       ON CONFLICT (id) DO UPDATE SET
         pncp_control_number = EXCLUDED.pncp_control_number,
@@ -109,6 +121,8 @@ export async function createPostgresStore(
         cnpj_role = EXCLUDED.cnpj_role,
         year = EXCLUDED.year,
         lifecycle_status = EXCLUDED.lifecycle_status,
+        publication_date = EXCLUDED.publication_date,
+        submission_date = EXCLUDED.submission_date,
         signature_date = EXCLUDED.signature_date,
         start_date = EXCLUDED.start_date,
         end_date = EXCLUDED.end_date,
@@ -119,25 +133,27 @@ export async function createPostgresStore(
         updated_at = NOW()
       `,
       [
-        contract.id,
-        contract.pncpControlNumber,
-        contract.contractNumber,
-        contract.municipalityIbge,
-        contract.municipalityName,
-        contract.uf.slice(0, 2).toUpperCase(),
-        contract.entityId,
-        contract.entityName,
-        contract.supplier.cnpj,
-        contract.cnpjRole ?? null,
-        contract.year,
-        contract.status,
-        toNullableDate(contract.signatureDate),
-        toNullableDate(contract.startDate),
-        toNullableDate(contract.endDate),
-        toCents(contract.originalValue),
-        toCents(contract.updatedValue),
-        contract.dataSourceOrigin,
-        JSON.stringify(contract),
+        normalizedContract.id,
+        normalizedContract.pncpControlNumber,
+        normalizedContract.contractNumber,
+        normalizedContract.municipalityIbge,
+        normalizedContract.municipalityName,
+        normalizedContract.uf.slice(0, 2).toUpperCase(),
+        normalizedContract.entityId,
+        normalizedContract.entityName,
+        normalizedContract.supplier.cnpj,
+        normalizedContract.cnpjRole ?? null,
+        normalizedContract.year,
+        normalizedContract.status,
+        toNullableDate(distinctDates.publicationDate),
+        toNullableDate(distinctDates.submissionDate),
+        toNullableDate(normalizedContract.signatureDate),
+        toNullableDate(normalizedContract.startDate),
+        toNullableDate(normalizedContract.endDate),
+        toCents(normalizedContract.originalValue),
+        toCents(normalizedContract.updatedValue),
+        normalizedContract.dataSourceOrigin,
+        JSON.stringify(normalizedContract),
       ]
     );
   };
@@ -210,17 +226,21 @@ export async function createPostgresStore(
     },
 
     async saveDossier(dossier: SavedDossierSummary) {
+      const normalizedHash = dossier.sha256Digest.trim().toLowerCase();
+      const existing = await pool.query<{ id: string }>(
+        'SELECT id FROM saved_dossiers WHERE sha256_digest = $1 LIMIT 1',
+        [normalizedHash]
+      );
+      if (existing.rows.length > 0) {
+        return storeApi.listDossiers();
+      }
       await pool.query(
         `
         INSERT INTO saved_dossiers (
           id, contract_id, contract_number, municipality_name, municipality_ibge,
           entity_name, supplier_name, risk_score, saved_at, analyst_note, sha256_digest
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-        ON CONFLICT (contract_id) DO UPDATE SET
-          risk_score = EXCLUDED.risk_score,
-          saved_at = EXCLUDED.saved_at,
-          analyst_note = EXCLUDED.analyst_note,
-          sha256_digest = EXCLUDED.sha256_digest
+        ON CONFLICT (sha256_digest) DO NOTHING
         `,
         [
           dossier.id,
@@ -233,7 +253,7 @@ export async function createPostgresStore(
           dossier.riskScore,
           dossier.savedAt,
           dossier.analystNote,
-          dossier.sha256Digest,
+          normalizedHash,
         ]
       );
       return storeApi.listDossiers();

@@ -7,6 +7,7 @@ import type {
 } from '@nexofis/shared/types/audit';
 import { sha256HexSync } from '@nexofis/shared/lib/hash';
 import { mapContractToOCDS } from '@nexofis/shared/lib/ocdsMapper';
+import { extractDistinctContractDates } from '@nexofis/shared/lib/contractLifecycleEvents';
 
 export interface NexofisDossierExportOptions {
   analystNote?: string;
@@ -23,6 +24,9 @@ export interface NexofisDossierArchivePayload {
     municipalityIbge: string;
     municipalityName: string;
     uf: string;
+    publicationDate: string | null;
+    submissionDate: string | null;
+    lifecycleEventCount: number;
     analystNote: string;
     archivedSnapshotId?: string;
     archivedSnapshotSavedAt?: string;
@@ -107,6 +111,16 @@ export function buildStructuredDossierJson(
         )
       : assessment.score;
 
+  const distinctDates = extractDistinctContractDates(baseContract);
+  const normalizedContractForExport: ContractRecord = {
+    ...baseContract,
+    publicationDate: distinctDates.publicationDate,
+    submissionDate: distinctDates.submissionDate,
+    submissionWindowStart: distinctDates.submissionWindowStart,
+    submissionWindowEnd: distinctDates.submissionWindowEnd,
+    lifecycleEvents: distinctDates.events,
+  };
+
   const payload: NexofisDossierArchivePayload = {
     archiveMetadata: {
       contractId: baseContract.id,
@@ -115,6 +129,9 @@ export function buildStructuredDossierJson(
       municipalityIbge: baseContract.municipalityIbge,
       municipalityName: baseContract.municipalityName,
       uf: baseContract.uf,
+      publicationDate: distinctDates.publicationDate,
+      submissionDate: distinctDates.submissionDate,
+      lifecycleEventCount: distinctDates.events.length,
       analystNote,
       archivedSnapshotId: options.archivedSnapshot?.id,
       archivedSnapshotSavedAt: options.archivedSnapshot?.savedAt,
@@ -127,7 +144,7 @@ export function buildStructuredDossierJson(
       documentCount: baseContract.documents.length,
       sourceRecordCount: baseContract.sourceRecords.length,
     },
-    contract: baseContract,
+    contract: normalizedContractForExport,
     forensicAssessment: assessment,
     auditorReviews,
     ocdsRelease: mapContractToOCDS(evaluated),

@@ -19,6 +19,11 @@ import {
   matchesContractLifecycleFilter,
   normalizeLifecycleFilterParam,
 } from '@nexofis/shared/lib/contractStatus';
+import {
+  buildContractLifecycleEvents,
+  computeCanonicalDossierSnapshotHash,
+  normalizeLifecycleDate,
+} from '@nexofis/shared/lib/contractLifecycleEvents';
 import { aggregateRiskDashboard } from '@nexofis/shared/lib/dashboardAggregator';
 import {
   matchesDatePeriod,
@@ -319,6 +324,8 @@ interface PncpPublicacaoItem {
   valorTotalEstimado?: number;
   valorTotalHomologado?: number;
   dataPublicacaoPncp?: string;
+  dataAberturaProposta?: string;
+  dataEncerramentoProposta?: string;
   modalidadeNome?: string;
   situacaoCompraNome?: string;
   orgaoEntidade?: { cnpj?: string; razaoSocial?: string };
@@ -563,7 +570,10 @@ async function fetchLivePncpContratacoes(
               ? estimadoNum
               : 0;
 
-      const publishedAt = item.dataPublicacaoPncp?.slice(0, 10) ?? '';
+      const publishedAt = normalizeLifecycleDate(item.dataPublicacaoPncp) ?? '';
+      const submissionWindowStart = normalizeLifecycleDate(item.dataAberturaProposta);
+      const submissionWindowEnd = normalizeLifecycleDate(item.dataEncerramentoProposta);
+      const submissionDate = submissionWindowEnd ?? submissionWindowStart ?? null;
       const rawModality = (item.modalidadeNome ?? '').toLowerCase();
       const modality: ContractRecord['modality'] = rawModality.includes('dispensa')
         ? 'Dispensa de Licitação'
@@ -618,8 +628,25 @@ async function fetchLivePncpContratacoes(
         object: item.objetoCompra ?? 'Objeto não detalhado na publicação PNCP.',
         objectCategory: item.amparoLegal?.nome ?? 'Contratação Pública PNCP',
         expectedCnaePrefixes: [],
+        publicationDate: publishedAt || null,
+        submissionDate,
+        submissionWindowStart,
+        submissionWindowEnd,
+        lifecycleEvents: buildContractLifecycleEvents({
+          sourceSystem: 'PNCP API Oficial',
+          publicationDate: publishedAt || null,
+          publicationSourceField: 'pncp:dataPublicacaoPncp',
+          publicationChannelName: 'Portal Nacional de Contratações Públicas (PNCP)',
+          publicationChannelUrl: sourceUrl,
+          submissionDate,
+          submissionSourceField: submissionWindowEnd
+            ? 'pncp:dataEncerramentoProposta'
+            : 'pncp:dataAberturaProposta',
+          submissionWindowStart,
+          submissionWindowEnd,
+        }),
         signatureDate: '', // A02: publicação de contratação/edital não traz assinatura contratual
-        startDate: publishedAt,
+        startDate: '', // Defect 1.8: data de publicação oficial jamais é confundida com início de vigência contratual
         endDate: '', // A02: nunca fabricar término
         originalValue: valor,
         updatedValue: valor,
@@ -1146,7 +1173,10 @@ app.get('/api/municipalities/:ibgeCode/context', async (req, res) => {
   const matchingRaw = getAllContracts().filter(
     (c) =>
       c.municipalityIbge === ibgeCode &&
-      matchesDatePeriod(c.signatureDate || c.startDate, { startDate, endDate })
+      matchesDatePeriod(c.signatureDate || c.startDate || c.publicationDate || c.submissionDate, {
+        startDate,
+        endDate,
+      })
   );
 
   // Deduplicate by pncpControlNumber preferring signed contracts with real suppliers
@@ -1378,7 +1408,7 @@ app.get('/api/contracts/search', async (req, res) => {
     if (ibge && c.municipalityIbge !== ibge) return false;
     if (year && String(c.year) !== year) return false;
     if (!matchesContractLifecycleFilter(c, statusFilter)) return false;
-    if (!matchesDatePeriod(c.signatureDate || c.startDate, { startDate, endDate })) return false;
+    if (!matchesDatePeriod(c.signatureDate || c.startDate || c.publicationDate || c.submissionDate, { startDate, endDate })) return false;
 
     if (q) {
       if (isCnpjQuery) {
@@ -2318,6 +2348,8 @@ function buildInvestigationContractInput(contract: ContractRecord): Investigatio
     municipalityIbge: contract.municipalityIbge,
     uf: contract.uf,
     entityName: contract.entityName,
+    publicationDate: contract.publicationDate ?? null,
+    submissionDate: contract.submissionDate ?? null,
     signatureDate: contract.signatureDate,
     originalValue: contract.originalValue,
     updatedValue: contract.updatedValue,
@@ -2354,6 +2386,8 @@ function buildInvestigationCaseResponse(
       municipalityIbge: contract.municipalityIbge,
       uf: contract.uf,
       entityName: contract.entityName,
+      publicationDate: contract.publicationDate ?? null,
+      submissionDate: contract.submissionDate ?? null,
       signatureDate: contract.signatureDate,
       originalValue: contract.originalValue,
       updatedValue: contract.updatedValue,
@@ -3186,6 +3220,21 @@ app.post(
             `Documento analisado (${file.originalname}) — objeto não delimitado automaticamente.`,
           objectCategory: 'Documento Auditado',
           expectedCnaePrefixes: [],
+          publicationDate: extracted.publicationDate,
+          submissionDate: extracted.submissionDate,
+          submissionWindowStart: extracted.submissionWindowStart,
+          submissionWindowEnd: extracted.submissionWindowEnd,
+          lifecycleEvents: buildContractLifecycleEvents({
+            sourceSystem: 'Upload Documental',
+            publicationDate: extracted.publicationDate,
+            publicationSourceField: 'document:data_publicacao',
+            submissionDate: extracted.submissionDate,
+            submissionSourceField: 'document:data_submissao',
+            submissionWindowStart: extracted.submissionWindowStart,
+            submissionWindowEnd: extracted.submissionWindowEnd,
+            signatureDate: extracted.signatureDate,
+            startDate: extracted.signatureDate,
+          }),
           signatureDate: extracted.signatureDate ?? '',
           startDate: extracted.signatureDate ?? '',
           endDate: '',
@@ -3252,6 +3301,8 @@ app.post(
               'Documento importado localmente sem consulta ao PNCP; ausência no PNCP não foi verificada.',
           },
           fieldProvenance: {
+            publicationDate: extracted.publicationDate ? 'document_extracted' : 'unknown',
+            submissionDate: extracted.submissionDate ? 'document_extracted' : 'unknown',
             signatureDate: extracted.signatureDate ? 'document_extracted' : 'unknown',
             endDate: 'unknown',
             biddersCount: 'unknown',
@@ -3381,14 +3432,13 @@ app.post('/api/dossiers', requireAnalystAuth, (req: AuthenticatedRequest, res) =
   const reviews = store.listFindingReviews(contract.id);
   const savedAt = new Date().toISOString();
 
-  // Compute canonical SHA-256 over the full reproducible snapshot payload
-  const canonicalPayload = JSON.stringify({
+  // Defect 1.2: Deterministic canonical SHA-256 over semantic dossier content (excludes volatile timestamps)
+  const sha256Digest = computeCanonicalDossierSnapshotHash({
+    contractId: evaluated.id,
     contract: evaluated,
     reviews,
     analystNote,
-    engineVersion: evaluated.assessment.engineVersion,
   });
-  const sha256Digest = crypto.createHash('sha256').update(canonicalPayload).digest('hex');
 
   const summary: SavedDossierSummary = {
     id: `DOS-${Date.now()}-${sha256Digest.slice(0, 6)}`,
@@ -3405,8 +3455,23 @@ app.post('/api/dossiers', requireAnalystAuth, (req: AuthenticatedRequest, res) =
     hasSnapshot: true,
   };
 
-  const dossiers = store.saveDossier(summary, { contract: evaluated, reviews });
-  res.status(201).json({ dossier: summary, dossiers });
+  const result = store.saveDossierWithDedup(summary, { contract: evaluated, reviews });
+  if (result.deduplicated) {
+    res.status(200).json({
+      dossier: result.dossier,
+      dossiers: result.dossiers,
+      deduplicated: true,
+      message:
+        'Snapshot de dossiê com conteúdo idêntico (mesmo hash SHA-256) já existe no banco; nenhuma cópia duplicada foi gravada.',
+    });
+    return;
+  }
+
+  res.status(201).json({
+    dossier: result.dossier,
+    dossiers: result.dossiers,
+    deduplicated: false,
+  });
 });
 
 app.delete('/api/dossiers/:id', requireAnalystAuth, (req, res) => {
@@ -3433,7 +3498,7 @@ function handleRiskDashboardSummary(req: express.Request, res: express.Response)
 
   const storedContracts = store.getAllStoredContracts();
   const filtered = storedContracts.filter((c) =>
-    matchesDatePeriod(c.signatureDate || c.startDate, { startDate, endDate })
+    matchesDatePeriod(c.signatureDate || c.startDate || c.publicationDate || c.submissionDate, { startDate, endDate })
   );
   const evaluated = filtered
     .map((c) => evaluateWithContext(c))

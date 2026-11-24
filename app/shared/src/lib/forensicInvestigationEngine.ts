@@ -27,6 +27,8 @@ export interface InvestigationContractInput {
   municipalityIbge: string;
   uf: string;
   entityName: string;
+  publicationDate?: string | null;
+  submissionDate?: string | null;
   signatureDate: string;
   originalValue: number;
   updatedValue: number;

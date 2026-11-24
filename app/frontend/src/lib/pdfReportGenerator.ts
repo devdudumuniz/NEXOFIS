@@ -12,6 +12,7 @@ import {
   formatDateBR,
   formatPercentageBR,
 } from '@nexofis/shared/lib/formatters';
+import { extractDistinctContractDates } from '@nexofis/shared/lib/contractLifecycleEvents';
 
 interface AutoTableDoc extends jsPDF {
   lastAutoTable?: { finalY: number };
@@ -319,6 +320,13 @@ export function buildAuditReportPdf(
   y += 3;
 
   const exec = assessment.executionChain;
+  const distinctDates = extractDistinctContractDates(contract);
+  const submissionDisplay =
+    distinctDates.submissionWindowStart && distinctDates.submissionWindowEnd
+      ? `${formatDateBR(distinctDates.submissionWindowStart)} a ${formatDateBR(distinctDates.submissionWindowEnd)}`
+      : distinctDates.submissionDate
+        ? formatDateBR(distinctDates.submissionDate)
+        : 'Nao informada';
   autoTable(doc, {
     startY: y,
     margin: { left: marginX, right: marginX },
@@ -330,6 +338,12 @@ export function buildAuditReportPdf(
       ['Orgao / Secretaria', safePdfText(contract.entityName)],
       ['Municipio / IBGE', safePdfText(`${contract.municipalityName}/${contract.uf} (IBGE ${contract.municipalityIbge})`)],
       ['Objeto', safePdfText(contract.object)],
+      [
+        'Publicacao e Submissao',
+        safePdfText(
+          `Publicacao oficial: ${distinctDates.publicationDate ? formatDateBR(distinctDates.publicationDate) : 'Nao informada'} | Submissao de propostas: ${submissionDisplay}`
+        ),
+      ],
       [
         'Modalidade e Vigencia',
         safePdfText(

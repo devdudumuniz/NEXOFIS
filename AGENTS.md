@@ -35,14 +35,16 @@ app/frontend -> Interface React/Tailwind conectada exclusivamente à API real (z
    - Benchmark exige sobreposição de tokens de especificação, compatibilidade de UF, janela de competência validada, conversão consistente de unidade e escala de quantidade, separação insumo vs composição e proveniência canônica por `peerId`.
    - Alerta vermelho DiD exige `didDesign` válido com `eligible === true`; sem `didDesign` emitir `CONTRASTE_DESCRITIVO_SEM_INFERENCIA`; com `eligible === false` emitir `METODOLOGIA_REPROVADA`.
    - Avaliações pontuais (`evaluateOutcomeClaim`) aplicam corte temporal estrito (`publishedAt <= evaluationDate`).
-6. **Canais de Participação**:
+6. **Canais de Participação e Eventos Temporais do Contrato (Defeito 1.8)**:
    - Separar estritamente portais de **publicação/divulgação** (`pncp.gov.br`, Diário Oficial, Portal da Transparência) de plataformas efetivas de **envio eletrônico de propostas** (`compras.gov.br`, BLL, BNC, Portal de Compras Públicas, Licitanet, etc.).
+   - Separar explicitamente as datas de **publicação oficial** (`publicationDate` / evento `publication`) e de **submissão de propostas** (`submissionDate`, `submissionWindowStart`, `submissionWindowEnd` / eventos `proposal_submission*`) no modelo de dados (`ContractRecord`, colunas dedicadas SQLite v7 e `OCDSRelease.tender`), jamais copiando data de publicação para submissão ou início de vigência.
 7. **Parsing e Datas**:
    - Usar `app/shared/src/lib/csvParser.ts` (RFC 4180 + `parseBrazilianNumber`) em todos os importadores CSV/TSV; nunca usar `.split(delimiter)` ingênuo.
    - Validar todas as datas e competências com `app/shared/src/lib/competenciaValidator.ts` (rejeitar `2026-13`, `2026-02-30`, etc.).
-8. **Persistência Verificada**:
-   - Nunca usar `INSERT OR IGNORE` em snapshots oficiais. Verificar `changes === 1` e confirmar leitura pós-escrita.
+8. **Persistência Verificada e Deduplicação por Hash (Defeitos 1.1 e 1.2)**:
+   - Nunca usar `INSERT OR IGNORE` em snapshots oficiais nem em dossiês. Verificar `changes === 1` e confirmar leitura pós-escrita.
    - Idempotência de snapshots oficiais usa chave composta `(source_kind, sha256, competencia, uf_norm)` para permitir re-coleta em dias/competências distintos.
+   - Snapshots de dossiês (`saved_dossiers`) têm hash canônico SHA-256 verificado no backend (`computeCanonicalDossierSnapshotHash`, excluindo timestamps voláteis) com restrição `UNIQUE(sha256_digest)`: conteúdos idênticos retornam o snapshot existente sem replicação, enquanto alterações genuínas geram nova versão imutável preservando o histórico.
 
 ## 3. Gates Obrigatórios Antes de Qualquer Commit / PR
 

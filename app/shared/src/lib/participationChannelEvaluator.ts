@@ -55,6 +55,10 @@ export interface ParticipationChannelInput {
     ombudsmanChannel: string | null;
   };
   schedule: {
+    /** Official publication date/timestamp (e.g. PNCP / Diário Oficial) — strictly distinct from proposal submission (Defect 1.8) */
+    publicationDateIso?: string | null;
+    /** Optional proposal submission window start date/timestamp */
+    submissionStartIso?: string | null;
     submissionDeadlineIso: string | null;
     openingDateTimeIso: string | null;
     timezone: string;
@@ -87,6 +91,22 @@ export interface ParticipationChannelEvaluation {
     institutionalContact: string;
     clarifications: string;
     ombudsman: string;
+  };
+  /** Explicit separation between publication event date and proposal submission event dates (Defect 1.8) */
+  timelineEvents: {
+    publicationEvent: {
+      dateIso: string | null;
+      channel: string;
+      note: string;
+    };
+    submissionEvent: {
+      startIso: string | null;
+      deadlineIso: string | null;
+      openingIso: string | null;
+      channel: string;
+      note: string;
+    };
+    chronologyCheck: 'consistent' | 'inconsistent_submission_before_publication' | 'incomplete';
   };
   accessDiagnostics: Array<{
     target: string;
@@ -140,6 +160,39 @@ export function evaluateParticipationChannels(
   const deadlineMs = input.schedule.submissionDeadlineIso
     ? Date.parse(input.schedule.submissionDeadlineIso)
     : Number.NaN;
+
+  // Resolve distinct publication event date vs proposal submission dates (Defect 1.8)
+  const publicationDateIso =
+    input.schedule.publicationDateIso ??
+    input.documents
+      .map((d) => d.publishedAt)
+      .filter((d): d is string => Boolean(d && d.trim()))
+      .sort()[0] ??
+    null;
+  const submissionStartIso = input.schedule.submissionStartIso ?? null;
+  const submissionDeadlineIso = input.schedule.submissionDeadlineIso ?? null;
+  const openingDateTimeIso = input.schedule.openingDateTimeIso ?? null;
+
+  const pubDateDay = publicationDateIso ? publicationDateIso.trim().slice(0, 10) : null;
+  const earliestSubDay = [submissionStartIso, submissionDeadlineIso, openingDateTimeIso]
+    .filter((d): d is string => Boolean(d && d.trim().length >= 10))
+    .map((d) => d.trim().slice(0, 10))
+    .sort()[0] ?? null;
+
+  let chronologyCheck: 'consistent' | 'inconsistent_submission_before_publication' | 'incomplete' = 'incomplete';
+  if (pubDateDay && earliestSubDay) {
+    if (earliestSubDay < pubDateDay) {
+      chronologyCheck = 'inconsistent_submission_before_publication';
+      limitations.push(
+        `Inconsistência cronológica entre eventos distintos: data de submissão/abertura (${earliestSubDay}) anterior à data de publicação oficial (${pubDateDay}).`
+      );
+      diligences.push(
+        'Conferir datas oficiais de publicação do aviso/edital e de abertura/encerramento de propostas no portal de compras e no PNCP.'
+      );
+    } else {
+      chronologyCheck = 'consistent';
+    }
+  }
 
   let postDeadlineUnavailabilityDetected = false;
   let technicalCollectorFailureDetected = false;
@@ -298,6 +351,30 @@ export function evaluateParticipationChannels(
       institutionalContact: input.institutionalChannels.contactEmail ?? 'Não localizado',
       clarifications: input.institutionalChannels.clarificationChannel ?? 'Não localizado',
       ombudsman: input.institutionalChannels.ombudsmanChannel ?? 'Não localizado',
+    },
+    timelineEvents: {
+      publicationEvent: {
+        dateIso: publicationDateIso,
+        channel: input.publicationChannel?.portalName ?? input.publicationChannel?.portalUrl ?? 'Portal de publicação não especificado',
+        note: publicationDateIso
+          ? `Publicação registrada em ${publicationDateIso} (evento distinto da submissão de propostas).`
+          : 'Data de publicação oficial não informada.',
+      },
+      submissionEvent: {
+        startIso: submissionStartIso,
+        deadlineIso: submissionDeadlineIso,
+        openingIso: openingDateTimeIso,
+        channel:
+          input.proposalSubmissionChannel.portalName ??
+          input.proposalSubmissionChannel.portalUrl ??
+          input.proposalSubmissionChannel.emailSpecifiedForProposals ??
+          'Canal de submissão não especificado',
+        note:
+          submissionStartIso || submissionDeadlineIso || openingDateTimeIso
+            ? `Submissão distinta da publicação (fuso ${input.schedule.timezone}).`
+            : 'Datas de submissão/encerramento de propostas não informadas.',
+      },
+      chronologyCheck,
     },
     accessDiagnostics,
     ocrDiagnostics: {

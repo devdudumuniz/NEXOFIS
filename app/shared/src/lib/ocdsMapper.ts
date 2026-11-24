@@ -1,5 +1,6 @@
 import type { EvaluatedContract, FindingReviewRecord, OCDSRelease } from '../types/audit';
 import { formatCnpj, formatCurrencyBRL, formatDateBR, formatPercentageBR } from './formatters';
+import { extractDistinctContractDates } from './contractLifecycleEvents';
 
 /**
  * Maps an evaluated contract to an OCDS 1.1-aligned release:
@@ -38,6 +39,15 @@ export function mapContractToOCDS(contract: EvaluatedContract): OCDSRelease {
     tags.push('implementation');
   }
 
+  const distinctDates = extractDistinctContractDates(contract);
+  const tenderPeriod: { startDate?: string; endDate?: string } = {};
+  if (distinctDates.submissionWindowStart) {
+    tenderPeriod.startDate = distinctDates.submissionWindowStart;
+  }
+  if (distinctDates.submissionWindowEnd || distinctDates.submissionDate) {
+    tenderPeriod.endDate = distinctDates.submissionWindowEnd ?? distinctDates.submissionDate ?? undefined;
+  }
+
   const release: OCDSRelease = {
     ocid,
     id: `${ocid}-r1`,
@@ -52,6 +62,8 @@ export function mapContractToOCDS(contract: EvaluatedContract): OCDSRelease {
       id: `TND-${contract.pncpControlNumber}`,
       title: contract.object,
       procurementMethodDetails: contract.modality,
+      ...(distinctDates.publicationDate ? { datePublished: distinctDates.publicationDate } : {}),
+      ...(tenderPeriod.startDate || tenderPeriod.endDate ? { tenderPeriod } : {}),
       ...(typeof contract.biddersCount === 'number' && contract.biddersCount > 0
         ? { numberOfTenderers: contract.biddersCount }
         : {}),
@@ -138,6 +150,7 @@ export function buildAuditDossierMarkdown(
   reviewsOverride?: FindingReviewRecord[]
 ): string {
   const { assessment } = contract;
+  const distinctDatesMd = extractDistinctContractDates(contract);
   const reviews = reviewsOverride ?? contract.reviews ?? [];
 
   const latestReviewByFinding = new Map<string, FindingReviewRecord>();
@@ -173,6 +186,21 @@ export function buildAuditDossierMarkdown(
     `- **Controle PNCP**: \`${contract.pncpControlNumber}\``,
     `- **Modalidade**: ${contract.modality} (${biddersDisplay})`,
     `- **Objeto**: ${contract.object}`,
+    ...(distinctDatesMd.publicationDate
+      ? [`- **Data de publicação oficial**: ${formatDateBR(distinctDatesMd.publicationDate)}`]
+      : []),
+    ...(distinctDatesMd.submissionDate || distinctDatesMd.submissionWindowStart || distinctDatesMd.submissionWindowEnd
+      ? [
+          `- **Data / janela de submissão de propostas**: ${
+            distinctDatesMd.submissionWindowStart && distinctDatesMd.submissionWindowEnd
+              ? `${formatDateBR(distinctDatesMd.submissionWindowStart)} a ${formatDateBR(distinctDatesMd.submissionWindowEnd)}`
+              : formatDateBR(distinctDatesMd.submissionDate ?? distinctDatesMd.submissionWindowEnd ?? distinctDatesMd.submissionWindowStart ?? '')
+          }`,
+        ]
+      : []),
+    ...(contract.signatureDate
+      ? [`- **Data de assinatura**: ${formatDateBR(contract.signatureDate)}`]
+      : []),
     `- **Vigência**: ${formatDateBR(contract.startDate)} a ${formatDateBR(contract.endDate)}`,
     `- **Fornecedor**: ${contract.supplier.legalName} (CNPJ/CPF ${formatCnpj(contract.supplier.cnpj)})`,
     ``,

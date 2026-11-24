@@ -450,7 +450,12 @@ export async function fetchDossierSnapshot(id: string): Promise<SavedDossierSnap
 export async function saveDossier(
   contractId: string,
   analystNote: string
-): Promise<{ dossier: SavedDossierSummary; dossiers: SavedDossierSummary[] }> {
+): Promise<{
+  dossier: SavedDossierSummary;
+  dossiers: SavedDossierSummary[];
+  deduplicated?: boolean;
+  message?: string;
+}> {
   const res = await fetch('/api/dossiers', {
     method: 'POST',
     headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),

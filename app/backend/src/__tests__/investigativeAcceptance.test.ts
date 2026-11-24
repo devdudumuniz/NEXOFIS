@@ -1043,7 +1043,7 @@ test('Regressões adicionais: SICONFI não soma estágios, Câmara diário sem h
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexofis-v6-'));
   try {
     const store = createNexofisStore(path.join(tmpDir, 'test.db'));
-    assert.equal(store.getSchemaVersion(), 6);
+    assert.equal(store.getSchemaVersion(), 7);
     const first = store.saveOfficialSnapshot({
       id: 'snap-1',
       sourceKind: 'sinapi',

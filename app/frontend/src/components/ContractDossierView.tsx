@@ -399,7 +399,9 @@ export function ContractDossierView({
     try {
       const res = await saveDossier(contract.id, analystNote);
       setSavedFeedback(
-        `Dossiê arquivado (${res.dossier.id}) · SHA-256 ${res.dossier.sha256Digest.slice(0, 12)}…`
+        res.deduplicated
+          ? `Dossiê idêntico já arquivado (${res.dossier.id}) · SHA-256 ${res.dossier.sha256Digest.slice(0, 12)}… — nenhuma cópia duplicada foi gravada.`
+          : `Dossiê arquivado (${res.dossier.id}) · SHA-256 ${res.dossier.sha256Digest.slice(0, 12)}…`
       );
       setShowSaveBox(false);
       onDossierSaved();
@@ -677,6 +679,32 @@ export function ContractDossierView({
                   ? `${formatDateBR(contract.startDate)} a ${formatDateBR(contract.endDate)}`
                   : 'Não informada pela fonte'}
               </span>
+              {(contract.publicationDate || contract.submissionDate || contract.submissionWindowStart || contract.submissionWindowEnd) && (
+                <>
+                  <span aria-hidden="true" className="hidden sm:inline">
+                    ·
+                  </span>
+                  <span data-testid="dossier-publication-date">
+                    Publicação:{' '}
+                    <span className="font-mono text-slate-800 dark:text-slate-200">
+                      {contract.publicationDate ? formatDateBR(contract.publicationDate) : 'Não informada'}
+                    </span>
+                  </span>
+                  <span aria-hidden="true" className="hidden sm:inline">
+                    ·
+                  </span>
+                  <span data-testid="dossier-submission-date">
+                    Submissão de propostas:{' '}
+                    <span className="font-mono text-slate-800 dark:text-slate-200">
+                      {contract.submissionWindowStart && contract.submissionWindowEnd
+                        ? `${formatDateBR(contract.submissionWindowStart)} a ${formatDateBR(contract.submissionWindowEnd)}`
+                        : contract.submissionDate
+                          ? formatDateBR(contract.submissionDate)
+                          : 'Não informada'}
+                    </span>
+                  </span>
+                </>
+              )}
             </div>
 
             {/* Legal Time Travel Metadata Line */}

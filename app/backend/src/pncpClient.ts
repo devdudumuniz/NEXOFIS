@@ -5,6 +5,10 @@ import {
   normalizeCnpj,
 } from '@nexofis/shared/lib/cnpj';
 import type { ContractRecord } from '@nexofis/shared/types/audit';
+import {
+  buildContractLifecycleEvents,
+  normalizeLifecycleDate,
+} from '@nexofis/shared/lib/contractLifecycleEvents';
 
 export interface PncpSearchItem {
   id?: string;
@@ -33,6 +37,9 @@ export interface PncpSearchItem {
   data_inicio_vigencia?: string;
   data_fim_vigencia?: string;
   data_publicacao_pncp?: string;
+  data_abertura_proposta?: string;
+  data_encerramento_proposta?: string;
+  data_submissao?: string;
   modalidade_licitacao_nome?: string;
   amparo_legal_nome?: string[] | string;
   situacao_nome?: string;
@@ -198,7 +205,15 @@ export function mapPncpSearchItemToContract(
   const hasValorGlobal = item.valor_global !== undefined && item.valor_global !== null && Number.isFinite(valorGlobal) && valorGlobal >= 0;
   const safeValue = hasValorGlobal ? valorGlobal : 0;
 
-  // Preserve exact upstream dates — NEVER invent YYYY-01-01 or YYYY-12-31
+  // Preserve exact upstream dates — NEVER invent YYYY-01-01 or YYYY-12-31 and NEVER conflate publication with submission (Defect 1.8)
+  const publicationDate = normalizeLifecycleDate(item.data_publicacao_pncp);
+  const submissionWindowStart = normalizeLifecycleDate(item.data_abertura_proposta);
+  const submissionWindowEnd = normalizeLifecycleDate(item.data_encerramento_proposta);
+  const submissionDate =
+    normalizeLifecycleDate(item.data_submissao) ??
+    submissionWindowEnd ??
+    submissionWindowStart ??
+    null;
   const signatureDate = parseIsoDateStrict(item.data_assinatura);
   const startDate = parseIsoDateStrict(item.data_inicio_vigencia) || signatureDate;
   const endDate = parseIsoDateStrict(item.data_fim_vigencia);
@@ -261,7 +276,34 @@ export function mapPncpSearchItemToContract(
     mappedStatus = 'Encerrado';
   }
 
+  const lifecycleEvents = buildContractLifecycleEvents({
+    sourceSystem: 'PNCP API Oficial',
+    publicationDate,
+    publicationSourceField: 'pncp:data_publicacao_pncp',
+    publicationChannelName: 'Portal Nacional de Contratações Públicas (PNCP)',
+    publicationChannelUrl: sourceUrl,
+    submissionDate,
+    submissionSourceField: item.data_submissao
+      ? 'pncp:data_submissao'
+      : item.data_encerramento_proposta
+        ? 'pncp:data_encerramento_proposta'
+        : 'pncp:data_abertura_proposta',
+    submissionWindowStart,
+    submissionWindowEnd,
+    signatureDate,
+    startDate,
+    endDate,
+  });
+
   const fieldProvenance: Record<string, string> = {
+    publicationDate: publicationDate ? 'pncp:data_publicacao_pncp' : 'unknown',
+    submissionDate: item.data_submissao
+      ? 'pncp:data_submissao'
+      : item.data_encerramento_proposta
+        ? 'pncp:data_encerramento_proposta'
+        : item.data_abertura_proposta
+          ? 'pncp:data_abertura_proposta'
+          : 'unknown',
     signatureDate: signatureDate ? 'pncp:data_assinatura' : 'unknown',
     startDate: item.data_inicio_vigencia ? 'pncp:data_inicio_vigencia' : signatureDate ? 'pncp:data_assinatura' : 'unknown',
     endDate: endDate ? 'pncp:data_fim_vigencia' : 'unknown',
@@ -287,6 +329,11 @@ export function mapPncpSearchItemToContract(
     object: item.description?.trim() || item.title?.trim() || 'Contrato público registrado no PNCP',
     objectCategory: amparo ? `${modalityMapped.modality} (${amparo})` : `${modalityMapped.modality} · PNCP`,
     expectedCnaePrefixes: [],
+    publicationDate,
+    submissionDate,
+    submissionWindowStart,
+    submissionWindowEnd,
+    lifecycleEvents,
     signatureDate,
     startDate,
     endDate,

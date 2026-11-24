@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS contracts (
   cnpj_role TEXT CHECK (cnpj_role IN ('fornecedor', 'orgao_contratante', 'subcontratado')),
   year INTEGER NOT NULL CHECK (year >= 1990 AND year <= 2100),
   lifecycle_status TEXT NOT NULL DEFAULT 'Vigente',
+  publication_date DATE,
+  submission_date DATE,
   signature_date DATE,
   start_date DATE,
   end_date DATE,
@@ -38,12 +40,14 @@ CREATE TABLE IF NOT EXISTS contracts (
 CREATE INDEX IF NOT EXISTS idx_pg_contracts_supplier_cnpj ON contracts(supplier_cnpj);
 CREATE INDEX IF NOT EXISTS idx_pg_contracts_ibge ON contracts(municipality_ibge);
 CREATE INDEX IF NOT EXISTS idx_pg_contracts_pncp ON contracts(pncp_control_number);
+CREATE INDEX IF NOT EXISTS idx_pg_contracts_publication_date ON contracts(publication_date);
+CREATE INDEX IF NOT EXISTS idx_pg_contracts_submission_date ON contracts(submission_date);
 CREATE INDEX IF NOT EXISTS idx_pg_contracts_signature_date ON contracts(signature_date);
 CREATE INDEX IF NOT EXISTS idx_pg_contracts_status ON contracts(lifecycle_status);
 
 CREATE TABLE IF NOT EXISTS saved_dossiers (
   id TEXT PRIMARY KEY,
-  contract_id TEXT NOT NULL UNIQUE REFERENCES contracts(id) ON DELETE CASCADE,
+  contract_id TEXT NOT NULL REFERENCES contracts(id) ON DELETE CASCADE,
   contract_number TEXT NOT NULL,
   municipality_name TEXT NOT NULL,
   municipality_ibge CHAR(7) NOT NULL,
@@ -52,8 +56,10 @@ CREATE TABLE IF NOT EXISTS saved_dossiers (
   risk_score INTEGER NOT NULL CHECK (risk_score >= 0 AND risk_score <= 100),
   saved_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   analyst_note TEXT NOT NULL DEFAULT '',
-  sha256_digest CHAR(64) NOT NULL
+  sha256_digest CHAR(64) NOT NULL UNIQUE
 );
+
+CREATE INDEX IF NOT EXISTS idx_pg_saved_dossiers_contract ON saved_dossiers(contract_id, saved_at DESC);
 
 -- Trilha append-only de revisões humanas (nunca sobrescrever ou apagar histórico)
 CREATE TABLE IF NOT EXISTS finding_reviews (
