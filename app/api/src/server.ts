@@ -118,6 +118,7 @@ import {
   type ForensicGraphSnapshot,
 } from '@nexofis/shared/lib/forensicGraphCypher';
 import { importSinapiOfficialFile } from '@nexofis/backend/connectors/sinapiImporter';
+import { validateCompetencia, validateIsoDate } from '@nexofis/shared/lib/competenciaValidator';
 import {
   createObservabilityRegistry,
   sanitizeLogPayload,
@@ -3581,23 +3582,35 @@ app.post(
       rawCsv?: string;
       filename?: string;
       defaultMethodologyVersion?: string;
+      competencia?: string;
     };
     if (typeof body.rawCsv !== 'string' || body.rawCsv.trim().length < 5) {
       res.status(400).json({ error: 'Conteúdo CSV/TSV da exportação pública SIAPS ausente.' });
       return;
+    }
+    if (body.competencia !== undefined && body.competencia !== '') {
+      const compCheck = validateCompetencia(body.competencia);
+      if (!compCheck.valid) {
+        res.status(400).json({ error: compCheck.reason ?? 'Competência SIAPS inválida.' });
+        return;
+      }
     }
     const imported = importSiapsPublicExport({
       rawCsv: body.rawCsv,
       filename: String(body.filename || 'siaps-export.csv').slice(0, 120),
       defaultMethodologyVersion: String(body.defaultMethodologyVersion || 'siaps-v1'),
     });
+    const effectiveCompetencia =
+      (body.competencia ? validateCompetencia(body.competencia).normalized : null) ??
+      imported.observations[0]?.competencia ??
+      'multi';
     const actor = deriveStrictInvestigationActor(req);
     const saved = store.saveOfficialSnapshot({
-      id: `snap_siaps_${imported.fileSha256.slice(0, 16)}`,
+      id: `snap_siaps_${imported.fileSha256.slice(0, 12)}_${effectiveCompetencia.replace(/[^a-zA-Z0-9_-]/g, '')}`,
       sourceKind: 'siaps',
       filename: imported.filename,
       sha256: imported.fileSha256,
-      competencia: imported.observations[0]?.competencia ?? 'multi',
+      competencia: effectiveCompetencia,
       uf: null,
       metadataJson: JSON.stringify({
         rowCount: imported.rowCount,
@@ -3633,12 +3646,19 @@ app.post(
       });
       return;
     }
+    const compCheck = validateCompetencia(body.competencia);
+    if (!compCheck.valid || !compCheck.normalized) {
+      res.status(400).json({
+        error: compCheck.reason ?? `Competência SINAPI inválida ("${body.competencia}").`,
+      });
+      return;
+    }
     const imported = importSinapiOfficialFile({
       rawBuffer: body.rawCsv,
       filename: String(body.filename || 'sinapi-oficial.csv').slice(0, 120),
       uf: body.uf,
-      competencia: body.competencia,
-      edition: String(body.edition || body.competencia),
+      competencia: compCheck.normalized,
+      edition: String(body.edition || compCheck.normalized),
       taxRegime: body.taxRegime === 'desonerado' ? 'desonerado' : 'nao_desonerado',
       defaultKind: body.defaultKind === 'composicao' ? 'composicao' : 'insumo',
       isRectification: Boolean(body.isRectification),
@@ -3646,7 +3666,7 @@ app.post(
     });
     const actor = deriveStrictInvestigationActor(req);
     const saved = store.saveOfficialSnapshot({
-      id: `snap_sinapi_${imported.originalFileSha256.slice(0, 16)}`,
+      id: `snap_sinapi_${imported.originalFileSha256.slice(0, 12)}_${imported.uf}_${imported.competencia.replace(/[^a-zA-Z0-9_-]/g, '')}`,
       sourceKind: 'sinapi',
       filename: imported.filename,
       sha256: imported.originalFileSha256,
@@ -3679,17 +3699,24 @@ app.post(
       res.status(400).json({ error: 'Conteúdo CSV do arquivo diário da Câmara ausente.' });
       return;
     }
-    const snapshotDate =
-      typeof body.snapshotDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(body.snapshotDate)
-        ? body.snapshotDate
-        : new Date().toISOString().slice(0, 10);
+    let snapshotDate = new Date().toISOString().slice(0, 10);
+    if (body.snapshotDate !== undefined && body.snapshotDate !== '') {
+      const dateCheck = validateIsoDate(body.snapshotDate);
+      if (!dateCheck.valid || !dateCheck.normalized) {
+        res.status(400).json({
+          error: dateCheck.reason ?? `Data do snapshot da Câmara inválida ("${body.snapshotDate}").`,
+        });
+        return;
+      }
+      snapshotDate = dateCheck.normalized;
+    }
     const parsed = parseCamaraDailyPersonnelSnapshot({
       rawCsv: body.rawCsv,
       snapshotDate,
     });
     const actor = deriveStrictInvestigationActor(req);
     const saved = store.saveOfficialSnapshot({
-      id: `snap_camara_${parsed.sha256.slice(0, 16)}`,
+      id: `snap_camara_${parsed.sha256.slice(0, 12)}_${snapshotDate}`,
       sourceKind: 'camara_personnel',
       filename: String(body.filename || `camara-funcionarios-${snapshotDate}.csv`).slice(0, 120),
       sha256: parsed.sha256,
@@ -3742,23 +3769,35 @@ app.post(
       rawCsv?: string;
       filename?: string;
       defaultMethodologyVersion?: string;
+      competencia?: string;
     };
     if (typeof body.rawCsv !== 'string' || body.rawCsv.trim().length < 5) {
       res.status(400).json({ error: 'Conteúdo CSV/TSV da tabela oficial INEP ausente.' });
       return;
+    }
+    if (body.competencia !== undefined && body.competencia !== '') {
+      const compCheck = validateCompetencia(body.competencia);
+      if (!compCheck.valid) {
+        res.status(400).json({ error: compCheck.reason ?? 'Competência INEP inválida.' });
+        return;
+      }
     }
     const imported = importInepPublicExport({
       rawCsv: body.rawCsv,
       filename: String(body.filename || 'inep-ideb-saeb.csv').slice(0, 120),
       defaultMethodologyVersion: String(body.defaultMethodologyVersion || 'inep-ideb-v1'),
     });
+    const effectiveCompetencia =
+      (body.competencia ? validateCompetencia(body.competencia).normalized : null) ??
+      imported.observations[0]?.competencia ??
+      'multi';
     const actor = deriveStrictInvestigationActor(req);
     const saved = store.saveOfficialSnapshot({
-      id: `snap_inep_${imported.fileSha256.slice(0, 16)}`,
+      id: `snap_inep_${imported.fileSha256.slice(0, 12)}_${effectiveCompetencia.replace(/[^a-zA-Z0-9_-]/g, '')}`,
       sourceKind: 'inep',
       filename: imported.filename,
       sha256: imported.fileSha256,
-      competencia: imported.observations[0]?.competencia ?? 'multi',
+      competencia: effectiveCompetencia,
       uf: null,
       metadataJson: JSON.stringify({
         rowCount: imported.rowCount,

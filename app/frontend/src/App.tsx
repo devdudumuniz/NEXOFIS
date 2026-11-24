@@ -11,6 +11,7 @@ import {
   Lock,
   LogOut,
   Menu,
+  Microscope,
   Moon,
   Network,
   PanelLeftClose,
@@ -55,10 +56,18 @@ import { ContractDossierView } from './components/ContractDossierView';
 import { SavedDossiersView } from './components/SavedDossiersView';
 import { RiskDashboardView } from './components/RiskDashboardView';
 import { PartnerNetworkView } from './components/PartnerNetworkView';
+import { InvestigativeWorkbenchView } from './components/InvestigativeWorkbenchView';
 import { ToastContainer } from './components/ToastContainer';
 import type { PartnerNetworkQueryMode } from '@nexofis/shared/lib/partnerNetworkGraph';
 
-type ActiveSection = 'dashboard' | 'municipio' | 'contrato' | 'rede' | 'documento' | 'dossies';
+type ActiveSection =
+  | 'dashboard'
+  | 'municipio'
+  | 'contrato'
+  | 'rede'
+  | 'investigacao'
+  | 'documento'
+  | 'dossies';
 
 interface UrlState {
   section: ActiveSection;
@@ -98,6 +107,7 @@ function readUrlState(): UrlState {
     rawSec === 'dashboard' ||
     rawSec === 'contrato' ||
     rawSec === 'rede' ||
+    rawSec === 'investigacao' ||
     rawSec === 'documento' ||
     rawSec === 'dossies'
       ? rawSec
@@ -520,6 +530,12 @@ export default function App() {
       icon: Network,
     },
     {
+      id: 'investigacao',
+      label: 'Bancada Investigativa',
+      hint: 'DiD, SINAPI, Canais & Cypher',
+      icon: Microscope,
+    },
+    {
       id: 'documento',
       label: 'Documento',
       hint: 'Upload PDF/Imagem e OCR',
@@ -767,9 +783,11 @@ export default function App() {
                       ? 'Contratos'
                       : section === 'rede'
                         ? 'Rede de Sócios'
-                        : section === 'documento'
-                          ? 'Documentos'
-                          : 'Dossiês'}
+                        : section === 'investigacao'
+                          ? 'Bancada Investigativa'
+                          : section === 'documento'
+                            ? 'Documentos'
+                            : 'Dossiês'}
               </button>
 
               {section === 'municipio' && breadcrumbCtx.municipality && (
@@ -972,6 +990,14 @@ export default function App() {
               authPrincipal={principal}
               onQueryStateChange={(q, mode) => setNetworkState({ query: q, mode })}
               onSelectContract={handleOpenContract}
+            />
+          ) : section === 'investigacao' ? (
+            <InvestigativeWorkbenchView
+              authPrincipal={principal}
+              onRequireAuth={() => {
+                setAuthError(null);
+                setAuthModalOpen(true);
+              }}
             />
           ) : section === 'documento' ? (
             <DocumentUploadView onSelectContract={handleOpenContract} />

@@ -1965,7 +1965,8 @@ export function verifyInvestigationPackage(
     evaluatedAt: p.evaluation!.evaluatedAt,
   });
 
-  // F04: Deep canonical replay comparison over FULL evaluation (summaries, titles, metrics, chronology, evidenceRefs, reviews)
+  // F04 + Defect 1.6: Deep canonical replay comparison over FULL evaluation
+  // (summaries, titles, metrics, chronology, limitations, diligences, evidenceRefs, reviews)
   const normalizeEvaluationForReplay = (ev: InvestigationEvaluation) => ({
     engineVersion: ev.engineVersion,
     factsVersion: ev.factsVersion,
@@ -1973,6 +1974,7 @@ export function verifyInvestigationPackage(
     observedMetrics: ev.observedMetrics,
     unresolvedIdentitiesCount: ev.unresolvedIdentitiesCount,
     budgetExceeded: ev.budgetExceeded,
+    generalLimitations: ev.generalLimitations,
     findings: ev.findings.map((f) => ({
       trailCode: f.trailCode,
       title: f.title,
@@ -1980,6 +1982,8 @@ export function verifyInvestigationPackage(
       status: f.status,
       summary: f.summary,
       metrics: f.metrics,
+      limitations: f.limitations,
+      suggestedDiligences: f.suggestedDiligences,
       ruleVersion: f.ruleVersion,
       factsVersion: f.factsVersion,
       inputsDigest: f.inputsDigest,

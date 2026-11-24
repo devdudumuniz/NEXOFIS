@@ -1,4 +1,5 @@
 import type { BenchmarkPeer, HorizontalBenchmarkResult } from '../types/audit';
+import { competenciaDistanceMonths, validateCompetencia } from './competenciaValidator';
 
 export const HORIZONTAL_BENCHMARK_RULE_ID = 'BENCH_HORIZONTAL_SUPPLIER_V1';
 
@@ -352,6 +353,8 @@ export interface PriceComparabilityProfile {
 
 export interface ComparablePricePeerInput extends BenchmarkPeer {
   profile: PriceComparabilityProfile;
+  /** Optional explicit multiplier to convert peer quantity into subject unit (defaults to 1 / conversionFactor when units differ). */
+  quantityConversionFactor?: number;
 }
 
 export interface PriceComparabilityEvaluation {
@@ -364,8 +367,32 @@ export interface PriceComparabilityEvaluation {
     | 'hipotese_de_sobrepreco_requer_diligencia';
   damageQuantificationAutomatic: false;
   damageQuantificationNote: string;
-  includedPeers: Array<{ contractNumber: string; source: string; unitPrice: number }>;
-  excludedPeers: Array<{ contractNumber: string; source: string; reasons: string[] }>;
+  includedPeers: Array<{
+    peerId: string;
+    contractNumber: string;
+    source: string;
+    referenceSource: string;
+    referenceVersion: string;
+    uf: string;
+    competencia: string;
+    unitPrice: number;
+    conversionApplied?: {
+      fromUnit: string;
+      toUnit: string;
+      priceFactor: number;
+      convertedQuantity: number;
+    };
+  }>;
+  excludedPeers: Array<{
+    peerId: string;
+    contractNumber: string;
+    source: string;
+    referenceSource: string;
+    referenceVersion: string;
+    uf: string;
+    competencia: string;
+    reasons: string[];
+  }>;
   sensitivityAnalysis: {
     leaveOneOutMinMedian: number | null;
     leaveOneOutMaxMedian: number | null;
@@ -383,10 +410,82 @@ function normComp(s: string): string {
     .trim();
 }
 
+const SPEC_STOPWORDS = new Set([
+  'de',
+  'da',
+  'do',
+  'das',
+  'dos',
+  'para',
+  'com',
+  'sem',
+  'em',
+  'no',
+  'na',
+  'nos',
+  'nas',
+  'por',
+  'tipo',
+  'classe',
+  'uso',
+  'padrao',
+  'fornecimento',
+  'aquisicao',
+  'item',
+  'material',
+  'unidade',
+  'unid',
+  'und',
+  'saco',
+  'sacos',
+  'caixa',
+  'caixas',
+  'litro',
+  'litros',
+  'metro',
+  'metros',
+  'kg',
+  'ton',
+]);
+
+function extractSpecificationTokens(spec: string): string[] {
+  const cleaned = normComp(spec).replace(/[^a-z0-9]+/g, ' ');
+  const tokens = cleaned
+    .split(/\s+/)
+    .filter((t) => t.length >= 3 && !SPEC_STOPWORDS.has(t) && !/^\d+$/.test(t));
+  return Array.from(new Set(tokens));
+}
+
+function specificationsAreComparable(
+  subjectSpec: string,
+  peerSpec: string
+): { comparable: boolean; overlapCount: number; minRatio: number } {
+  const subjTokens = extractSpecificationTokens(subjectSpec);
+  const peerTokens = extractSpecificationTokens(peerSpec);
+  if (subjTokens.length === 0 || peerTokens.length === 0) {
+    return { comparable: false, overlapCount: 0, minRatio: 0 };
+  }
+  const peerSet = new Set(peerTokens);
+  let overlapCount = 0;
+  for (const token of subjTokens) {
+    if (peerSet.has(token)) {
+      overlapCount += 1;
+    }
+  }
+  const denom = Math.min(subjTokens.length, peerTokens.length);
+  const minRatio = denom > 0 ? overlapCount / denom : 0;
+  return {
+    comparable: overlapCount >= 1 && minRatio >= 0.34,
+    overlapCount,
+    minRatio: Number(minRatio.toFixed(2)),
+  };
+}
+
 /**
  * Reuses the existing evaluateHorizontalBenchmark engine after enforcing strict pre-calculation
- * comparability checks: specification, unit & conversion, quantity/scale, location & competência,
- * delivery conditions, freight/service/taxes bundling, insumo vs composição, and reference/version.
+ * comparability checks: specification token overlap, unit & conversion (both price and quantity scale),
+ * location (UF) & competência window, delivery conditions, freight/service/taxes bundling,
+ * insumo vs composição, and canonical peerId provenance.
  * Blocks misleading ratios on missing/zero/incompatible units and never auto-quantifies damage.
  */
 export function evaluateInvestigativePriceComparison(params: {
@@ -399,31 +498,105 @@ export function evaluateInvestigativePriceComparison(params: {
   mode?: 'same_supplier' | 'market';
   maxScopeDistance?: number;
   maxQuantityRatio?: number;
+  allowCrossUf?: boolean;
+  maxCompetenciaDistanceMonths?: number;
   subjectContractKey?: string;
 }): PriceComparabilityEvaluation {
   const maxQuantityRatio = params.maxQuantityRatio ?? 5.0;
+  const allowCrossUf = params.allowCrossUf ?? false;
+  const maxCompetenciaDistanceMonths = params.maxCompetenciaDistanceMonths ?? 12;
   const subj = params.subjectProfile;
   const subjUnit = normalizeUnit(subj.unitLabel);
+  const subjUf = subj.uf.trim().toUpperCase();
+  const subjCompCheck = validateCompetencia(subj.competencia);
+
   const includedPeers: PriceComparabilityEvaluation['includedPeers'] = [];
   const excludedPeers: PriceComparabilityEvaluation['excludedPeers'] = [];
+  const peerInputById = new Map<string, ComparablePricePeerInput>();
+  const conversionMetaById = new Map<
+    string,
+    { fromUnit: string; toUnit: string; priceFactor: number; convertedQuantity: number }
+  >();
 
-  const filteredBenchmarkPeers: BenchmarkPeer[] = params.peers.map((peer) => {
+  const filteredBenchmarkPeers: BenchmarkPeer[] = params.peers.map((peer, idx) => {
+    const canonicalPeerId = peer.id?.trim() || `peer_${idx + 1}_${peer.contractNumber}`;
+    const normalizedPeer: ComparablePricePeerInput =
+      peer.id === canonicalPeerId ? peer : { ...peer, id: canonicalPeerId };
+    peerInputById.set(canonicalPeerId, normalizedPeer);
+
     const reasons: string[] = [];
-    const p = peer.profile;
+    const p = normalizedPeer.profile;
+    const peerUnit = normalizeUnit(p.unitLabel);
+    const peerUf = p.uf.trim().toUpperCase();
 
-    if (!Number.isFinite(peer.nominalUnitPrice) || peer.nominalUnitPrice <= 0) {
+    if (!Number.isFinite(normalizedPeer.nominalUnitPrice) || normalizedPeer.nominalUnitPrice <= 0) {
       reasons.push('Preço unitário ausente, zero ou inválido (razão bloqueada).');
     }
-    if (!subjUnit || !normalizeUnit(p.unitLabel)) {
-      reasons.push('Unidade de medida ausente no item analisado ou no comparável.');
-    } else if (
-      normalizeUnit(p.unitLabel) !== subjUnit &&
-      !(typeof peer.conversionFactor === 'number' && Number.isFinite(peer.conversionFactor) && peer.conversionFactor > 0)
-    ) {
+
+    // Specification token overlap check (prevents comparing e.g. Cimento vs Areia)
+    if (!subj.specification.trim() || !p.specification.trim()) {
+      reasons.push('Especificação técnica ausente no item analisado ou no comparável.');
+    } else {
+      const specCheck = specificationsAreComparable(subj.specification, p.specification);
+      if (!specCheck.comparable) {
+        reasons.push(
+          `Especificação técnica incompatível ("${p.specification}" vs "${subj.specification}"; sobreposição insuficiente).`
+        );
+      }
+    }
+
+    // UF compatibility check
+    if (!allowCrossUf && subjUf && peerUf && subjUf !== peerUf) {
       reasons.push(
-        `Unidade incompatível (${p.unitLabel} ≠ ${subj.unitLabel}) sem fator de conversão documentado.`
+        `Localidade (UF) divergente (${peerUf} ≠ ${subjUf}) sem ajuste regional autorizado.`
       );
     }
+
+    // Competência validity and temporal distance check
+    const peerCompCheck = validateCompetencia(p.competencia);
+    if (!subjCompCheck.valid) {
+      reasons.push(`Competência do item analisado inválida ("${subj.competencia}").`);
+    } else if (!peerCompCheck.valid) {
+      reasons.push(`Competência do comparável inválida ("${p.competencia}").`);
+    } else {
+      const monthsApart = competenciaDistanceMonths(subj.competencia, p.competencia);
+      if (monthsApart !== null && monthsApart > maxCompetenciaDistanceMonths) {
+        reasons.push(
+          `Competência fora da janela comparável (${p.competencia} vs ${subj.competencia}: ${monthsApart} meses > limite de ${maxCompetenciaDistanceMonths} meses).`
+        );
+      }
+    }
+
+    // Unit & conversion check (converts BOTH unit price and quantity scale)
+    let effectivePeerQuantity = p.quantity;
+    if (!subjUnit || !peerUnit) {
+      reasons.push('Unidade de medida ausente no item analisado ou no comparável.');
+    } else if (peerUnit !== subjUnit) {
+      if (
+        typeof normalizedPeer.conversionFactor === 'number' &&
+        Number.isFinite(normalizedPeer.conversionFactor) &&
+        normalizedPeer.conversionFactor > 0
+      ) {
+        const qtyFactor =
+          typeof normalizedPeer.quantityConversionFactor === 'number' &&
+          Number.isFinite(normalizedPeer.quantityConversionFactor) &&
+          normalizedPeer.quantityConversionFactor > 0
+            ? normalizedPeer.quantityConversionFactor
+            : 1 / normalizedPeer.conversionFactor;
+        effectivePeerQuantity = Number((p.quantity * qtyFactor).toFixed(4));
+        conversionMetaById.set(canonicalPeerId, {
+          fromUnit: p.unitLabel,
+          toUnit: subj.unitLabel,
+          priceFactor: normalizedPeer.conversionFactor,
+          convertedQuantity: effectivePeerQuantity,
+        });
+      } else {
+        reasons.push(
+          `Unidade incompatível (${p.unitLabel} ≠ ${subj.unitLabel}) sem fator de conversão documentado.`
+        );
+      }
+    }
+
     if (p.itemKind !== subj.itemKind) {
       reasons.push(
         `Natureza incompatível (${p.itemKind} ≠ ${subj.itemKind}; vedada comparação direta insumo vs composição).`
@@ -450,10 +623,13 @@ export function evaluateInvestigativePriceComparison(params: {
     if (
       Number.isFinite(subj.quantity) &&
       subj.quantity > 0 &&
-      Number.isFinite(p.quantity) &&
-      p.quantity > 0
+      Number.isFinite(effectivePeerQuantity) &&
+      effectivePeerQuantity > 0
     ) {
-      const qtyRatio = Math.max(subj.quantity / p.quantity, p.quantity / subj.quantity);
+      const qtyRatio = Math.max(
+        subj.quantity / effectivePeerQuantity,
+        effectivePeerQuantity / subj.quantity
+      );
       if (qtyRatio > maxQuantityRatio) {
         reasons.push(
           `Escala de quantidade não comparável (razão ${qtyRatio.toFixed(1)}× excede limite de ${maxQuantityRatio}×).`
@@ -466,18 +642,23 @@ export function evaluateInvestigativePriceComparison(params: {
 
     if (reasons.length > 0) {
       excludedPeers.push({
-        contractNumber: peer.contractNumber,
+        peerId: canonicalPeerId,
+        contractNumber: normalizedPeer.contractNumber,
         source: `${p.referenceSource} (${p.referenceVersion})`,
+        referenceSource: p.referenceSource,
+        referenceVersion: p.referenceVersion,
+        uf: peerUf,
+        competencia: p.competencia,
         reasons,
       });
       return {
-        ...peer,
+        ...normalizedPeer,
         included: false,
         exclusionReason: reasons.join(' '),
       };
     }
 
-    return peer;
+    return normalizedPeer;
   });
 
   const benchmark = evaluateHorizontalBenchmark({
@@ -492,24 +673,39 @@ export function evaluateInvestigativePriceComparison(params: {
     subjectContractKey: params.subjectContractKey,
   });
 
-  // Collect final included vs excluded peers (combining pre-validation + benchmarkEngine exclusions)
-  const excludedSet = new Set(excludedPeers.map((e) => e.contractNumber));
+  // Collect final included vs excluded peers keyed strictly by canonical peerId
+  const excludedPeerIds = new Set(excludedPeers.map((e) => e.peerId));
   for (const p of benchmark.peers) {
-    const matchInput = params.peers.find((orig) => orig.contractNumber === p.contractNumber);
-    const sourceLabel = matchInput
-      ? `${matchInput.profile.referenceSource} (${matchInput.profile.referenceVersion})`
-      : 'Peer';
+    const matchInput = peerInputById.get(p.id);
+    const refSource = matchInput?.profile.referenceSource ?? 'Peer';
+    const refVersion = matchInput?.profile.referenceVersion ?? '';
+    const sourceLabel = matchInput ? `${refSource} (${refVersion})` : 'Peer';
+    const peerUf = matchInput?.profile.uf.trim().toUpperCase() ?? p.uf.trim().toUpperCase();
+    const peerComp = matchInput?.profile.competencia ?? String(p.contractYear);
     if (p.included) {
       includedPeers.push({
+        peerId: p.id,
         contractNumber: p.contractNumber,
         source: sourceLabel,
+        referenceSource: refSource,
+        referenceVersion: refVersion,
+        uf: peerUf,
+        competencia: peerComp,
         unitPrice: p.inflationAdjustedPrice,
+        conversionApplied: conversionMetaById.get(p.id),
       });
-    } else if (!excludedSet.has(p.contractNumber)) {
+    } else if (!excludedPeerIds.has(p.id)) {
       excludedPeers.push({
+        peerId: p.id,
         contractNumber: p.contractNumber,
         source: sourceLabel,
-        reasons: [p.exclusionReason || 'Excluído por critérios de comparabilidade do motor de benchmark.'],
+        referenceSource: refSource,
+        referenceVersion: refVersion,
+        uf: peerUf,
+        competencia: peerComp,
+        reasons: [
+          p.exclusionReason || 'Excluído por critérios de comparabilidade do motor de benchmark.',
+        ],
       });
     }
   }
@@ -560,13 +756,13 @@ export function evaluateInvestigativePriceComparison(params: {
       leaveOneOutMaxRatio,
     },
     validationChecksApplied: [
-      'especificação e classe de serviço',
-      'unidade e fator de conversão documentado',
+      'especificação técnica (sobreposição de tokens) e classe de serviço',
+      'unidade e fator de conversão documentado (preço e escala de quantidade)',
       'quantidade e escala comparável',
-      'localidade (UF) e competência',
+      'localidade (UF) e janela de competência validada',
       'condições de entrega, frete, serviço embutido e tributos/encargos',
       'separação insumo vs composição',
-      'fonte de referência e versão da tabela',
+      'fonte de referência, versão da tabela e proveniência canônica por peerId',
     ],
   };
 }

@@ -529,15 +529,83 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
     ).run(5, 'official_reference_snapshots_siaps_sinapi_camara', new Date().toISOString());
   }
 
+  // Additive migration v6: Support 'inep' source_kind and composite idempotency (source_kind, sha256, competencia, uf_norm)
+  const v6Check = db
+    .prepare('SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations')
+    .get() as { version: number };
+
+  if (v6Check.version < 6) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.exec(`
+        CREATE TABLE official_reference_snapshots_v6 (
+          id TEXT PRIMARY KEY,
+          source_kind TEXT NOT NULL CHECK(source_kind IN ('siaps', 'sinapi', 'camara_personnel', 'inep')),
+          filename TEXT NOT NULL,
+          sha256 TEXT NOT NULL,
+          competencia TEXT NOT NULL,
+          uf TEXT,
+          uf_norm TEXT NOT NULL DEFAULT '',
+          metadata_json TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          imported_by TEXT NOT NULL,
+          imported_at TEXT NOT NULL,
+          UNIQUE(source_kind, sha256, competencia, uf_norm)
+        );
+
+        INSERT INTO official_reference_snapshots_v6 (
+          id, source_kind, filename, sha256, competencia, uf, uf_norm,
+          metadata_json, payload_json, imported_by, imported_at
+        )
+        SELECT
+          id,
+          source_kind,
+          filename,
+          sha256,
+          competencia,
+          uf,
+          COALESCE(UPPER(TRIM(uf)), ''),
+          metadata_json,
+          payload_json,
+          imported_by,
+          imported_at
+        FROM official_reference_snapshots;
+
+        DROP TABLE official_reference_snapshots;
+        ALTER TABLE official_reference_snapshots_v6 RENAME TO official_reference_snapshots;
+
+        CREATE INDEX IF NOT EXISTS idx_official_snapshots_kind
+          ON official_reference_snapshots(source_kind, imported_at);
+        CREATE INDEX IF NOT EXISTS idx_official_snapshots_sha
+          ON official_reference_snapshots(sha256);
+      `);
+
+      db.prepare(
+        'INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)'
+      ).run(6, 'official_reference_snapshots_inep_and_composite_idempotency', new Date().toISOString());
+      db.exec('COMMIT');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
   const stmtInsertOfficialSnapshot = db.prepare(`
-    INSERT OR IGNORE INTO official_reference_snapshots (
-      id, source_kind, filename, sha256, competencia, uf,
+    INSERT INTO official_reference_snapshots (
+      id, source_kind, filename, sha256, competencia, uf, uf_norm,
       metadata_json, payload_json, imported_by, imported_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  const stmtGetOfficialSnapshotBySha = db.prepare(
-    'SELECT id FROM official_reference_snapshots WHERE sha256 = ?'
-  );
+  const stmtGetOfficialSnapshotByCompositeKey = db.prepare(`
+    SELECT id
+    FROM official_reference_snapshots
+    WHERE source_kind = ? AND sha256 = ? AND competencia = ? AND uf_norm = ?
+  `);
+  const stmtGetOfficialSnapshotById = db.prepare(`
+    SELECT id, source_kind, sha256, competencia, uf
+    FROM official_reference_snapshots
+    WHERE id = ?
+  `);
   const stmtListOfficialSnapshotsAll = db.prepare(`
     SELECT id, source_kind, filename, sha256, competencia, uf, metadata_json, imported_by, imported_at
     FROM official_reference_snapshots
@@ -1726,25 +1794,65 @@ export function createNexofisStore(dbPath: string = DEFAULT_DB_PATH): NexofisSto
       return rows.map(mapSupplierQsaRow);
     },
     saveOfficialSnapshot(snapshot) {
-      const existing = stmtGetOfficialSnapshotBySha.get(snapshot.sha256) as
-        | { id: string }
-        | undefined;
+      const normalizedCompetencia = snapshot.competencia.trim();
+      const normalizedUf = snapshot.uf ? snapshot.uf.trim().toUpperCase() : null;
+      const ufNorm = normalizedUf ?? '';
+
+      const existing = stmtGetOfficialSnapshotByCompositeKey.get(
+        snapshot.sourceKind,
+        snapshot.sha256,
+        normalizedCompetencia,
+        ufNorm
+      ) as { id: string } | undefined;
       if (existing) {
         return { alreadyExisted: true, id: existing.id };
       }
-      stmtInsertOfficialSnapshot.run(
-        snapshot.id,
+
+      let effectiveId = snapshot.id;
+      const collidingId = stmtGetOfficialSnapshotById.get(effectiveId) as { id: string } | undefined;
+      if (collidingId) {
+        const suffix = crypto
+          .createHash('sha256')
+          .update(`${snapshot.sourceKind}|${snapshot.sha256}|${normalizedCompetencia}|${ufNorm}`)
+          .digest('hex')
+          .slice(0, 8);
+        effectiveId = `${snapshot.id}_${suffix}`;
+      }
+
+      const result = stmtInsertOfficialSnapshot.run(
+        effectiveId,
         snapshot.sourceKind,
         snapshot.filename,
         snapshot.sha256,
-        snapshot.competencia,
-        snapshot.uf,
+        normalizedCompetencia,
+        normalizedUf,
+        ufNorm,
         snapshot.metadataJson,
         snapshot.payloadJson,
         snapshot.importedBy,
         new Date().toISOString()
       );
-      return { alreadyExisted: false, id: snapshot.id };
+      if (Number(result.changes) !== 1) {
+        throw new Error(
+          `Falha ao persistir snapshot oficial (${snapshot.sourceKind}): esperado changes=1, obtido ${String(result.changes)}.`
+        );
+      }
+
+      const persisted = stmtGetOfficialSnapshotById.get(effectiveId) as
+        | { id: string; source_kind: string; sha256: string; competencia: string; uf: string | null }
+        | undefined;
+      if (
+        !persisted ||
+        persisted.source_kind !== snapshot.sourceKind ||
+        persisted.sha256 !== snapshot.sha256 ||
+        persisted.competencia !== normalizedCompetencia
+      ) {
+        throw new Error(
+          `Verificação pós-escrita falhou para snapshot oficial ${effectiveId} (${snapshot.sourceKind}).`
+        );
+      }
+
+      return { alreadyExisted: false, id: persisted.id };
     },
     listOfficialSnapshots(sourceKind) {
       const rows = (

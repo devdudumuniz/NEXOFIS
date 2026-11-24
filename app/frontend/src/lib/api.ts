@@ -765,4 +765,104 @@ export async function fetchForensicCypherProjection(
   );
 }
 
+export interface OfficialSnapshotSummary {
+  id: string;
+  sourceKind: 'siaps' | 'sinapi' | 'camara_personnel' | 'inep';
+  filename: string;
+  sha256: string;
+  competencia: string;
+  uf: string | null;
+  metadataJson: string;
+  importedBy: string;
+  importedAt: string;
+}
+
+export async function fetchOfficialSnapshots(
+  kind?: 'siaps' | 'sinapi' | 'camara_personnel' | 'inep'
+): Promise<{ snapshots: OfficialSnapshotSummary[] }> {
+  const qs = kind ? `?kind=${encodeURIComponent(kind)}` : '';
+  const res = await fetch(`/api/investigative/snapshots${qs}`, {
+    headers: buildAuthHeaders(),
+  });
+  return readJson<{ snapshots: OfficialSnapshotSummary[] }>(
+    res,
+    'Falha ao consultar snapshots oficiais persistidos.'
+  );
+}
+
+export async function importOfficialDataset(
+  kind: 'siaps' | 'inep' | 'sinapi' | 'camara-personnel',
+  payload: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  const res = await fetch(`/api/investigative/importers/${kind}`, {
+    method: 'POST',
+    headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  });
+  return readJson<Record<string, unknown>>(
+    res,
+    `Falha ao importar arquivo oficial (${kind.toUpperCase()}).`
+  );
+}
+
+export async function evaluatePairedDid(
+  payload: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  const res = await fetch('/api/investigative/outcomes/did-evaluate', {
+    method: 'POST',
+    headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  });
+  return readJson<Record<string, unknown>>(
+    res,
+    'Falha ao executar análise de Diferença-em-Diferenças (DiD).'
+  );
+}
+
+export async function evaluatePublicIntegrity(
+  payload: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  const res = await fetch('/api/investigative/public-integrity/evaluate', {
+    method: 'POST',
+    headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  });
+  return readJson<Record<string, unknown>>(
+    res,
+    'Falha ao avaliar trilhas de integridade pública.'
+  );
+}
+
+export async function evaluateInvestigativePrices(
+  payload: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  const res = await fetch('/api/investigative/prices/evaluate', {
+    method: 'POST',
+    headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  });
+  return readJson<Record<string, unknown>>(
+    res,
+    'Falha ao avaliar comparabilidade de preços.'
+  );
+}
+
+export async function auditEditalTextChannels(payload: {
+  text: string;
+  procurementId?: string;
+  applicableLegalRule?: string;
+  jurisdiction?: string;
+}): Promise<EditalChannelAuditResult> {
+  const res = await fetch('/api/investigative/participation/audit-edital-text', {
+    method: 'POST',
+    headers: buildAuthHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(payload),
+  });
+  return readJson<EditalChannelAuditResult>(
+    res,
+    'Falha ao auditar canais de participação no edital.'
+  );
+}
+
+
 

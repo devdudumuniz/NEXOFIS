@@ -338,7 +338,7 @@ test('SQLite store persists contracts, dossiers, and append-only finding reviews
 
   try {
     const store1 = createNexofisStore(dbPath);
-    assert.equal(store1.getSchemaVersion(), 5);
+    assert.equal(store1.getSchemaVersion(), 6);
 
     const sample = FIXTURE_HIGH_RISK;
     store1.upsertContract(sample);

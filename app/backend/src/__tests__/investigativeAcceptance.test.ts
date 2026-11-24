@@ -1035,15 +1035,15 @@ test('Regressões adicionais: SICONFI não soma estágios, Câmara diário sem h
   // Observability registry tracks latencies & coverage
   const obsReg = createObservabilityRegistry();
   obsReg.recordSourceCall({ source: 'pncp_search', ok: true, latencyMs: 120, statusLabel: 'complete' });
-  const snap = obsReg.getSnapshot({ schemaVersion: 5, indexedSuppliers: 10, indexedQsa: 5 });
-  assert.equal(snap.schemaVersion, 5);
+  const snap = obsReg.getSnapshot({ schemaVersion: 6, indexedSuppliers: 10, indexedQsa: 5 });
+  assert.equal(snap.schemaVersion, 6);
   assert.equal(snap.coverage.qsaCoveragePct, 50);
 
-  // SQLite v5 migration & idempotent official snapshot persistence
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexofis-v5-'));
+  // SQLite v6 migration & idempotent official snapshot persistence
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nexofis-v6-'));
   try {
     const store = createNexofisStore(path.join(tmpDir, 'test.db'));
-    assert.equal(store.getSchemaVersion(), 5);
+    assert.equal(store.getSchemaVersion(), 6);
     const first = store.saveOfficialSnapshot({
       id: 'snap-1',
       sourceKind: 'sinapi',
@@ -1142,6 +1142,20 @@ test('19. Diferença-em-Diferenças pareada (Saúde/Educação) + importador INE
         postValue: 40.0,
       },
     ],
+    didDesign: {
+      requestedMethod: 'did',
+      usesSimpleNeighborAverageAsSyntheticControl: false,
+      comparisonGroupJustification:
+        'Três municípios vizinhos da mesma microrregião e faixa populacional sem consultoria equivalente.',
+      prePeriodTreatedCount: 3,
+      prePeriodControlCount: 3,
+      postPeriodTreatedCount: 1,
+      postPeriodControlCount: 1,
+      preTrendsTested: true,
+      preTrendsParallel: true,
+      explicitAssumptions: ['Tendências paralelas examinadas nos 3 períodos pré-contrato.'],
+      uncertaintyReported: true,
+    },
   });
 
   assert.equal(did.validControlCount, 3);

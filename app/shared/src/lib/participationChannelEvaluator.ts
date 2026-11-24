@@ -42,6 +42,12 @@ export interface ParticipationChannelInput {
     emailSpecifiedForProposals: string | null;
     physicalDeliveryAllowed: boolean | null;
   };
+  /** Official publication/publicity channel (e.g. PNCP, Diário Oficial) — strictly separate from proposal submission! */
+  publicationChannel?: {
+    hasOfficialPublicationPortal: boolean;
+    portalName: string | null;
+    portalUrl: string | null;
+  };
   /** Institutional channels analyzed separately */
   institutionalChannels: {
     contactEmail: string | null;
@@ -76,6 +82,7 @@ export interface ParticipationChannelEvaluation {
     reason: string;
   };
   channelBreakdown: {
+    publicationPortal: string;
     proposalSubmission: string;
     institutionalContact: string;
     clarifications: string;
@@ -280,8 +287,11 @@ export function evaluateParticipationChannels(
       reason: legalReason,
     },
     channelBreakdown: {
+      publicationPortal: input.publicationChannel?.hasOfficialPublicationPortal
+        ? `Portal de publicação: ${input.publicationChannel.portalName ?? 'informado'} (${input.publicationChannel.portalUrl ?? 'URL não informada'}) — publicidade distinta de canal de submissão`
+        : 'Não informado separadamente',
       proposalSubmission: input.proposalSubmissionChannel.hasValidElectronicPortal
-        ? `Portal eletrônico: ${input.proposalSubmissionChannel.portalName ?? 'informado'} (${input.proposalSubmissionChannel.portalUrl ?? 'URL não informada'})`
+        ? `Portal eletrônico de submissão: ${input.proposalSubmissionChannel.portalName ?? 'informado'} (${input.proposalSubmissionChannel.portalUrl ?? 'URL não informada'})`
         : input.proposalSubmissionChannel.emailSpecifiedForProposals
           ? `E-mail declarado para propostas: ${input.proposalSubmissionChannel.emailSpecifiedForProposals}`
           : 'Não localizado nos documentos analisados',
@@ -322,7 +332,10 @@ export interface EditalChannelAuditResult {
   emailsFound: string[];
   filteredOutSystemEmails: string[];
   phonesFound: string[];
+  /** Electronic bidding/proposal SUBMISSION platforms ONLY (excludes pure publication portals like PNCP) */
   platformsFound: string[];
+  /** Pure publication/publicity portals (e.g. PNCP, Diário Oficial) separated from submission channels (Defect 1.8) */
+  publicationPortalsFound: string[];
   alerts: EditalChannelAuditAlert[];
   legalReferences: string[];
   /** Formal structured evaluation reusing the core participation channel guardrails */
@@ -342,8 +355,8 @@ const IGNORED_TOOL_EMAIL_DOMAINS = [
 /**
  * Automated communication-channel audit over extracted PDF/edital text (RegEx + contextual rules).
  * Extracts institutional emails (excluding software vendor domains like adobe.com/microsoft.com),
- * Brazilian phone numbers, and official electronic bidding portals, while enforcing NEXOFIS
- * safeguards (OCR quality threshold, separation between valid electronic portal vs email omission,
+ * Brazilian phone numbers, electronic bidding SUBMISSION portals, and PUBLICATION portals (PNCP/DO)
+ * strictly separated (Defect 1.8), while enforcing NEXOFIS safeguards (OCR quality threshold,
  * zero active probing, and human legal review before declaring illegality).
  */
 export function auditEditalCommunicationChannels(
@@ -361,8 +374,11 @@ export function auditEditalCommunicationChannels(
 
   const emailRegex = /[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+/g;
   const phoneRegex = /(?<!\d)(?:\(?\d{2}\)?\s*)?(?:9\d{4}|\d{4})[-\s]\d{4}(?!\d)/g;
-  const platformRegex =
-    /https?:\/\/(?:www\.)?(?:gov\.br\/compras(?:net)?|comprasnet|compras\.gov|bll|bnc|portaldecompraspublicas|portaldecompras|licitanet|licitacoes-e|pncp\.gov\.br|novobbmnet|comprasbr)[a-zA-Z0-9._~:/?#[\]@!$&'()*+,;=-]*/gi;
+  // Submission platforms ONLY (PNCP is strictly a publication portal, NOT a proposal submission channel)
+  const submissionPlatformRegex =
+    /https?:\/\/(?:www\.)?(?:gov\.br\/compras(?:net)?|comprasnet|compras\.gov\.br|bll(?:compras)?|bnc|portaldecompraspublicas|portaldecompras|licitanet|licitacoes-e|novobbmnet|comprasbr|licitar\.digital)[a-zA-Z0-9._~:/?#[\]@!$&'()*+,;=-]*/gi;
+  const publicationPortalRegex =
+    /https?:\/\/(?:www\.)?(?:pncp\.gov\.br|in\.gov\.br|diariomunicipal|transparencia\.[a-z0-9.-]+\.gov\.br)[a-zA-Z0-9._~:/?#[\]@!$&'()*+,;=-]*/gi;
 
   const rawEmails = Array.from(new Set(safeText.match(emailRegex) ?? []));
   const filteredOutSystemEmails: string[] = [];
@@ -382,7 +398,10 @@ export function auditEditalCommunicationChannels(
   ).filter((p) => p.replace(/\D/g, '').length >= 8 && p.replace(/\D/g, '').length <= 11);
 
   const platformsFound = Array.from(
-    new Set((safeText.match(platformRegex) ?? []).map((u) => u.replace(/[.,;)]+$/, '')))
+    new Set((safeText.match(submissionPlatformRegex) ?? []).map((u) => u.replace(/[.,;)]+$/, '')))
+  );
+  const publicationPortalsFound = Array.from(
+    new Set((safeText.match(publicationPortalRegex) ?? []).map((u) => u.replace(/[.,;)]+$/, '')))
   );
 
   const isElectronicOrDispensa =
@@ -413,8 +432,10 @@ export function auditEditalCommunicationChannels(
         severity: platformsFound.length > 0 ? 'aviso' : 'critico',
         message:
           platformsFound.length > 0
-            ? 'TRANSPARÊNCIA PARCIAL: Nenhum e-mail institucional identificado no texto para pedidos de esclarecimento, embora haja plataforma eletrônica oficial indicada.'
-            : 'OMISSÃO CRÍTICA: Nenhum e-mail institucional identificado para envio de propostas ou pedidos de esclarecimento.',
+            ? 'TRANSPARÊNCIA PARCIAL: Nenhum e-mail institucional identificado no texto para pedidos de esclarecimento, embora haja plataforma eletrônica oficial de submissão indicada.'
+            : publicationPortalsFound.length > 0
+              ? 'OMISSÃO CRÍTICA: Apenas portal de publicação (ex.: PNCP/Diário Oficial) foi identificado, sem e-mail institucional ou plataforma eletrônica de submissão de propostas.'
+              : 'OMISSÃO CRÍTICA: Nenhum e-mail institucional identificado para envio de propostas ou pedidos de esclarecimento.',
         legalBasis: legalReferences,
       });
     }
@@ -433,7 +454,9 @@ export function auditEditalCommunicationChannels(
         code: 'SINAL_CRITICO_COMPETITIVIDADE',
         severity: 'critico',
         message:
-          'SINAL CRÍTICO À AMPLA CONCORRÊNCIA: Edital eletrônico ou dispensa sem indicação de plataforma oficial de licitação ou e-mail institucional para envio/esclarecimentos. Requer revisão jurídica humana.',
+          publicationPortalsFound.length > 0
+            ? 'SINAL CRÍTICO À AMPLA CONCORRÊNCIA: Edital eletrônico/dispensa menciona apenas portal de publicação (ex.: PNCP), sem indicar plataforma efetiva de submissão de propostas nem e-mail institucional. Requer revisão jurídica humana.'
+            : 'SINAL CRÍTICO À AMPLA CONCORRÊNCIA: Edital eletrônico ou dispensa sem indicação de plataforma oficial de submissão de propostas ou e-mail institucional. Requer revisão jurídica humana.',
         legalBasis: legalReferences,
       });
     }
@@ -443,6 +466,11 @@ export function auditEditalCommunicationChannels(
     procurementId: options?.procurementId ?? 'DOC-EDITAL',
     applicableLegalRule: options?.applicableLegalRule ?? 'Lei nº 14.133/2021 (Art. 5º) · LAI · PNTP (Atricon)',
     jurisdiction: options?.jurisdiction ?? 'Brasil — Esfera Municipal/Estadual/Federal',
+    publicationChannel: {
+      hasOfficialPublicationPortal: publicationPortalsFound.length > 0,
+      portalName: publicationPortalsFound.length > 0 ? new URL(publicationPortalsFound[0]).hostname : null,
+      portalUrl: publicationPortalsFound[0] ?? null,
+    },
     proposalSubmissionChannel: {
       hasValidElectronicPortal: platformsFound.length > 0,
       portalName: platformsFound.length > 0 ? new URL(platformsFound[0]).hostname : null,
@@ -467,7 +495,7 @@ export function auditEditalCommunicationChannels(
       {
         documentType: 'edital',
         title: options?.procurementId ?? 'Documento analisado',
-        url: platformsFound[0] ?? null,
+        url: platformsFound[0] ?? publicationPortalsFound[0] ?? null,
         externalId: null,
         publishedAt: null,
         amendmentDates: [],
@@ -497,6 +525,7 @@ export function auditEditalCommunicationChannels(
     filteredOutSystemEmails,
     phonesFound,
     platformsFound,
+    publicationPortalsFound,
     alerts,
     legalReferences,
     channelEvaluation,

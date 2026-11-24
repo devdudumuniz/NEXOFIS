@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import { parseBrazilianNumber, parseCsvTable } from './csvParser';
+import { validateCompetencia, validateIsoDate } from './competenciaValidator';
 
 export type IndicatorPeriodicity =
   | 'mensal'
@@ -210,24 +212,7 @@ export interface SiconfiReconciliationResult {
 }
 
 function parseNumericOrNull(raw: string | undefined): number | null {
-  if (!raw) return null;
-  const cleaned = raw.trim().replace(/^"|"$/g, '');
-  if (
-    !cleaned ||
-    cleaned === '-' ||
-    cleaned === '--' ||
-    /^n\/?d$/i.test(cleaned) ||
-    /^n\/?a$/i.test(cleaned) ||
-    /nao\s*publicado/i.test(cleaned) ||
-    /não\s*publicado/i.test(cleaned)
-  ) {
-    return null;
-  }
-  const normalized = cleaned.includes(',') && cleaned.includes('.')
-    ? cleaned.replace(/\./g, '').replace(',', '.')
-    : cleaned.replace(',', '.');
-  const num = Number(normalized);
-  return Number.isFinite(num) ? num : null;
+  return parseBrazilianNumber(raw);
 }
 
 export function validateDidDesign(design: DidDesignInput): {
@@ -389,12 +374,38 @@ export function evaluateOutcomeClaim(params: {
     };
   }
 
-  // Only published observations with numeric values (NEVER coerce unpublished to 0)
+  // Only published observations with numeric values available ON OR BEFORE evaluationDate
+  // (Corte Temporal: future publications publishedAt > evaluationDate are excluded from point-in-time evaluation)
+  const postCutoffPublishedObs = matchingObs.filter(
+    (o) =>
+      o.isPublished &&
+      o.value !== null &&
+      o.periodEndDate >= effectiveStart &&
+      o.periodEndDate <= evaluationDate &&
+      typeof o.publishedAt === 'string' &&
+      o.publishedAt.trim().length >= 10 &&
+      o.publishedAt.trim().slice(0, 10) > evaluationDate
+  );
+  if (postCutoffPublishedObs.length > 0) {
+    limitations.push(
+      `Corte temporal aplicado em ${evaluationDate}: ${postCutoffPublishedObs.length} observação(ões) publicada(s) posteriormente (${postCutoffPublishedObs.map((o) => `${o.competencia} pub.${o.publishedAt?.slice(0, 10)}`).join(', ')}) foram excluídas para preservar avaliação point-in-time.`
+    );
+  }
+
   const publishedPostObs = matchingObs.filter(
-    (o) => o.isPublished && o.value !== null && o.periodEndDate >= effectiveStart && o.periodEndDate <= evaluationDate
+    (o) =>
+      o.isPublished &&
+      o.value !== null &&
+      o.periodEndDate >= effectiveStart &&
+      o.periodEndDate <= evaluationDate &&
+      (!o.publishedAt || o.publishedAt.trim().slice(0, 10) <= evaluationDate)
   );
   const unpublishedPostObs = matchingObs.filter(
-    (o) => (!o.isPublished || o.value === null) && o.periodEndDate >= effectiveStart
+    (o) =>
+      (!o.isPublished ||
+        o.value === null ||
+        (typeof o.publishedAt === 'string' && o.publishedAt.trim().slice(0, 10) > evaluationDate)) &&
+      o.periodEndDate >= effectiveStart
   );
 
   if (publishedPostObs.length === 0) {
@@ -403,7 +414,7 @@ export function evaluateOutcomeClaim(params: {
     );
     if (unpublishedPostObs.length > 0) {
       limitations.push(
-        `${unpublishedPostObs.length} competência(s) localizada(s) ainda sem valor publicado (${unpublishedPostObs.map((u) => u.competencia).join(', ')}).`
+        `${unpublishedPostObs.length} competência(s) localizada(s) ainda sem valor publicado até a data de corte (${unpublishedPostObs.map((u) => u.competencia).join(', ')}).`
       );
     }
     diligences.push(
@@ -561,13 +572,9 @@ export function importSiapsPublicExport(params: {
   const observations: IndicatorObservation[] = [];
   let unpublishedCount = 0;
 
-  const lines = params.rawCsv
-    .replace(/^\uFEFF/, '')
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
+  const parsed = parseCsvTable(params.rawCsv);
 
-  if (lines.length < 2) {
+  if (parsed.headers.length === 0 || parsed.rows.length === 0) {
     warnings.push('Arquivo SIAPS sem linhas de dados.');
     return {
       sourceSystem: 'SIAPS — Exportação Pública CSV/XLSX (sem API inventada)',
@@ -581,11 +588,7 @@ export function importSiapsPublicExport(params: {
     };
   }
 
-  const delimiter = lines[0].includes(';') ? ';' : lines[0].includes('\t') ? '\t' : ',';
-  const headers = lines[0]
-    .split(delimiter)
-    .map((h) => h.replace(/^"|"$/g, '').trim().toLowerCase());
-
+  const headers = parsed.headers.map((h) => h.trim().toLowerCase());
   const col = (names: string[]) => headers.findIndex((h) => names.some((n) => h.includes(n)));
 
   const idxIbge = col(['ibge', 'municipio_cod', 'territorio']);
@@ -599,12 +602,20 @@ export function importSiapsPublicExport(params: {
   const idxPub = col(['publicacao', 'published', 'data_publicacao']);
   const idxRev = col(['revisao', 'revision']);
 
-  for (let i = 1; i < lines.length; i++) {
-    const parts = lines[i].split(delimiter).map((c) => c.replace(/^"|"$/g, '').trim());
+  for (let i = 0; i < parsed.rows.length; i++) {
+    const parts = parsed.rows[i];
     const territoryCode = (idxIbge >= 0 ? parts[idxIbge] : parts[0])?.replace(/\D/g, '') || '';
     const indicatorId = (idxIndicator >= 0 ? parts[idxIndicator] : parts[1]) || '';
-    const competencia = (idxComp >= 0 ? parts[idxComp] : parts[2]) || '';
-    if (!territoryCode || !indicatorId || !competencia) continue;
+    const rawCompetencia = (idxComp >= 0 ? parts[idxComp] : parts[2]) || '';
+    if (!territoryCode || !indicatorId || !rawCompetencia) continue;
+
+    const compValidation = validateCompetencia(rawCompetencia);
+    if (!compValidation.valid || !compValidation.normalized) {
+      warnings.push(
+        `Linha ${i + 2} ignorada por competência inválida ("${rawCompetencia}"): ${compValidation.reason ?? 'formato inválido'}`
+      );
+      continue;
+    }
 
     const methodologyVersion =
       (idxMethodology >= 0 && parts[idxMethodology]) || params.defaultMethodologyVersion;
@@ -615,23 +626,28 @@ export function importSiapsPublicExport(params: {
       value = Number(((numerator / denominator) * 100).toFixed(2));
     }
 
-    const publishedAt = idxPub >= 0 && parts[idxPub] ? parts[idxPub] : null;
+    const rawPublishedAt = idxPub >= 0 && parts[idxPub] ? parts[idxPub].trim() : null;
+    const publishedAt =
+      rawPublishedAt && validateIsoDate(rawPublishedAt.slice(0, 10)).valid
+        ? rawPublishedAt
+        : null;
     const isPublished = value !== null;
     if (!isPublished) {
       unpublishedCount += 1;
     }
 
+    const explicitEnd = idxPeriodEnd >= 0 ? validateIsoDate(parts[idxPeriodEnd]) : { valid: false, normalized: null };
     const inferredPeriodEnd =
-      (idxPeriodEnd >= 0 && /^\d{4}-\d{2}-\d{2}$/.test(parts[idxPeriodEnd] ?? '')
-        ? parts[idxPeriodEnd]
-        : inferPeriodEndFromCompetencia(competencia)) || `${competencia.slice(0, 4)}-12-31`;
+      (explicitEnd.valid && explicitEnd.normalized) ||
+      compValidation.periodEndDate ||
+      `${compValidation.normalized.slice(0, 4)}-12-31`;
 
     observations.push({
-      observationId: `siaps_${territoryCode}_${indicatorId}_${competencia}_${i}`,
+      observationId: `siaps_${territoryCode}_${indicatorId}_${compValidation.normalized}_${i + 1}`,
       indicatorId,
       methodologyVersion,
       territoryCode,
-      competencia,
+      competencia: compValidation.normalized,
       periodEndDate: inferredPeriodEnd,
       publishedAt,
       collectedAt: importedAt,
@@ -804,7 +820,13 @@ export interface PairedDidResult {
   netEffectOriented: number;
   validControlCount: number;
   excludedControlCount: number;
-  alertLevel: 'ALERTA_VERMELHO_INEFETIVIDADE' | 'ATENCAO_DESEMPENHO_ESTAGNADO' | 'VARIACAO_FAVORAVEL_OBSERVADA' | 'CONTROLE_INSUFICIENTE';
+  alertLevel:
+    | 'ALERTA_VERMELHO_INEFETIVIDADE'
+    | 'ATENCAO_DESEMPENHO_ESTAGNADO'
+    | 'VARIACAO_FAVORAVEL_OBSERVADA'
+    | 'CONTROLE_INSUFICIENTE'
+    | 'METODOLOGIA_REPROVADA'
+    | 'CONTRASTE_DESCRITIVO_SEM_INFERENCIA';
   alertTitle: string;
   alertDetail: string;
   /** Forensic safeguard: indicator stagnation triggers audit of physical delivery, never automatic proof of fictitious service */
@@ -904,11 +926,27 @@ export function computePairedDidEffect(input: PairedDidInput): PairedDidResult {
   let alertTitle: string;
   let alertDetail: string;
 
-  if (netEffectOriented <= 0 && input.installmentsPaidPct >= 80) {
+  // Defect 1.4: NEVER emit red ineffectiveness alert when DiD methodology failed validation
+  // or when no formal didDesign was supplied.
+  if (didValidation && !didValidation.eligible) {
+    alertLevel = 'METODOLOGIA_REPROVADA';
+    alertTitle = 'Metodologia DiD Reprovada — Alerta Causal Bloqueado';
+    alertDetail = `Desenho de Diferença-em-Diferenças não atendeu aos pré-requisitos metodológicos (${didValidation.blockingReasons.join(' ')}). O contraste numérico observado (Efeito líquido orientado = ${netEffectOriented}, ΔTratado=${deltaTreated}, ΔControle=${deltaControlMean}) não pode sustentar alerta vermelho de inefetividade.`;
+    diligences.push(
+      'Corrigir desenho quase-experimental (justificar grupo de controle, testar pré-tendências paralelas com >= 3 períodos pré, declarar hipóteses e incerteza estatística) antes de emitir inferência DiD.'
+    );
+  } else if (!input.didDesign) {
+    alertLevel = 'CONTRASTE_DESCRITIVO_SEM_INFERENCIA';
+    alertTitle = 'Contraste Descritivo Pareado (Sem Desenho DiD Validado)';
+    alertDetail = `Contraste descritivo frente a ${validControls.length} município(s) vizinho(s): ΔTratado=${deltaTreated}, ΔControle=${deltaControlMean}, diferença orientada=${netEffectOriented} (${input.installmentsPaidPct.toFixed(1)}% pago). Como o desenho DiD formal (pré-tendências, hipóteses e incerteza) não foi informado, nenhum alerta vermelho causal é emitido automaticamente.`;
+    diligences.push(
+      'Informar avaliação formal de pré-tendências e incerteza (didDesign) para qualificar inferência DiD e auditar entregas contratuais independentemente.'
+    );
+  } else if (netEffectOriented <= 0 && input.installmentsPaidPct >= 80) {
     alertLevel = 'ALERTA_VERMELHO_INEFETIVIDADE';
     alertTitle =
       'Alerta Vermelho de Triagem: Indício de Inefetividade — Auditar Prestação Efetiva do Serviço';
-    alertDetail = `Efeito líquido orientado = ${netEffectOriented} (ΔTratado=${deltaTreated}, ΔControle=${deltaControlMean}) com ${input.installmentsPaidPct.toFixed(1)}% das parcelas pagas. O indicador do município contratante evoluiu igual ou abaixo dos ${validControls.length} municípios pareados; exige auditoria física/documental de entregas (Dimensão A) antes de qualquer conclusão jurídica.`;
+    alertDetail = `Efeito líquido orientado = ${netEffectOriented} (ΔTratado=${deltaTreated}, ΔControle=${deltaControlMean}) com ${input.installmentsPaidPct.toFixed(1)}% das parcelas pagas e desenho DiD validado. O indicador do município contratante evoluiu igual ou abaixo dos ${validControls.length} municípios pareados; exige auditoria física/documental de entregas (Dimensão A) antes de qualquer conclusão jurídica.`;
     diligences.push(
       'Solicitar relatórios técnicos assinados, listas de presença, atas de capacitação, produtos entregues e atestes de fiscalização para cada parcela liquidada/paga.',
       'Conferir no SICONFI (Função 10 Saúde / Função 12 Educação) os estágios separados de empenho, liquidação e pagamento vinculados ao CNPJ da contratada.'
@@ -980,13 +1018,9 @@ export function importInepPublicExport(params: {
   const observations: IndicatorObservation[] = [];
   let unpublishedCount = 0;
 
-  const lines = params.rawCsv
-    .replace(/^\uFEFF/, '')
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
+  const parsed = parseCsvTable(params.rawCsv);
 
-  if (lines.length < 2) {
+  if (parsed.headers.length === 0 || parsed.rows.length === 0) {
     warnings.push('Arquivo INEP sem linhas de dados.');
     return {
       sourceSystem: 'INEP/MEC — Microdados e Tabelas Públicas (IDEB / SAEB / Rendimento)',
@@ -1000,10 +1034,7 @@ export function importInepPublicExport(params: {
     };
   }
 
-  const delimiter = lines[0].includes(';') ? ';' : lines[0].includes('\t') ? '\t' : ',';
-  const headers = lines[0]
-    .split(delimiter)
-    .map((h) => h.replace(/^"|"$/g, '').trim().toLowerCase());
+  const headers = parsed.headers.map((h) => h.trim().toLowerCase());
   const col = (names: string[]) => headers.findIndex((h) => names.some((n) => h.includes(n)));
 
   const idxIbge = col(['ibge', 'co_municipio', 'municipio_cod', 'territorio']);
@@ -1013,26 +1044,38 @@ export function importInepPublicExport(params: {
   const idxMethod = col(['metodologia', 'versao']);
   const idxPub = col(['publicacao', 'data_publicacao']);
 
-  for (let i = 1; i < lines.length; i++) {
-    const parts = lines[i].split(delimiter).map((c) => c.replace(/^"|"$/g, '').trim());
+  for (let i = 0; i < parsed.rows.length; i++) {
+    const parts = parsed.rows[i];
     const territoryCode = (idxIbge >= 0 ? parts[idxIbge] : parts[0])?.replace(/\D/g, '') || '';
     const indicatorId = (idxIndicator >= 0 ? parts[idxIndicator] : 'IDEB') || 'IDEB';
-    const ano = (idxAno >= 0 ? parts[idxAno] : parts[2])?.replace(/\D/g, '').slice(0, 4) || '';
-    if (!territoryCode || !ano) continue;
+    const rawComp = (idxAno >= 0 ? parts[idxAno] : parts[2])?.trim() || '';
+    if (!territoryCode || !rawComp) continue;
+
+    const compValidation = validateCompetencia(rawComp);
+    if (!compValidation.valid || !compValidation.normalized) {
+      warnings.push(
+        `Linha ${i + 2} ignorada por ano/competência inválida ("${rawComp}"): ${compValidation.reason ?? 'formato inválido'}`
+      );
+      continue;
+    }
 
     const value = idxVal >= 0 ? parseNumericOrNull(parts[idxVal]) : parseNumericOrNull(parts[3]);
     const isPublished = value !== null;
     if (!isPublished) unpublishedCount += 1;
 
+    const rawPub = idxPub >= 0 && parts[idxPub] ? parts[idxPub].trim() : null;
+    const publishedAt =
+      rawPub && validateIsoDate(rawPub.slice(0, 10)).valid ? rawPub : null;
+
     observations.push({
-      observationId: `inep_${territoryCode}_${indicatorId}_${ano}_${i}`,
+      observationId: `inep_${territoryCode}_${indicatorId}_${compValidation.normalized}_${i + 1}`,
       indicatorId,
       methodologyVersion:
         (idxMethod >= 0 && parts[idxMethod]) || params.defaultMethodologyVersion || 'inep-ideb-v1',
       territoryCode,
-      competencia: ano,
-      periodEndDate: `${ano}-12-31`,
-      publishedAt: idxPub >= 0 && parts[idxPub] ? parts[idxPub] : null,
+      competencia: compValidation.normalized,
+      periodEndDate: compValidation.periodEndDate ?? `${compValidation.normalized.slice(0, 4)}-12-31`,
+      publishedAt,
       collectedAt: importedAt,
       revision: 'original',
       numerator: null,

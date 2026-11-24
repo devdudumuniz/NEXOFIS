@@ -569,7 +569,7 @@ export function DocumentUploadView({ onSelectContract }: DocumentUploadViewProps
                     </span>
                   </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px]">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 text-[11px]">
                     <div className="p-2 rounded bg-[#FAF9F5] dark:bg-[#061321] border border-slate-200 dark:border-[#1D3A57]">
                       <div className="text-slate-500 dark:text-slate-400">E-mails institucionais</div>
                       <div className="font-mono font-semibold text-[#0B2540] dark:text-[#FAF9F5] mt-0.5 break-all">
@@ -587,11 +587,19 @@ export function DocumentUploadView({ onSelectContract }: DocumentUploadViewProps
                       </div>
                     </div>
                     <div className="p-2 rounded bg-[#FAF9F5] dark:bg-[#061321] border border-slate-200 dark:border-[#1D3A57]">
-                      <div className="text-slate-500 dark:text-slate-400">Plataformas eletrônicas</div>
+                      <div className="text-slate-500 dark:text-slate-400">Envio de propostas</div>
                       <div className="font-mono font-semibold text-[#0B2540] dark:text-[#FAF9F5] mt-0.5 break-all">
                         {result.editalChannelAudit.platformsFound.length > 0
                           ? result.editalChannelAudit.platformsFound.join(', ')
                           : 'Nenhuma identificada'}
+                      </div>
+                    </div>
+                    <div className="p-2 rounded bg-[#FAF9F5] dark:bg-[#061321] border border-slate-200 dark:border-[#1D3A57]">
+                      <div className="text-slate-500 dark:text-slate-400">Portais de publicação</div>
+                      <div className="font-mono font-semibold text-[#0B2540] dark:text-[#FAF9F5] mt-0.5 break-all">
+                        {result.editalChannelAudit.publicationPortalsFound.length > 0
+                          ? result.editalChannelAudit.publicationPortalsFound.join(', ')
+                          : 'Nenhum identificado'}
                       </div>
                     </div>
                   </div>

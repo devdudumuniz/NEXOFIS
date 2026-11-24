@@ -1,5 +1,7 @@
 import crypto from 'node:crypto';
 import type { EndDateSemantics } from './temporalIdentityGraph';
+import { parseCsvTable } from './csvParser';
+import { validateIsoDate } from './competenciaValidator';
 
 export type PublicIntegrityTrailStatus =
   | 'CONFIRMADO_DOCUMENTALMENTE'
@@ -370,6 +372,19 @@ export function evaluateContractConflictTrail(
       continue;
     }
 
+    // Defect 1.3b: Never attribute person-A's corporate link to person-B's public appointment
+    const corpPersonId = item.corporateLink.person.personId.trim();
+    const apptPersonId = item.appointment.person.personId.trim();
+    if (!corpPersonId || !apptPersonId || corpPersonId !== apptPersonId) {
+      findings.push({
+        code: 'CONFLICT_DISTINCT_IDENTITIES',
+        status: 'CONFORME_NO_ESCOPO',
+        detail: `Sem sinal de conflito pessoal direto: vínculo societário pertence à identidade "${item.corporateLink.person.fullName}" (${corpPersonId || 'N/D'}) e nomeação pertence à identidade distinta "${item.appointment.person.fullName}" (${apptPersonId || 'N/D'}).`,
+        evidenceRefs: [...item.corporateLink.evidenceRefs, ...item.appointment.evidenceRefs],
+      });
+      continue;
+    }
+
     if (!isIsoDate(item.contractSignatureDate)) {
       findings.push({
         code: 'CONFLICT_MISSING_CONTRACT_DATE',
@@ -572,8 +587,25 @@ export function evaluateRoleLegalRequirementsTrail(
     input.evidences.map((e) => [e.requirementLabel.trim().toLowerCase(), e])
   );
 
-  for (const reqLabel of input.applicableLaw.expressRequirements) {
-    const matched = evidenceByReq.get(reqLabel.trim().toLowerCase());
+  // Defect Graduação: when requiresGraduation=true and expressRequirements is empty,
+  // synthesize the mandatory graduation requirement so missing evidence NEVER yields CONFORME_NO_ESCOPO.
+  const effectiveRequirements =
+    input.applicableLaw.expressRequirements.length > 0
+      ? input.applicableLaw.expressRequirements
+      : input.applicableLaw.requiresGraduation
+        ? ['Graduação superior exigida pela norma do cargo']
+        : [];
+
+  for (const reqLabel of effectiveRequirements) {
+    const normalizedReq = reqLabel.trim().toLowerCase();
+    const matched =
+      evidenceByReq.get(normalizedReq) ??
+      (input.applicableLaw.requiresGraduation &&
+      input.applicableLaw.expressRequirements.length === 0
+        ? input.evidences.find((e) =>
+            /gradua|superior|diploma|bacharel|licenciatur/i.test(e.requirementLabel)
+          )
+        : undefined);
     if (!matched || matched.evidenceStatus === 'missing_document') {
       hasMissingDoc = true;
       findings.push({
@@ -655,19 +687,19 @@ export function parseCamaraDailyPersonnelSnapshot(params: {
   rawCsv: string;
   snapshotDate: string;
 }): CamaraDailyPersonnelSnapshot {
+  const dateCheck = validateIsoDate(params.snapshotDate);
+  if (!dateCheck.valid) {
+    throw new Error(dateCheck.reason ?? `Data de snapshot inválida: "${params.snapshotDate}".`);
+  }
   const sha256 = crypto.createHash('sha256').update(params.rawCsv, 'utf8').digest('hex');
-  const lines = params.rawCsv
-    .replace(/^\uFEFF/, '')
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
+  const parsed = parseCsvTable(params.rawCsv);
 
-  if (lines.length < 2) {
+  if (parsed.headers.length === 0 || parsed.rows.length === 0) {
     return {
       sourceSystem: 'Camara dos Deputados — Arquivo Diario de Funcionarios',
       coverageScope: 'camara_federal_diario',
       hasHistoricalChanges: false,
-      snapshotDate: params.snapshotDate,
+      snapshotDate: dateCheck.normalized!,
       sha256,
       recordCount: 0,
       rows: [],
@@ -678,11 +710,7 @@ export function parseCamaraDailyPersonnelSnapshot(params: {
     };
   }
 
-  const delimiter = lines[0].includes(';') ? ';' : lines[0].includes('\t') ? '\t' : ',';
-  const headers = lines[0]
-    .split(delimiter)
-    .map((h) => h.replace(/^"|"$/g, '').trim().toLowerCase());
-
+  const headers = parsed.headers.map((h) => h.trim().toLowerCase());
   const findIdx = (patterns: string[]) =>
     headers.findIndex((h) => patterns.some((p) => h.includes(p)));
 
@@ -692,8 +720,7 @@ export function parseCamaraDailyPersonnelSnapshot(params: {
   const idxVinculo = findIdx(['vinculo', 'natureza', 'categoria', 'grupo']);
 
   const rows: CamaraPersonnelSnapshotRow[] = [];
-  for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split(delimiter).map((c) => c.replace(/^"|"$/g, '').trim());
+  for (const cols of parsed.rows) {
     const nome = idxNome >= 0 ? cols[idxNome] ?? '' : cols[0] ?? '';
     if (!nome) continue;
     rows.push({
@@ -701,7 +728,7 @@ export function parseCamaraDailyPersonnelSnapshot(params: {
       cargo: idxCargo >= 0 ? cols[idxCargo] ?? '' : cols[1] ?? '',
       lotacao: idxLotacao >= 0 ? cols[idxLotacao] ?? '' : cols[2] ?? '',
       vinculo: idxVinculo >= 0 ? cols[idxVinculo] ?? '' : cols[3] ?? 'nao_informado',
-      dataColeta: params.snapshotDate,
+      dataColeta: dateCheck.normalized!,
     });
   }
 
@@ -709,12 +736,12 @@ export function parseCamaraDailyPersonnelSnapshot(params: {
     sourceSystem: 'Camara dos Deputados — Arquivo Diario de Funcionarios',
     coverageScope: 'camara_federal_diario',
     hasHistoricalChanges: false,
-    snapshotDate: params.snapshotDate,
+    snapshotDate: dateCheck.normalized!,
     sha256,
     recordCount: rows.length,
     rows,
     limitations: [
-      `Snapshot pontual coletado em ${params.snapshotDate}: a Câmara disponibiliza arquivo diário sem histórico de alterações; nenhum histórico anterior à coleta foi inferido.`,
+      `Snapshot pontual coletado em ${dateCheck.normalized}: a Câmara disponibiliza arquivo diário sem histórico de alterações; nenhum histórico anterior à coleta foi inferido.`,
       'Dados federais de pessoal da Câmara dos Deputados não representam cobertura de servidores municipais.',
     ],
   };

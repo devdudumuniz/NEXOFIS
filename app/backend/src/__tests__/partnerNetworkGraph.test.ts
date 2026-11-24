@@ -402,7 +402,7 @@ describe('Mapa de Vínculos Societários — Motor de Grafo (partnerNetworkGraph
 
     try {
       const store1 = createNexofisStore(dbPath);
-      assert.equal(store1.getSchemaVersion(), 5);
+      assert.equal(store1.getSchemaVersion(), 6);
       store1.upsertSupplierQsa(qsaDataset[0]);
       store1.upsertSupplierQsa(qsaDataset[1]);
       store1.close();

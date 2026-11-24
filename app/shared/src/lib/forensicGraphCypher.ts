@@ -302,14 +302,27 @@ export function generateForensicCypherScript(snapshot: ForensicGraphSnapshot): s
 }
 
 /**
+ * Exhaustive AssertionState composer (Defect 1.3a):
+ * Precedence: dismissed > contested > candidate > documented.
+ * Ensures a dismissed edge NEVER degrades/reappears as documented.
+ */
+export function composeAssertionStates(states: ReadonlyArray<AssertionState>): AssertionState {
+  if (states.some((s) => s === 'dismissed')) return 'dismissed';
+  if (states.some((s) => s === 'contested')) return 'contested';
+  if (states.some((s) => s === 'candidate')) return 'candidate';
+  return 'documented';
+}
+
+/**
  * In-process equivalent of Consulta 1 (Neo4j Cypher kinship + office + contract traversal),
  * running directly on NEXOFIS's SQLite/TypeScript data without requiring a Neo4j daemon.
  */
 export function executeKinshipOfficeContractQuery(
   snapshot: ForensicGraphSnapshot,
-  options?: { onlyDocumented?: boolean }
+  options?: { onlyDocumented?: boolean; includeDismissed?: boolean }
 ): KinshipOfficeContractMatch[] {
   const onlyDocumented = options?.onlyDocumented ?? true;
+  const includeDismissed = options?.includeDismissed ?? false;
   const peopleById = new Map(snapshot.people.map((p) => [p.personId, p]));
   const companiesByCnpj = new Map(snapshot.companies.map((c) => [c.cnpj, c]));
   const agenciesById = new Map(snapshot.agencies.map((a) => [a.orgaoId, a]));
@@ -353,10 +366,14 @@ export function executeKinshipOfficeContractQuery(
               officeEdge.assertionState,
               shareEdge.assertionState,
             ];
+            const composedState = composeAssertionStates(assertionStates);
+            if (!includeDismissed && composedState === 'dismissed') {
+              continue;
+            }
             const includesUnresolvedOrCandidatePath =
               !politico.identityResolved ||
               !parente.identityResolved ||
-              assertionStates.some((st) => st !== 'documented');
+              composedState !== 'documented';
 
             if (onlyDocumented && includesUnresolvedOrCandidatePath) {
               continue;
@@ -401,10 +418,11 @@ export function executeKinshipOfficeContractQuery(
 export function executeMultiHopCorporateNetworkQuery(
   snapshot: ForensicGraphSnapshot,
   targetCnpj: string,
-  options?: { onlyDocumented?: boolean }
+  options?: { onlyDocumented?: boolean; includeDismissed?: boolean }
 ): MultiHopCorporateNetworkMatch[] {
   const cleanTarget = targetCnpj.replace(/\D/g, '');
   const onlyDocumented = options?.onlyDocumented ?? false;
+  const includeDismissed = options?.includeDismissed ?? false;
   const peopleById = new Map(snapshot.people.map((p) => [p.personId, p]));
   const companiesByCnpj = new Map(
     snapshot.companies.map((c) => [c.cnpj.replace(/\D/g, ''), c])
@@ -434,12 +452,11 @@ export function executeMultiHopCorporateNetworkQuery(
       const e2 = companiesByCnpj.get(e2Clean);
       if (!e2) continue;
 
-      const combinedState: AssertionState =
-        s1.assertionState === 'contested' || s2.assertionState === 'contested'
-          ? 'contested'
-          : s1.assertionState === 'candidate' || s2.assertionState === 'candidate'
-            ? 'candidate'
-            : 'documented';
+      const combinedState = composeAssertionStates([s1.assertionState, s2.assertionState]);
+
+      if (!includeDismissed && combinedState === 'dismissed') {
+        continue;
+      }
 
       const includesUnresolvedIdentity = !person.identityResolved || combinedState !== 'documented';
       if (onlyDocumented && includesUnresolvedIdentity) {
